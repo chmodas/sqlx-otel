@@ -89,6 +89,15 @@ fn record_error(cx: &OtelContext, err: &sqlx::Error) {
         description: Cow::Owned(err.to_string()),
     });
     span.set_attribute(KeyValue::new(attribute::ERROR_TYPE, error_type(err)));
+    // Extract SQLSTATE or database-specific error code when available.
+    if let sqlx::Error::Database(db_err) = err {
+        if let Some(code) = db_err.code() {
+            span.set_attribute(KeyValue::new(
+                attribute::DB_RESPONSE_STATUS_CODE,
+                code.into_owned(),
+            ));
+        }
+    }
     span.add_event(
         "exception",
         vec![

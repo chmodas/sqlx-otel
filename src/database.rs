@@ -34,3 +34,22 @@ impl Database for sqlx::Sqlite {
         (None, None, namespace)
     }
 }
+
+#[cfg(feature = "postgres")]
+impl Database for sqlx::Postgres {
+    const SYSTEM: &'static str = "postgresql";
+
+    fn connection_attributes(
+        pool: &sqlx::Pool<Self>,
+    ) -> (Option<String>, Option<u16>, Option<String>) {
+        use sqlx::ConnectOptions;
+
+        let url = pool.connect_options().to_url_lossy();
+        let host = url.host_str().map(String::from);
+        let port = url.port();
+        let namespace = url
+            .path_segments()
+            .and_then(|mut segments| segments.next().map(String::from));
+        (host, port, namespace)
+    }
+}

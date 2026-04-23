@@ -107,6 +107,7 @@ fn record_rows(cx: &OtelContext, rows: u64) {
 }
 
 /// End the span and record metrics.
+/// End the span and record metrics.
 fn finish(
     cx: &OtelContext,
     start: Instant,
@@ -118,39 +119,102 @@ fn finish(
     metrics.record(start.elapsed(), rows, attrs);
 }
 
+/// Await a future, record any error on the span, then finish. Used by `execute`, `prepare`,
+/// `prepare_with`, and `describe` which share the same instrumentation pattern.
+async fn execute_instrumented<T>(
+    fut: futures::future::BoxFuture<'_, Result<T, sqlx::Error>>,
+    cx: OtelContext,
+    start: Instant,
+    metrics: std::sync::Arc<Metrics>,
+    metric_attrs: Vec<KeyValue>,
+) -> Result<T, sqlx::Error> {
+    let result = fut.await;
+    if let Err(err) = &result {
+        record_error(&cx, err);
+    }
+    finish(&cx, start, None, &metrics, &metric_attrs);
+    result
+}
+
 // ---------------------------------------------------------------------------
 // InstrumentedStream – keeps the span alive for streaming operations
 // ---------------------------------------------------------------------------
 
+/// Trait that determines how many rows a stream item represents.
+trait RowCounter<T> {
+    /// Return the number of rows this item contributes.
+    fn count(item: &T) -> u64;
+}
+
+/// Counts every item as one row. Used for `fetch` (which yields `Row`).
+struct CountAll;
+
+impl<T> RowCounter<T> for CountAll {
+    fn count(_item: &T) -> u64 {
+        1
+    }
+}
+
+/// Counts only `Either::Right` items as rows. Used for `fetch_many` (which yields
+/// `Either<QueryResult, Row>`).
+struct CountRight;
+
+impl<L, R> RowCounter<sqlx::Either<L, R>> for CountRight {
+    fn count(item: &sqlx::Either<L, R>) -> u64 {
+        u64::from(item.is_right())
+    }
+}
+
+/// Counts nothing. Used for `execute_many` (which yields `QueryResult`, not rows).
+struct CountNone;
+
+impl<T> RowCounter<T> for CountNone {
+    fn count(_item: &T) -> u64 {
+        0
+    }
+}
+
 /// A stream wrapper that holds an OpenTelemetry context (keeping the span alive), counts rows,
 /// and records metrics when the stream completes or is dropped.
-struct InstrumentedStream<S> {
+struct InstrumentedStream<S, C> {
     inner: S,
     cx: OtelContext,
     start: Instant,
     rows: u64,
-    /// When `true`, every `Ok` item increments the row counter. When `false`, the counter
-    /// stays at zero and no `db.response.returned_rows` is recorded. Set to `false` for
-    /// `execute_many` (which yields `QueryResult`, not rows).
-    count_rows: bool,
     metrics: std::sync::Arc<Metrics>,
     metric_attrs: Vec<KeyValue>,
     finished: bool,
+    _counter: std::marker::PhantomData<C>,
 }
 
-impl<S> InstrumentedStream<S> {
+impl<S, C> InstrumentedStream<S, C> {
+    fn new(
+        inner: S,
+        cx: OtelContext,
+        start: Instant,
+        metrics: std::sync::Arc<Metrics>,
+        metric_attrs: Vec<KeyValue>,
+    ) -> Self {
+        Self {
+            inner,
+            cx,
+            start,
+            rows: 0,
+            metrics,
+            metric_attrs,
+            finished: false,
+            _counter: std::marker::PhantomData,
+        }
+    }
+
     fn complete(&mut self) {
         if !self.finished {
             self.finished = true;
-            let rows = if self.count_rows {
-                Some(self.rows)
-            } else {
-                None
-            };
+            record_rows(&self.cx, self.rows);
             finish(
                 &self.cx,
                 self.start,
-                rows,
+                Some(self.rows),
                 &self.metrics,
                 &self.metric_attrs,
             );
@@ -158,18 +222,21 @@ impl<S> InstrumentedStream<S> {
     }
 }
 
-impl<S, T> Stream for InstrumentedStream<S>
+// Safety: all fields are Unpin (inner S is bounded Unpin, the rest are owned values).
+// PhantomData<C> prevents auto-Unpin, so we impl it explicitly.
+impl<S: Unpin, C> Unpin for InstrumentedStream<S, C> {}
+
+impl<S, T, C> Stream for InstrumentedStream<S, C>
 where
     S: Stream<Item = Result<T, sqlx::Error>> + Unpin,
+    C: RowCounter<T>,
 {
     type Item = Result<T, sqlx::Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, task_cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.inner).poll_next(task_cx) {
             Poll::Ready(Some(Ok(item))) => {
-                if self.count_rows {
-                    self.rows += 1;
-                }
+                self.rows += C::count(&item);
                 Poll::Ready(Some(Ok(item)))
             }
             Poll::Ready(Some(Err(err))) => {
@@ -185,7 +252,7 @@ where
     }
 }
 
-impl<S> Drop for InstrumentedStream<S> {
+impl<S, C> Drop for InstrumentedStream<S, C> {
     fn drop(&mut self) {
         self.complete();
     }
@@ -208,6 +275,7 @@ macro_rules! impl_executor {
         {
             type Database = DB;
 
+            /// Execute the query and return the total number of rows affected.
             fn execute<'e, 'q: 'e, E>(
                 $self_,
                 query: E,
@@ -226,19 +294,12 @@ macro_rules! impl_executor {
                 let metric_attrs = state.attrs.base_key_values();
                 let (cx, start) = start_span(&name, span_attrs);
                 let fut = ($inner).execute(query);
-                Box::pin(async move {
-                    let result = fut.await;
-                    match &result {
-                        Ok(_) => finish(&cx, start, None, &state.metrics, &metric_attrs),
-                        Err(err) => {
-                            record_error(&cx, err);
-                            finish(&cx, start, None, &state.metrics, &metric_attrs);
-                        }
-                    }
-                    result
-                })
+                Box::pin(execute_instrumented(
+                    fut, cx, start, state.metrics, metric_attrs,
+                ))
             }
 
+            /// Execute multiple queries and return the rows affected from each query, in a stream.
             fn execute_many<'e, 'q: 'e, E>(
                 $self_,
                 query: E,
@@ -254,18 +315,16 @@ macro_rules! impl_executor {
                 let metric_attrs = state.attrs.base_key_values();
                 let (cx, start) = start_span(&name, span_attrs);
                 let stream = ($inner).execute_many(query);
-                Box::pin(InstrumentedStream {
-                    inner: stream,
+                Box::pin(InstrumentedStream::<_, CountNone>::new(
+                    stream,
                     cx,
                     start,
-                    rows: 0,
-                    count_rows: false,
-                    metrics: state.metrics,
+                    state.metrics,
                     metric_attrs,
-                    finished: false,
-                })
+                ))
             }
 
+            /// Execute the query and return the generated results as a stream.
             fn fetch<'e, 'q: 'e, E>(
                 $self_,
                 query: E,
@@ -281,18 +340,17 @@ macro_rules! impl_executor {
                 let metric_attrs = state.attrs.base_key_values();
                 let (cx, start) = start_span(&name, span_attrs);
                 let stream = ($inner).fetch(query);
-                Box::pin(InstrumentedStream {
-                    inner: stream,
+                Box::pin(InstrumentedStream::<_, CountAll>::new(
+                    stream,
                     cx,
                     start,
-                    rows: 0,
-                    count_rows: true,
-                    metrics: state.metrics,
+                    state.metrics,
                     metric_attrs,
-                    finished: false,
-                })
+                ))
             }
 
+            /// Execute multiple queries and return the generated results as a stream
+            /// from each query, in a stream.
             fn fetch_many<'e, 'q: 'e, E>(
                 $self_,
                 query: E,
@@ -314,18 +372,16 @@ macro_rules! impl_executor {
                 let metric_attrs = state.attrs.base_key_values();
                 let (cx, start) = start_span(&name, span_attrs);
                 let stream = ($inner).fetch_many(query);
-                Box::pin(InstrumentedStream {
-                    inner: stream,
+                Box::pin(InstrumentedStream::<_, CountRight>::new(
+                    stream,
                     cx,
                     start,
-                    rows: 0,
-                    count_rows: true,
-                    metrics: state.metrics,
+                    state.metrics,
                     metric_attrs,
-                    finished: false,
-                })
+                ))
             }
 
+            /// Execute the query and return all the generated results, collected into a [`Vec`].
             fn fetch_all<'e, 'q: 'e, E>(
                 $self_,
                 query: E,
@@ -361,6 +417,7 @@ macro_rules! impl_executor {
                 })
             }
 
+            /// Execute the query and returns exactly one row.
             fn fetch_one<'e, 'q: 'e, E>(
                 $self_,
                 query: E,
@@ -395,6 +452,7 @@ macro_rules! impl_executor {
                 })
             }
 
+            /// Execute the query and returns at most one row.
             fn fetch_optional<'e, 'q: 'e, E>(
                 $self_,
                 query: E,
@@ -430,6 +488,14 @@ macro_rules! impl_executor {
                 })
             }
 
+            /// Prepare the SQL query to inspect the type information of its parameters
+            /// and results.
+            ///
+            /// Be advised that when using the `query`, `query_as`, or `query_scalar` functions, the query
+            /// is transparently prepared and executed.
+            ///
+            /// This explicit API is provided to allow access to the statement metadata available after
+            /// it prepared but before the first row is returned.
             fn prepare<'e, 'q: 'e>(
                 $self_,
                 query: &'q str,
@@ -446,16 +512,16 @@ macro_rules! impl_executor {
                 let metric_attrs = state.attrs.base_key_values();
                 let (cx, start) = start_span(&name, span_attrs);
                 let fut = ($inner).prepare(query);
-                Box::pin(async move {
-                    let result = fut.await;
-                    if let Err(err) = &result {
-                        record_error(&cx, err);
-                    }
-                    finish(&cx, start, None, &state.metrics, &metric_attrs);
-                    result
-                })
+                Box::pin(execute_instrumented(
+                    fut, cx, start, state.metrics, metric_attrs,
+                ))
             }
 
+            /// Prepare the SQL query, with parameter type information, to inspect the
+            /// type information about its parameters and results.
+            ///
+            /// Only some database drivers (Postgres, MSSQL) can take advantage of
+            /// this extra information to influence parameter type inference.
             fn prepare_with<'e, 'q: 'e>(
                 $self_,
                 sql: &'q str,
@@ -473,16 +539,16 @@ macro_rules! impl_executor {
                 let metric_attrs = state.attrs.base_key_values();
                 let (cx, start) = start_span(&name, span_attrs);
                 let fut = ($inner).prepare_with(sql, parameters);
-                Box::pin(async move {
-                    let result = fut.await;
-                    if let Err(err) = &result {
-                        record_error(&cx, err);
-                    }
-                    finish(&cx, start, None, &state.metrics, &metric_attrs);
-                    result
-                })
+                Box::pin(execute_instrumented(
+                    fut, cx, start, state.metrics, metric_attrs,
+                ))
             }
 
+             /// Describe the SQL query and return type information about its parameters
+             /// and results.
+             ///
+             /// This is used by compile-time verification in the query macros to
+             /// power their type inference.
             #[doc(hidden)]
             fn describe<'e, 'q: 'e>(
                 $self_,
@@ -500,14 +566,9 @@ macro_rules! impl_executor {
                 let metric_attrs = state.attrs.base_key_values();
                 let (cx, start) = start_span(&name, span_attrs);
                 let fut = ($inner).describe(sql);
-                Box::pin(async move {
-                    let result = fut.await;
-                    if let Err(err) = &result {
-                        record_error(&cx, err);
-                    }
-                    finish(&cx, start, None, &state.metrics, &metric_attrs);
-                    result
-                })
+                Box::pin(execute_instrumented(
+                    fut, cx, start, state.metrics, metric_attrs,
+                ))
             }
         }
     };

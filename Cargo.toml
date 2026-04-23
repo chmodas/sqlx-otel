@@ -30,9 +30,11 @@ sqlx = { version = "0.8", default-features = false }
 
 [features]
 sqlite = ["sqlx/sqlite"]
+postgres = ["sqlx/postgres"]
 
 [dev-dependencies]
 opentelemetry_sdk = { version = "0.31", features = ["testing", "rt-tokio"] }
 serial_test = "3"
-sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
+sqlx = { version = "0.8", features = ["sqlite", "postgres", "runtime-tokio"] }
+testcontainers = "0.27"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

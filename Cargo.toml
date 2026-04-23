@@ -27,3 +27,12 @@ futures = "0.3"
 opentelemetry = "0.31"
 opentelemetry-semantic-conventions = { version = "0.31", features = ["semconv_experimental"] }
 sqlx = { version = "0.8", default-features = false }
+
+[features]
+sqlite = ["sqlx/sqlite"]
+
+[dev-dependencies]
+opentelemetry_sdk = { version = "0.31", features = ["testing", "rt-tokio"] }
+serial_test = "3"
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

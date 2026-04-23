@@ -18,3 +18,19 @@ pub trait Database: sqlx::Database {
         pool: &sqlx::Pool<Self>,
     ) -> (Option<String>, Option<u16>, Option<String>);
 }
+
+#[cfg(feature = "sqlite")]
+impl Database for sqlx::Sqlite {
+    const SYSTEM: &'static str = "sqlite";
+
+    fn connection_attributes(
+        pool: &sqlx::Pool<Self>,
+    ) -> (Option<String>, Option<u16>, Option<String>) {
+        let namespace = pool
+            .connect_options()
+            .get_filename()
+            .to_str()
+            .map(String::from);
+        (None, None, namespace)
+    }
+}

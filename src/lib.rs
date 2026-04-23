@@ -1,2 +1,16 @@
 //! Lightweight `SQLx` wrapper that emits OpenTelemetry-native spans and metrics
 //! following the database client semantic conventions.
+
+pub(crate) mod attributes;
+mod connection;
+mod database;
+mod executor;
+mod metrics;
+mod pool;
+mod transaction;
+
+pub use attributes::QueryTextMode;
+pub use connection::{Connection, PoolConnection};
+pub use database::Database;
+pub use pool::{Pool, PoolBuilder};
+pub use transaction::Transaction;

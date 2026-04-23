@@ -19,5 +19,7 @@ exclude = [
   "README.md"
 ]
 
+[lints.clippy]
+pedantic = "warn"
 
 [dependencies]

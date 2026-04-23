@@ -1,0 +1,23 @@
+[package]
+name = "sqlx-otel"
+version = "0.0.0"
+edition = "2024"
+authors = ["Borislav Borisov <chmodas@astutebits.com>"]
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/chmodas/sqlx-otel"
+homepage = "https://github.com/chmodas/sqlx-otel"
+documentation = "https://github.com/chmodas/sqlx-otel"
+description = "sqlx-otel provides semantic OpenTelemetry tracing and metrics for SQLx database operations."
+categories = ["database", "asynchronous"]
+keywords = ["sqlx", "tracing", "opentelemetry", "database", "observability"]
+rust-version = "1.85.0"
+
+exclude = [
+  ".gitignore",
+  ".github",
+  "README.md"
+]
+
+
+[dependencies]

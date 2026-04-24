@@ -7,10 +7,9 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/chmodas/sqlx-otel"
 homepage = "https://github.com/chmodas/sqlx-otel"
-documentation = "https://github.com/chmodas/sqlx-otel"
-description = "sqlx-otel provides semantic OpenTelemetry tracing and metrics for SQLx database operations."
-categories = ["database", "asynchronous"]
-keywords = ["sqlx", "tracing", "opentelemetry", "database", "observability"]
+description = "Thin wrapper around SQLx that emits OpenTelemetry spans and metrics following the database client semantic conventions."
+categories = ["database", "asynchronous", "development-tools::profiling"]
+keywords = ["sqlx", "opentelemetry", "metrics", "database", "instrumentation"]
 rust-version = "1.85.0"
 
 exclude = [

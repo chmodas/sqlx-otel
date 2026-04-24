@@ -1026,6 +1026,139 @@ async fn operation_duration_metric_is_recorded() {
 }
 
 // ===========================================================================
+// Transaction rollback
+// ===========================================================================
+
+#[tokio::test]
+#[serial]
+async fn transaction_rollback() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    let mut tx: Transaction<'_, Postgres> = pool.begin().await.unwrap();
+    sqlx::query("CREATE TABLE IF NOT EXISTS rollback_test (id SERIAL PRIMARY KEY)")
+        .execute(&mut tx)
+        .await
+        .unwrap();
+    tx.rollback().await.unwrap();
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_common_span_attributes(&spans[0], SYSTEM);
+}
+
+// ===========================================================================
+// PoolBuilder with_* methods
+// ===========================================================================
+
+#[tokio::test]
+#[serial]
+async fn builder_with_database_overrides_namespace() {
+    let tel = common::TestTelemetry::install();
+    let shared = shared_container().await;
+    let raw = sqlx::PgPool::connect(&shared.url).await.unwrap();
+    let pool = PoolBuilder::from(raw).with_database("custom_db").build();
+
+    let _ = (&pool).fetch_optional("SELECT 1").await.unwrap();
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(
+        attr(&spans[0], "db.namespace"),
+        Some(opentelemetry::Value::String("custom_db".into()))
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn builder_with_host_overrides_server_address() {
+    let tel = common::TestTelemetry::install();
+    let shared = shared_container().await;
+    let raw = sqlx::PgPool::connect(&shared.url).await.unwrap();
+    let pool = PoolBuilder::from(raw).with_host("custom-host").build();
+
+    let _ = (&pool).fetch_optional("SELECT 1").await.unwrap();
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(
+        attr(&spans[0], "server.address"),
+        Some(opentelemetry::Value::String("custom-host".into()))
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn builder_with_port_overrides_server_port() {
+    let tel = common::TestTelemetry::install();
+    let shared = shared_container().await;
+    let raw = sqlx::PgPool::connect(&shared.url).await.unwrap();
+    let pool = PoolBuilder::from(raw).with_port(9999).build();
+
+    let _ = (&pool).fetch_optional("SELECT 1").await.unwrap();
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(
+        attr(&spans[0], "server.port"),
+        Some(opentelemetry::Value::I64(9999))
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn builder_with_network_peer_address() {
+    let tel = common::TestTelemetry::install();
+    let shared = shared_container().await;
+    let raw = sqlx::PgPool::connect(&shared.url).await.unwrap();
+    let pool = PoolBuilder::from(raw)
+        .with_network_peer_address("10.0.0.5")
+        .build();
+
+    let _ = (&pool).fetch_optional("SELECT 1").await.unwrap();
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(
+        attr(&spans[0], "network.peer.address"),
+        Some(opentelemetry::Value::String("10.0.0.5".into()))
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn builder_with_network_peer_port() {
+    let tel = common::TestTelemetry::install();
+    let shared = shared_container().await;
+    let raw = sqlx::PgPool::connect(&shared.url).await.unwrap();
+    let pool = PoolBuilder::from(raw).with_network_peer_port(5433).build();
+
+    let _ = (&pool).fetch_optional("SELECT 1").await.unwrap();
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(
+        attr(&spans[0], "network.peer.port"),
+        Some(opentelemetry::Value::I64(5433))
+    );
+}
+
+// ===========================================================================
+// Pool close / is_closed
+// ===========================================================================
+
+#[tokio::test]
+#[serial]
+async fn pool_close_and_is_closed() {
+    let _tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    assert!(!pool.is_closed());
+    pool.close().await;
+    assert!(pool.is_closed());
+}
+
+// ===========================================================================
 // QueryTextMode
 // ===========================================================================
 

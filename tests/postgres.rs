@@ -2,6 +2,7 @@
 
 mod common;
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use common::{assert_common_span_attributes, assert_error_span, attr};
@@ -13,30 +14,51 @@ use sqlx::Postgres;
 use sqlx_otel::{Pool, PoolBuilder, Transaction};
 use testcontainers::core::IntoContainerPort;
 use testcontainers::runners::AsyncRunner;
-use testcontainers::{GenericImage, ImageExt};
+use testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use tokio::sync::OnceCell;
 
 const SYSTEM: &str = "postgresql";
 
-/// Spin up a Postgres container and return an instrumented pool connected to it.
-async fn test_pool() -> (Pool<Postgres>, testcontainers::ContainerAsync<GenericImage>) {
-    let container = GenericImage::new("postgres", "15-alpine")
-        .with_wait_for(testcontainers::core::WaitFor::message_on_stderr(
-            "database system is ready to accept connections",
-        ))
-        .with_exposed_port(5432.tcp())
-        .with_env_var("POSTGRES_USER", "postgres")
-        .with_env_var("POSTGRES_DB", "testdb")
-        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
-        .with_startup_timeout(Duration::from_secs(60))
-        .start()
-        .await
-        .expect("starting postgres container");
+/// Shared container and connection URL, initialised once across all tests.
+struct SharedContainer {
+    _container: ContainerAsync<GenericImage>,
+    url: String,
+}
 
-    let port = container.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgres://postgres@localhost:{port}/testdb");
-    let raw = sqlx::PgPool::connect(&url).await.unwrap();
-    let pool = PoolBuilder::from(raw).build();
-    (pool, container)
+static CONTAINER: OnceLock<OnceCell<SharedContainer>> = OnceLock::new();
+
+async fn shared_container() -> &'static SharedContainer {
+    CONTAINER
+        .get_or_init(OnceCell::new)
+        .get_or_init(|| async {
+            let container = GenericImage::new("postgres", "15-alpine")
+                .with_wait_for(testcontainers::core::WaitFor::message_on_stderr(
+                    "database system is ready to accept connections",
+                ))
+                .with_exposed_port(5432.tcp())
+                .with_env_var("POSTGRES_USER", "postgres")
+                .with_env_var("POSTGRES_DB", "testdb")
+                .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+                .with_startup_timeout(Duration::from_secs(60))
+                .start()
+                .await
+                .expect("starting postgres container");
+
+            let port = container.get_host_port_ipv4(5432).await.unwrap();
+            let url = format!("postgres://postgres@localhost:{port}/testdb");
+            SharedContainer {
+                _container: container,
+                url,
+            }
+        })
+        .await
+}
+
+/// Return an instrumented pool connected to the shared container.
+async fn test_pool() -> Pool<Postgres> {
+    let shared = shared_container().await;
+    let raw = sqlx::PgPool::connect(&shared.url).await.unwrap();
+    PoolBuilder::from(raw).build()
 }
 
 // ===========================================================================
@@ -47,7 +69,7 @@ async fn test_pool() -> (Pool<Postgres>, testcontainers::ContainerAsync<GenericI
 #[serial]
 async fn execute_creates_span_via_pool() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     sqlx::query("CREATE TABLE IF NOT EXISTS exec_pool (id SERIAL PRIMARY KEY)")
         .execute(&pool)
@@ -64,7 +86,7 @@ async fn execute_creates_span_via_pool() {
 #[serial]
 async fn execute_creates_span_via_connection() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let mut conn = pool.acquire().await.unwrap();
     sqlx::query("CREATE TABLE IF NOT EXISTS exec_conn (id SERIAL PRIMARY KEY)")
@@ -82,7 +104,7 @@ async fn execute_creates_span_via_connection() {
 #[serial]
 async fn execute_creates_span_via_transaction() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let mut tx: Transaction<'_, Postgres> = pool.begin().await.unwrap();
     sqlx::query("CREATE TABLE IF NOT EXISTS exec_tx (id SERIAL PRIMARY KEY)")
@@ -101,7 +123,7 @@ async fn execute_creates_span_via_transaction() {
 #[serial]
 async fn execute_records_error() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let result = sqlx::query("INVALID SQL GIBBERISH").execute(&pool).await;
     assert!(result.is_err());
@@ -121,7 +143,7 @@ async fn execute_records_error() {
 #[serial]
 async fn execute_many_via_pool() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let mut stream = (&pool).execute_many("SELECT 1; SELECT 2");
     while stream.next().await.is_some() {}
@@ -140,7 +162,7 @@ async fn execute_many_via_pool() {
 #[serial]
 async fn execute_many_via_connection() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let mut conn = pool.acquire().await.unwrap();
     let mut stream = (&mut conn).execute_many("SELECT 1; SELECT 2");
@@ -160,7 +182,7 @@ async fn execute_many_via_connection() {
 #[serial]
 async fn execute_many_via_transaction() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let mut tx: Transaction<'_, Postgres> = pool.begin().await.unwrap();
 
@@ -182,7 +204,7 @@ async fn execute_many_via_transaction() {
 #[serial]
 async fn execute_many_records_error() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let mut stream = (&pool).execute_many("INVALID SQL GIBBERISH");
     let result = stream.next().await;
@@ -207,7 +229,7 @@ async fn execute_many_records_error() {
 #[serial]
 async fn fetch_via_pool() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let mut stream = (&pool).fetch("SELECT 1 UNION ALL SELECT 2");
     let mut count = 0u64;
@@ -230,7 +252,7 @@ async fn fetch_via_pool() {
 #[serial]
 async fn fetch_via_connection() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let mut conn = pool.acquire().await.unwrap();
     let mut stream = (&mut conn).fetch("SELECT 1 UNION ALL SELECT 2");
@@ -250,7 +272,7 @@ async fn fetch_via_connection() {
 #[serial]
 async fn fetch_via_transaction() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let mut tx: Transaction<'_, Postgres> = pool.begin().await.unwrap();
 
@@ -272,7 +294,7 @@ async fn fetch_via_transaction() {
 #[serial]
 async fn fetch_stream_dropped_early_still_records_span() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     {
         let mut stream = (&pool).fetch("SELECT 1 UNION ALL SELECT 2");
@@ -292,7 +314,7 @@ async fn fetch_stream_dropped_early_still_records_span() {
 #[serial]
 async fn fetch_stream_records_error() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let mut stream = (&pool).fetch("INVALID SQL");
     let result = stream.next().await;
@@ -317,7 +339,7 @@ async fn fetch_stream_records_error() {
 #[serial]
 async fn fetch_many_via_pool() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let mut stream = (&pool).fetch_many("SELECT 1 UNION ALL SELECT 2");
     let mut rows = 0u64;
@@ -342,7 +364,7 @@ async fn fetch_many_via_pool() {
 #[serial]
 async fn fetch_many_via_connection() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let mut conn = pool.acquire().await.unwrap();
     let mut stream = (&mut conn).fetch_many("SELECT 1 UNION ALL SELECT 2");
@@ -362,7 +384,7 @@ async fn fetch_many_via_connection() {
 #[serial]
 async fn fetch_many_via_transaction() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let mut tx: Transaction<'_, Postgres> = pool.begin().await.unwrap();
 
@@ -384,7 +406,7 @@ async fn fetch_many_via_transaction() {
 #[serial]
 async fn fetch_many_dropped_early_still_records_span() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     {
         let mut stream = (&pool).fetch_many("SELECT 1 UNION ALL SELECT 2");
@@ -404,7 +426,7 @@ async fn fetch_many_dropped_early_still_records_span() {
 #[serial]
 async fn fetch_many_records_error() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let mut stream = (&pool).fetch_many("INVALID SQL GIBBERISH");
     let result = stream.next().await;
@@ -429,7 +451,7 @@ async fn fetch_many_records_error() {
 #[serial]
 async fn fetch_all_via_pool() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let rows = (&pool)
         .fetch_all("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3")
@@ -450,7 +472,7 @@ async fn fetch_all_via_pool() {
 #[serial]
 async fn fetch_all_via_connection() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let mut conn = pool.acquire().await.unwrap();
     let rows = (&mut conn)
@@ -472,7 +494,7 @@ async fn fetch_all_via_connection() {
 #[serial]
 async fn fetch_all_via_transaction() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let mut tx: Transaction<'_, Postgres> = pool.begin().await.unwrap();
     let rows = (&mut tx)
@@ -495,7 +517,7 @@ async fn fetch_all_via_transaction() {
 #[serial]
 async fn fetch_all_records_error() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let result = (&pool).fetch_all("INVALID SQL GIBBERISH").await;
     assert!(result.is_err());
@@ -515,7 +537,7 @@ async fn fetch_all_records_error() {
 #[serial]
 async fn fetch_one_via_pool() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let _row = (&pool).fetch_one("SELECT 1").await.unwrap();
 
@@ -532,7 +554,7 @@ async fn fetch_one_via_pool() {
 #[serial]
 async fn fetch_one_via_connection() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let mut conn = pool.acquire().await.unwrap();
     let _row = (&mut conn).fetch_one("SELECT 1").await.unwrap();
@@ -550,7 +572,7 @@ async fn fetch_one_via_connection() {
 #[serial]
 async fn fetch_one_via_transaction() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let mut tx: Transaction<'_, Postgres> = pool.begin().await.unwrap();
     let _row = (&mut tx).fetch_one("SELECT 1").await.unwrap();
@@ -569,7 +591,7 @@ async fn fetch_one_via_transaction() {
 #[serial]
 async fn fetch_one_records_error() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let result = (&pool).fetch_one("INVALID SQL GIBBERISH").await;
     assert!(result.is_err());
@@ -589,7 +611,7 @@ async fn fetch_one_records_error() {
 #[serial]
 async fn fetch_optional_records_one_row() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let result = (&pool).fetch_optional("SELECT 1").await.unwrap();
     assert!(result.is_some());
@@ -607,7 +629,7 @@ async fn fetch_optional_records_one_row() {
 #[serial]
 async fn fetch_optional_records_zero_rows() {
     let _setup_tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     sqlx::query("CREATE TABLE IF NOT EXISTS empty_table (id SERIAL PRIMARY KEY)")
         .execute(&pool)
@@ -638,7 +660,7 @@ async fn fetch_optional_records_zero_rows() {
 #[serial]
 async fn fetch_optional_via_connection() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let mut conn = pool.acquire().await.unwrap();
     let result = (&mut conn).fetch_optional("SELECT 42").await.unwrap();
@@ -657,7 +679,7 @@ async fn fetch_optional_via_connection() {
 #[serial]
 async fn fetch_optional_via_transaction() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let mut tx: Transaction<'_, Postgres> = pool.begin().await.unwrap();
     let result = (&mut tx).fetch_optional("SELECT 99").await.unwrap();
@@ -677,7 +699,7 @@ async fn fetch_optional_via_transaction() {
 #[serial]
 async fn fetch_optional_records_error() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let result = (&pool).fetch_optional("INVALID SQL GIBBERISH").await;
     assert!(result.is_err());
@@ -697,7 +719,7 @@ async fn fetch_optional_records_error() {
 #[serial]
 async fn prepare_via_pool() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let _stmt = (&pool).prepare("SELECT 1").await.unwrap();
 
@@ -711,7 +733,7 @@ async fn prepare_via_pool() {
 #[serial]
 async fn prepare_via_connection() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let mut conn = pool.acquire().await.unwrap();
     let _stmt = (&mut conn).prepare("SELECT 1").await.unwrap();
@@ -726,7 +748,7 @@ async fn prepare_via_connection() {
 #[serial]
 async fn prepare_via_transaction() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let mut tx: Transaction<'_, Postgres> = pool.begin().await.unwrap();
     let _stmt = (&mut tx).prepare("SELECT 1").await.unwrap();
@@ -742,7 +764,7 @@ async fn prepare_via_transaction() {
 #[serial]
 async fn prepare_records_error() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let mut conn = pool.acquire().await.unwrap();
     let result = (&mut conn).prepare("INVALID SQL GIBBERISH").await;
@@ -763,7 +785,7 @@ async fn prepare_records_error() {
 #[serial]
 async fn prepare_with_via_pool() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let _stmt = (&pool).prepare_with("SELECT $1", &[]).await.unwrap();
 
@@ -777,7 +799,7 @@ async fn prepare_with_via_pool() {
 #[serial]
 async fn prepare_with_via_connection() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let mut conn = pool.acquire().await.unwrap();
     let _stmt = (&mut conn).prepare_with("SELECT $1", &[]).await.unwrap();
@@ -792,7 +814,7 @@ async fn prepare_with_via_connection() {
 #[serial]
 async fn prepare_with_via_transaction() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let mut tx: Transaction<'_, Postgres> = pool.begin().await.unwrap();
     let _stmt = (&mut tx).prepare_with("SELECT $1", &[]).await.unwrap();
@@ -808,7 +830,7 @@ async fn prepare_with_via_transaction() {
 #[serial]
 async fn prepare_with_records_error() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let mut conn = pool.acquire().await.unwrap();
     let result = (&mut conn).prepare_with("INVALID SQL GIBBERISH", &[]).await;
@@ -829,7 +851,7 @@ async fn prepare_with_records_error() {
 #[serial]
 async fn describe_via_pool() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let _desc = (&pool).describe("SELECT 1").await.unwrap();
 
@@ -843,7 +865,7 @@ async fn describe_via_pool() {
 #[serial]
 async fn describe_via_connection() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let mut conn = pool.acquire().await.unwrap();
     let _desc = (&mut conn).describe("SELECT 1").await.unwrap();
@@ -858,7 +880,7 @@ async fn describe_via_connection() {
 #[serial]
 async fn describe_via_transaction() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let mut tx: Transaction<'_, Postgres> = pool.begin().await.unwrap();
     let _desc = (&mut tx).describe("SELECT 1").await.unwrap();
@@ -874,7 +896,7 @@ async fn describe_via_transaction() {
 #[serial]
 async fn describe_records_error() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let mut conn = pool.acquire().await.unwrap();
     let result = (&mut conn).describe("INVALID SQL GIBBERISH").await;
@@ -895,7 +917,7 @@ async fn describe_records_error() {
 #[serial]
 async fn connection_attributes_populated() {
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let _row = (&pool).fetch_one("SELECT 1").await.unwrap();
 
@@ -924,7 +946,7 @@ async fn connection_attributes_populated() {
 #[serial]
 async fn sqlstate_recorded_on_constraint_violation() {
     let _setup_tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     // Create a table with a unique constraint.
     sqlx::query("CREATE TABLE IF NOT EXISTS unique_test (id INT PRIMARY KEY)")
@@ -968,7 +990,7 @@ async fn operation_duration_metric_is_recorded() {
     use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
 
     let tel = common::TestTelemetry::install();
-    let (pool, _container) = test_pool().await;
+    let pool = test_pool().await;
 
     let _row = (&pool).fetch_one("SELECT 1").await.unwrap();
 
@@ -1010,22 +1032,8 @@ async fn operation_duration_metric_is_recorded() {
 #[tokio::test]
 #[serial]
 async fn query_text_mode_off_suppresses_sql() {
-    let container = GenericImage::new("postgres", "15-alpine")
-        .with_wait_for(testcontainers::core::WaitFor::message_on_stderr(
-            "database system is ready to accept connections",
-        ))
-        .with_exposed_port(5432.tcp())
-        .with_env_var("POSTGRES_USER", "postgres")
-        .with_env_var("POSTGRES_DB", "testdb")
-        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
-        .with_startup_timeout(Duration::from_secs(60))
-        .start()
-        .await
-        .expect("starting postgres container");
-
-    let port = container.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgres://postgres@localhost:{port}/testdb");
-    let raw = sqlx::PgPool::connect(&url).await.unwrap();
+    let shared = shared_container().await;
+    let raw = sqlx::PgPool::connect(&shared.url).await.unwrap();
     let pool = PoolBuilder::from(raw)
         .with_query_text_mode(sqlx_otel::QueryTextMode::Off)
         .build();

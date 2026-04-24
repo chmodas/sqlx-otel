@@ -65,7 +65,7 @@ async fn execute_creates_span_via_transaction() {
 
     let mut tx: Transaction<'_, Sqlite> = pool.begin().await.unwrap();
     sqlx::query("CREATE TABLE exec_tx (id INTEGER PRIMARY KEY)")
-        .execute(&mut tx.executor())
+        .execute(&mut tx)
         .await
         .unwrap();
     tx.commit().await.unwrap();
@@ -142,8 +142,7 @@ async fn execute_many_via_transaction() {
     let pool = test_pool().await;
 
     let mut tx: Transaction<'_, Sqlite> = pool.begin().await.unwrap();
-    let mut exec = tx.executor();
-    let mut stream = (&mut exec).execute_many("SELECT 1; SELECT 2");
+    let mut stream = (&mut tx).execute_many("SELECT 1; SELECT 2");
     while stream.next().await.is_some() {}
     drop(stream);
     tx.commit().await.unwrap();
@@ -232,8 +231,7 @@ async fn fetch_via_transaction() {
     let pool = test_pool().await;
 
     let mut tx: Transaction<'_, Sqlite> = pool.begin().await.unwrap();
-    let mut exec = tx.executor();
-    let mut stream = (&mut exec).fetch("SELECT 1 UNION ALL SELECT 2");
+    let mut stream = (&mut tx).fetch("SELECT 1 UNION ALL SELECT 2");
     while stream.next().await.is_some() {}
     drop(stream);
     tx.commit().await.unwrap();
@@ -352,8 +350,7 @@ async fn fetch_many_via_transaction() {
     let pool = test_pool().await;
 
     let mut tx: Transaction<'_, Sqlite> = pool.begin().await.unwrap();
-    let mut exec = tx.executor();
-    let mut stream = (&mut exec).fetch_many("SELECT 1 UNION ALL SELECT 2");
+    let mut stream = (&mut tx).fetch_many("SELECT 1 UNION ALL SELECT 2");
     while stream.next().await.is_some() {}
     drop(stream);
     tx.commit().await.unwrap();
@@ -466,7 +463,7 @@ async fn fetch_all_via_transaction() {
     let pool = test_pool().await;
 
     let mut tx: Transaction<'_, Sqlite> = pool.begin().await.unwrap();
-    let rows = (&mut tx.executor())
+    let rows = (&mut tx)
         .fetch_all("SELECT 1 UNION ALL SELECT 2")
         .await
         .unwrap();
@@ -544,7 +541,7 @@ async fn fetch_one_via_transaction() {
     let pool = test_pool().await;
 
     let mut tx: Transaction<'_, Sqlite> = pool.begin().await.unwrap();
-    let _row = (&mut tx.executor()).fetch_one("SELECT 1").await.unwrap();
+    let _row = (&mut tx).fetch_one("SELECT 1").await.unwrap();
     tx.commit().await.unwrap();
 
     let spans = tel.spans();
@@ -650,10 +647,7 @@ async fn fetch_optional_via_transaction() {
     let pool = test_pool().await;
 
     let mut tx: Transaction<'_, Sqlite> = pool.begin().await.unwrap();
-    let result = (&mut tx.executor())
-        .fetch_optional("SELECT 99")
-        .await
-        .unwrap();
+    let result = (&mut tx).fetch_optional("SELECT 99").await.unwrap();
     assert!(result.is_some());
     tx.commit().await.unwrap();
 
@@ -722,7 +716,7 @@ async fn prepare_via_transaction() {
     let pool = test_pool().await;
 
     let mut tx: Transaction<'_, Sqlite> = pool.begin().await.unwrap();
-    let _stmt = (&mut tx.executor()).prepare("SELECT 1").await.unwrap();
+    let _stmt = (&mut tx).prepare("SELECT 1").await.unwrap();
     tx.commit().await.unwrap();
 
     let spans = tel.spans();
@@ -788,10 +782,7 @@ async fn prepare_with_via_transaction() {
     let pool = test_pool().await;
 
     let mut tx: Transaction<'_, Sqlite> = pool.begin().await.unwrap();
-    let _stmt = (&mut tx.executor())
-        .prepare_with("SELECT ?", &[])
-        .await
-        .unwrap();
+    let _stmt = (&mut tx).prepare_with("SELECT ?", &[]).await.unwrap();
     tx.commit().await.unwrap();
 
     let spans = tel.spans();
@@ -857,7 +848,7 @@ async fn describe_via_transaction() {
     let pool = test_pool().await;
 
     let mut tx: Transaction<'_, Sqlite> = pool.begin().await.unwrap();
-    let _desc = (&mut tx.executor()).describe("SELECT 1").await.unwrap();
+    let _desc = (&mut tx).describe("SELECT 1").await.unwrap();
     tx.commit().await.unwrap();
 
     let spans = tel.spans();

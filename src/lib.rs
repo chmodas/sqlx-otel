@@ -10,7 +10,7 @@ mod pool;
 mod transaction;
 
 pub use attributes::QueryTextMode;
-pub use connection::{Connection, PoolConnection};
+pub use connection::PoolConnection;
 pub use database::Database;
 pub use pool::{Pool, PoolBuilder};
 pub use transaction::Transaction;

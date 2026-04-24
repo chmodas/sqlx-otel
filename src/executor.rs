@@ -589,8 +589,7 @@ macro_rules! impl_executor {
 
 impl_executor!(&'_ crate::Pool<DB>, self => &self.inner);
 impl_executor!(&'c mut crate::PoolConnection<DB>, self => self.inner.as_mut());
-impl_executor!(&'c mut crate::Connection<'c, DB>, self => &mut *self.inner);
-impl_executor!(&'c mut crate::Transaction<'c, DB>, self => &mut *self.inner);
+impl_executor!(&'c mut crate::Transaction<'_, DB>, self => &mut *self.inner);
 
 #[cfg(test)]
 mod tests {

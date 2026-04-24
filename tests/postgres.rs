@@ -86,7 +86,7 @@ async fn execute_creates_span_via_transaction() {
 
     let mut tx: Transaction<'_, Postgres> = pool.begin().await.unwrap();
     sqlx::query("CREATE TABLE IF NOT EXISTS exec_tx (id SERIAL PRIMARY KEY)")
-        .execute(&mut tx.executor())
+        .execute(&mut tx)
         .await
         .unwrap();
     tx.commit().await.unwrap();
@@ -163,8 +163,8 @@ async fn execute_many_via_transaction() {
     let (pool, _container) = test_pool().await;
 
     let mut tx: Transaction<'_, Postgres> = pool.begin().await.unwrap();
-    let mut exec = tx.executor();
-    let mut stream = (&mut exec).execute_many("SELECT 1; SELECT 2");
+
+    let mut stream = (&mut tx).execute_many("SELECT 1; SELECT 2");
     while stream.next().await.is_some() {}
     drop(stream);
     tx.commit().await.unwrap();
@@ -253,8 +253,8 @@ async fn fetch_via_transaction() {
     let (pool, _container) = test_pool().await;
 
     let mut tx: Transaction<'_, Postgres> = pool.begin().await.unwrap();
-    let mut exec = tx.executor();
-    let mut stream = (&mut exec).fetch("SELECT 1 UNION ALL SELECT 2");
+
+    let mut stream = (&mut tx).fetch("SELECT 1 UNION ALL SELECT 2");
     while stream.next().await.is_some() {}
     drop(stream);
     tx.commit().await.unwrap();
@@ -365,8 +365,8 @@ async fn fetch_many_via_transaction() {
     let (pool, _container) = test_pool().await;
 
     let mut tx: Transaction<'_, Postgres> = pool.begin().await.unwrap();
-    let mut exec = tx.executor();
-    let mut stream = (&mut exec).fetch_many("SELECT 1 UNION ALL SELECT 2");
+
+    let mut stream = (&mut tx).fetch_many("SELECT 1 UNION ALL SELECT 2");
     while stream.next().await.is_some() {}
     drop(stream);
     tx.commit().await.unwrap();
@@ -475,7 +475,7 @@ async fn fetch_all_via_transaction() {
     let (pool, _container) = test_pool().await;
 
     let mut tx: Transaction<'_, Postgres> = pool.begin().await.unwrap();
-    let rows = (&mut tx.executor())
+    let rows = (&mut tx)
         .fetch_all("SELECT 1 UNION ALL SELECT 2")
         .await
         .unwrap();
@@ -553,7 +553,7 @@ async fn fetch_one_via_transaction() {
     let (pool, _container) = test_pool().await;
 
     let mut tx: Transaction<'_, Postgres> = pool.begin().await.unwrap();
-    let _row = (&mut tx.executor()).fetch_one("SELECT 1").await.unwrap();
+    let _row = (&mut tx).fetch_one("SELECT 1").await.unwrap();
     tx.commit().await.unwrap();
 
     let spans = tel.spans();
@@ -660,10 +660,7 @@ async fn fetch_optional_via_transaction() {
     let (pool, _container) = test_pool().await;
 
     let mut tx: Transaction<'_, Postgres> = pool.begin().await.unwrap();
-    let result = (&mut tx.executor())
-        .fetch_optional("SELECT 99")
-        .await
-        .unwrap();
+    let result = (&mut tx).fetch_optional("SELECT 99").await.unwrap();
     assert!(result.is_some());
     tx.commit().await.unwrap();
 
@@ -732,7 +729,7 @@ async fn prepare_via_transaction() {
     let (pool, _container) = test_pool().await;
 
     let mut tx: Transaction<'_, Postgres> = pool.begin().await.unwrap();
-    let _stmt = (&mut tx.executor()).prepare("SELECT 1").await.unwrap();
+    let _stmt = (&mut tx).prepare("SELECT 1").await.unwrap();
     tx.commit().await.unwrap();
 
     let spans = tel.spans();
@@ -798,10 +795,7 @@ async fn prepare_with_via_transaction() {
     let (pool, _container) = test_pool().await;
 
     let mut tx: Transaction<'_, Postgres> = pool.begin().await.unwrap();
-    let _stmt = (&mut tx.executor())
-        .prepare_with("SELECT $1", &[])
-        .await
-        .unwrap();
+    let _stmt = (&mut tx).prepare_with("SELECT $1", &[]).await.unwrap();
     tx.commit().await.unwrap();
 
     let spans = tel.spans();
@@ -867,7 +861,7 @@ async fn describe_via_transaction() {
     let (pool, _container) = test_pool().await;
 
     let mut tx: Transaction<'_, Postgres> = pool.begin().await.unwrap();
-    let _desc = (&mut tx.executor()).describe("SELECT 1").await.unwrap();
+    let _desc = (&mut tx).describe("SELECT 1").await.unwrap();
     tx.commit().await.unwrap();
 
     let spans = tel.spans();
@@ -949,7 +943,7 @@ async fn sqlstate_recorded_on_constraint_violation() {
     // Re-install telemetry to capture only the violating query.
     let tel = common::TestTelemetry::install();
 
-    // Insert a duplicate — should trigger SQLSTATE 23505 (unique_violation).
+    // Insert a duplicate – should trigger SQLSTATE 23505 (unique_violation).
     let result = sqlx::query("INSERT INTO unique_test (id) VALUES (1)")
         .execute(&pool)
         .await;

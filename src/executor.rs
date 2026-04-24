@@ -598,18 +598,66 @@ mod tests {
 
     #[test]
     fn error_type_classification() {
+        // Unit variants.
         assert_eq!(error_type(&sqlx::Error::RowNotFound), "RowNotFound");
         assert_eq!(error_type(&sqlx::Error::PoolTimedOut), "PoolTimedOut");
         assert_eq!(error_type(&sqlx::Error::PoolClosed), "PoolClosed");
         assert_eq!(error_type(&sqlx::Error::WorkerCrashed), "WorkerCrashed");
+
+        // String / boxed-error variants.
         assert_eq!(
-            error_type(&sqlx::Error::ColumnNotFound("x".into())),
-            "ColumnNotFound"
+            error_type(&sqlx::Error::Configuration("bad".into())),
+            "Configuration"
         );
         assert_eq!(
             error_type(&sqlx::Error::Io(std::io::Error::other("test"))),
             "Io"
         );
+        assert_eq!(error_type(&sqlx::Error::Tls("tls".into())), "Tls");
+        assert_eq!(
+            error_type(&sqlx::Error::Protocol("proto".into())),
+            "Protocol"
+        );
+        assert_eq!(error_type(&sqlx::Error::Decode("dec".into())), "Decode");
+        assert_eq!(
+            error_type(&sqlx::Error::AnyDriverError("any".into())),
+            "AnyDriverError"
+        );
+
+        // Struct variants.
+        assert_eq!(
+            error_type(&sqlx::Error::ColumnNotFound("x".into())),
+            "ColumnNotFound"
+        );
+        assert_eq!(
+            error_type(&sqlx::Error::ColumnIndexOutOfBounds { index: 5, len: 3 }),
+            "ColumnIndexOutOfBounds"
+        );
+        assert_eq!(
+            error_type(&sqlx::Error::ColumnDecode {
+                index: "0".into(),
+                source: "bad".into(),
+            }),
+            "ColumnDecode"
+        );
+        assert_eq!(
+            error_type(&sqlx::Error::TypeNotFound {
+                type_name: "Foo".into(),
+            }),
+            "TypeNotFound"
+        );
+
+        // Migrate variant (behind sqlx's "migrate" default feature).
+        assert_eq!(
+            error_type(&sqlx::Error::Migrate(Box::new(
+                sqlx::migrate::MigrateError::Execute(sqlx::Error::Protocol("test".into()))
+            ))),
+            "Migrate"
+        );
+
+        // The `_ => "Unknown"` branch covers future sqlx::Error variants that may be
+        // added in newer sqlx releases. It cannot be tested directly since we cannot
+        // construct an unknown variant, but it ensures forward compatibility.
     }
 
     fn test_attrs() -> ConnectionAttributes {

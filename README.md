@@ -30,14 +30,26 @@ tx.commit().await?;
 
 Every operation through the pool automatically emits an OpenTelemetry span and records metrics. No code changes are required beyond wrapping the pool.
 
-## Backends
+## Feature flags
 
-Enable one or more via feature flags:
+### Backends
 
 ```toml
 [dependencies]
-sqlx-otel = { version = "0.0.0", features = ["sqlite", "postgres", "mysql"] }
+sqlx-otel = { version = "0.0.0", features = ["postgres"] }
+# or "sqlite", "mysql"
 ```
+
+### Runtime (optional)
+
+Enable a runtime to get `db.client.connection.count` polling via a background task:
+
+```toml
+sqlx-otel = { version = "0.0.0", features = ["postgres", "runtime-tokio"] }
+# or "runtime-async-std"
+```
+
+All other metrics work without a runtime feature.
 
 ## What you get out of the box
 
@@ -60,14 +72,29 @@ Every `Executor` method (`execute`, `fetch`, `fetch_all`, `fetch_one`, `fetch_op
 
 On error, the span status is set to `Error` and an `exception` event is added with `exception.type` and `exception.message` attributes.
 
-### Metrics
+### Operation metrics
 
 | Instrument                         | Type      | Unit | Description                           |
 |------------------------------------|-----------|------|---------------------------------------|
 | `db.client.operation.duration`     | Histogram | `s`  | Duration of each database operation   |
 | `db.client.response.returned_rows` | Histogram |      | Number of rows returned per operation |
 
-Metrics carry the same connection-level attributes (`db.system.name`, `db.namespace`, `server.address`, `server.port`).
+These carry the connection-level attributes (`db.system.name`, `db.namespace`, `server.address`, `server.port`).
+
+### Connection pool metrics
+
+| Instrument                                | Type            | Unit | Description                                           |
+|-------------------------------------------|-----------------|------|-------------------------------------------------------|
+| `db.client.connection.wait_time`          | Histogram       | `s`  | Time spent waiting for a connection in `acquire()`    |
+| `db.client.connection.use_time`           | Histogram       | `s`  | Time a connection was held before being returned      |
+| `db.client.connection.timeouts`           | Counter         |      | Number of acquire attempts that timed out             |
+| `db.client.connection.pending_requests`   | UpDownCounter   |      | Number of callers currently waiting in `acquire()`    |
+| `db.client.connection.count`              | Gauge           |      | Current connections by state (`idle`/`used`)          |
+| `db.client.connection.max`                | Gauge           |      | Maximum number of connections allowed                 |
+| `db.client.connection.idle.max`           | Gauge           |      | Maximum idle connections (equals `max` in SQLx)       |
+| `db.client.connection.idle.min`           | Gauge           |      | Configured minimum connections                        |
+
+The first four are recorded inline on every `acquire()` / connection drop – no sampling gaps. `connection.count` is polled by a background task and requires a runtime feature (`runtime-tokio` or `runtime-async-std`). The remaining three are static gauges recorded once at pool construction.
 
 ## Configuration
 
@@ -75,15 +102,18 @@ Metrics carry the same connection-level attributes (`db.system.name`, `db.namesp
 
 ```rust
 use sqlx_otel::{PoolBuilder, QueryTextMode};
+use std::time::Duration;
 
 let pool = PoolBuilder::from(raw_pool)
-.with_database("mydb")
-.with_host("db.example.com")
-.with_port(5432)
-.with_network_peer_address("10.0.0.5")
-.with_network_peer_port(5432)
-.with_query_text_mode(QueryTextMode::Off)
-.build();
+    .with_database("mydb")
+    .with_host("db.example.com")
+    .with_port(5432)
+    .with_network_peer_address("10.0.0.5")
+    .with_network_peer_port(5432)
+    .with_query_text_mode(QueryTextMode::Off)
+    .with_pool_name("my-service-db")
+    .with_pool_metrics_interval(Duration::from_secs(5))
+    .build();
 ```
 
 ### Query text modes

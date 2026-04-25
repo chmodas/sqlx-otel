@@ -8,7 +8,7 @@ use opentelemetry_semantic_conventions::metric;
 ///
 /// Created once per [`Pool`](crate::Pool) and shared (via `Arc`) across all wrapper types
 /// derived from that pool. Instruments are obtained from the globally configured
-/// `MeterProvider`; when no provider is installed they resolve to no-ops.
+/// `MeterProvider`; when no provider is installed, they resolve to no-ops.
 #[derive(Debug, Clone)]
 pub(crate) struct Metrics {
     duration: Histogram<f64>,

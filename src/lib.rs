@@ -7,6 +7,8 @@ mod database;
 mod executor;
 mod metrics;
 mod pool;
+mod pool_metrics;
+mod runtime;
 mod transaction;
 
 pub use attributes::QueryTextMode;

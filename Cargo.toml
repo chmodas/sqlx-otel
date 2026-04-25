@@ -26,11 +26,15 @@ futures = "0.3"
 opentelemetry = "0.31"
 opentelemetry-semantic-conventions = { version = "0.31", features = ["semconv_experimental"] }
 sqlx = { version = "0.8", default-features = false }
+async-std = { version = "1", optional = true }
+tokio = { version = "1", features = ["rt", "time"], optional = true }
 
 [features]
 sqlite = ["sqlx/sqlite"]
 postgres = ["sqlx/postgres"]
 mysql = ["sqlx/mysql"]
+runtime-tokio = ["dep:tokio"]
+runtime-async-std = ["dep:async-std"]
 
 [dev-dependencies]
 opentelemetry_sdk = { version = "0.31", features = ["testing", "rt-tokio"] }

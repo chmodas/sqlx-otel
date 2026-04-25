@@ -9,6 +9,7 @@ use opentelemetry::trace::{SpanKind, Status, TraceContextExt, Tracer};
 use opentelemetry::{Context as OtelContext, KeyValue};
 use opentelemetry_semantic_conventions::attribute;
 
+use crate::annotations::QueryAnnotations;
 use crate::attributes::{self, ConnectionAttributes, QueryTextMode};
 use crate::database::Database;
 use crate::metrics::Metrics;
@@ -18,21 +19,32 @@ use crate::metrics::Metrics;
 // ---------------------------------------------------------------------------
 
 /// Build span attributes for a query, combining connection-level and per-query values.
+///
+/// When `annotations` is provided, the four per-query semantic convention attributes
+/// (`db.operation.name`, `db.collection.name`, `db.query.summary`,
+/// `db.stored_procedure.name`) are included for any field that is set.
 fn build_attributes(
     attrs: &ConnectionAttributes,
     sql: Option<&str>,
-    operation: Option<&str>,
-    collection: Option<&str>,
+    annotations: Option<&QueryAnnotations>,
 ) -> Vec<KeyValue> {
     let mut kv = attrs.base_key_values();
-    if let Some(op) = operation {
-        kv.push(KeyValue::new(attribute::DB_OPERATION_NAME, op.to_owned()));
-    }
-    if let Some(coll) = collection {
-        kv.push(KeyValue::new(
-            attribute::DB_COLLECTION_NAME,
-            coll.to_owned(),
-        ));
+    if let Some(ann) = annotations {
+        if let Some(ref op) = ann.operation {
+            kv.push(KeyValue::new(attribute::DB_OPERATION_NAME, op.clone()));
+        }
+        if let Some(ref coll) = ann.collection {
+            kv.push(KeyValue::new(attribute::DB_COLLECTION_NAME, coll.clone()));
+        }
+        if let Some(ref summary) = ann.query_summary {
+            kv.push(KeyValue::new(attribute::DB_QUERY_SUMMARY, summary.clone()));
+        }
+        if let Some(ref sp) = ann.stored_procedure {
+            kv.push(KeyValue::new(
+                attribute::DB_STORED_PROCEDURE_NAME,
+                sp.clone(),
+            ));
+        }
     }
     if let Some(sql) = sql {
         match attrs.query_text_mode {
@@ -282,8 +294,18 @@ impl<S, C> Drop for InstrumentedStream<S, C> {
 ///
 /// Each method extracts the SQL string, builds an OpenTelemetry span with connection attributes,
 /// delegates to the inner executor, and records metrics and errors on completion.
+///
+/// Two forms are supported:
+/// - `impl_executor!(Type, self => inner)` – no annotations (passes `None`).
+/// - `impl_executor!(Type, self => inner, annotations: expr)` – per-query annotations.
 macro_rules! impl_executor {
     ($ty:ty, $self_:ident => $inner:expr) => {
+        impl_executor!(@impl $ty, $self_ => $inner, None);
+    };
+    ($ty:ty, $self_:ident => $inner:expr, annotations: $ann:expr) => {
+        impl_executor!(@impl $ty, $self_ => $inner, $ann);
+    };
+    (@impl $ty:ty, $self_:ident => $inner:expr, $ann:expr) => {
         impl<'c, DB> sqlx::Executor<'c> for $ty
         where
             DB: Database,
@@ -305,8 +327,12 @@ macro_rules! impl_executor {
             {
                 let sql = query.sql().to_owned();
                 let state = $self_.state.clone();
-                let name = attributes::span_name(state.attrs.system, None, None);
-                let span_attrs = build_attributes(&state.attrs, Some(&sql), None, None);
+                let annotations: Option<&QueryAnnotations> = $ann;
+                let (op, coll) = annotations.map_or((None, None), |a| {
+                    (a.operation.as_deref(), a.collection.as_deref())
+                });
+                let name = attributes::span_name(state.attrs.system, op, coll);
+                let span_attrs = build_attributes(&state.attrs, Some(&sql), annotations);
                 let metric_attrs = state.attrs.base_key_values();
                 let (cx, start) = start_span(&name, span_attrs);
                 let fut = ($inner).execute(query);
@@ -325,7 +351,8 @@ macro_rules! impl_executor {
                 })
             }
 
-            /// Execute multiple queries and return the rows affected from each query, in a stream.
+            /// Execute multiple queries and return the rows affected from each query,
+            /// in a stream.
             fn execute_many<'e, 'q: 'e, E>(
                 $self_,
                 query: E,
@@ -336,8 +363,12 @@ macro_rules! impl_executor {
             {
                 let sql = query.sql().to_owned();
                 let state = $self_.state.clone();
-                let name = attributes::span_name(state.attrs.system, None, None);
-                let span_attrs = build_attributes(&state.attrs, Some(&sql), None, None);
+                let annotations: Option<&QueryAnnotations> = $ann;
+                let (op, coll) = annotations.map_or((None, None), |a| {
+                    (a.operation.as_deref(), a.collection.as_deref())
+                });
+                let name = attributes::span_name(state.attrs.system, op, coll);
+                let span_attrs = build_attributes(&state.attrs, Some(&sql), annotations);
                 let metric_attrs = state.attrs.base_key_values();
                 let (cx, start) = start_span(&name, span_attrs);
                 let stream = ($inner).execute_many(query);
@@ -361,8 +392,12 @@ macro_rules! impl_executor {
             {
                 let sql = query.sql().to_owned();
                 let state = $self_.state.clone();
-                let name = attributes::span_name(state.attrs.system, None, None);
-                let span_attrs = build_attributes(&state.attrs, Some(&sql), None, None);
+                let annotations: Option<&QueryAnnotations> = $ann;
+                let (op, coll) = annotations.map_or((None, None), |a| {
+                    (a.operation.as_deref(), a.collection.as_deref())
+                });
+                let name = attributes::span_name(state.attrs.system, op, coll);
+                let span_attrs = build_attributes(&state.attrs, Some(&sql), annotations);
                 let metric_attrs = state.attrs.base_key_values();
                 let (cx, start) = start_span(&name, span_attrs);
                 let stream = ($inner).fetch(query);
@@ -383,7 +418,10 @@ macro_rules! impl_executor {
             ) -> BoxStream<
                 'e,
                 Result<
-                    sqlx::Either<<DB as sqlx::Database>::QueryResult, <DB as sqlx::Database>::Row>,
+                    sqlx::Either<
+                        <DB as sqlx::Database>::QueryResult,
+                        <DB as sqlx::Database>::Row,
+                    >,
                     sqlx::Error,
                 >,
             >
@@ -393,8 +431,12 @@ macro_rules! impl_executor {
             {
                 let sql = query.sql().to_owned();
                 let state = $self_.state.clone();
-                let name = attributes::span_name(state.attrs.system, None, None);
-                let span_attrs = build_attributes(&state.attrs, Some(&sql), None, None);
+                let annotations: Option<&QueryAnnotations> = $ann;
+                let (op, coll) = annotations.map_or((None, None), |a| {
+                    (a.operation.as_deref(), a.collection.as_deref())
+                });
+                let name = attributes::span_name(state.attrs.system, op, coll);
+                let span_attrs = build_attributes(&state.attrs, Some(&sql), annotations);
                 let metric_attrs = state.attrs.base_key_values();
                 let (cx, start) = start_span(&name, span_attrs);
                 let stream = ($inner).fetch_many(query);
@@ -407,7 +449,8 @@ macro_rules! impl_executor {
                 ))
             }
 
-            /// Execute the query and return all the generated results, collected into a [`Vec`].
+            /// Execute the query and return all the generated results, collected into
+            /// a [`Vec`].
             fn fetch_all<'e, 'q: 'e, E>(
                 $self_,
                 query: E,
@@ -421,8 +464,12 @@ macro_rules! impl_executor {
             {
                 let sql = query.sql().to_owned();
                 let state = $self_.state.clone();
-                let name = attributes::span_name(state.attrs.system, None, None);
-                let span_attrs = build_attributes(&state.attrs, Some(&sql), None, None);
+                let annotations: Option<&QueryAnnotations> = $ann;
+                let (op, coll) = annotations.map_or((None, None), |a| {
+                    (a.operation.as_deref(), a.collection.as_deref())
+                });
+                let name = attributes::span_name(state.attrs.system, op, coll);
+                let span_attrs = build_attributes(&state.attrs, Some(&sql), annotations);
                 let metric_attrs = state.attrs.base_key_values();
                 let (cx, start) = start_span(&name, span_attrs);
                 let fut = ($inner).fetch_all(query);
@@ -457,8 +504,12 @@ macro_rules! impl_executor {
             {
                 let sql = query.sql().to_owned();
                 let state = $self_.state.clone();
-                let name = attributes::span_name(state.attrs.system, None, None);
-                let span_attrs = build_attributes(&state.attrs, Some(&sql), None, None);
+                let annotations: Option<&QueryAnnotations> = $ann;
+                let (op, coll) = annotations.map_or((None, None), |a| {
+                    (a.operation.as_deref(), a.collection.as_deref())
+                });
+                let name = attributes::span_name(state.attrs.system, op, coll);
+                let span_attrs = build_attributes(&state.attrs, Some(&sql), annotations);
                 let metric_attrs = state.attrs.base_key_values();
                 let (cx, start) = start_span(&name, span_attrs);
                 let fut = ($inner).fetch_one(query);
@@ -492,8 +543,12 @@ macro_rules! impl_executor {
             {
                 let sql = query.sql().to_owned();
                 let state = $self_.state.clone();
-                let name = attributes::span_name(state.attrs.system, None, None);
-                let span_attrs = build_attributes(&state.attrs, Some(&sql), None, None);
+                let annotations: Option<&QueryAnnotations> = $ann;
+                let (op, coll) = annotations.map_or((None, None), |a| {
+                    (a.operation.as_deref(), a.collection.as_deref())
+                });
+                let name = attributes::span_name(state.attrs.system, op, coll);
+                let span_attrs = build_attributes(&state.attrs, Some(&sql), annotations);
                 let metric_attrs = state.attrs.base_key_values();
                 let (cx, start) = start_span(&name, span_attrs);
                 let fut = ($inner).fetch_optional(query);
@@ -517,11 +572,11 @@ macro_rules! impl_executor {
             /// Prepare the SQL query to inspect the type information of its parameters
             /// and results.
             ///
-            /// Be advised that when using the `query`, `query_as`, or `query_scalar` functions, the query
-            /// is transparently prepared and executed.
+            /// Be advised that when using the `query`, `query_as`, or `query_scalar`
+            /// functions, the query is transparently prepared and executed.
             ///
-            /// This explicit API is provided to allow access to the statement metadata available after
-            /// it prepared but before the first row is returned.
+            /// This explicit API is provided to allow access to the statement metadata
+            /// available after it prepared but before the first row is returned.
             fn prepare<'e, 'q: 'e>(
                 $self_,
                 query: &'q str,
@@ -533,8 +588,12 @@ macro_rules! impl_executor {
                 'c: 'e,
             {
                 let state = $self_.state.clone();
-                let name = attributes::span_name(state.attrs.system, None, None);
-                let span_attrs = build_attributes(&state.attrs, Some(query), None, None);
+                let annotations: Option<&QueryAnnotations> = $ann;
+                let (op, coll) = annotations.map_or((None, None), |a| {
+                    (a.operation.as_deref(), a.collection.as_deref())
+                });
+                let name = attributes::span_name(state.attrs.system, op, coll);
+                let span_attrs = build_attributes(&state.attrs, Some(query), annotations);
                 let metric_attrs = state.attrs.base_key_values();
                 let (cx, start) = start_span(&name, span_attrs);
                 let fut = ($inner).prepare(query);
@@ -560,8 +619,12 @@ macro_rules! impl_executor {
                 'c: 'e,
             {
                 let state = $self_.state.clone();
-                let name = attributes::span_name(state.attrs.system, None, None);
-                let span_attrs = build_attributes(&state.attrs, Some(sql), None, None);
+                let annotations: Option<&QueryAnnotations> = $ann;
+                let (op, coll) = annotations.map_or((None, None), |a| {
+                    (a.operation.as_deref(), a.collection.as_deref())
+                });
+                let name = attributes::span_name(state.attrs.system, op, coll);
+                let span_attrs = build_attributes(&state.attrs, Some(sql), annotations);
                 let metric_attrs = state.attrs.base_key_values();
                 let (cx, start) = start_span(&name, span_attrs);
                 let fut = ($inner).prepare_with(sql, parameters);
@@ -570,11 +633,11 @@ macro_rules! impl_executor {
                 ))
             }
 
-             /// Describe the SQL query and return type information about its parameters
-             /// and results.
-             ///
-             /// This is used by compile-time verification in the query macros to
-             /// power their type inference.
+            /// Describe the SQL query and return type information about its parameters
+            /// and results.
+            ///
+            /// This is used by compile-time verification in the query macros to
+            /// power their type inference.
             #[doc(hidden)]
             fn describe<'e, 'q: 'e>(
                 $self_,
@@ -587,8 +650,12 @@ macro_rules! impl_executor {
                 'c: 'e,
             {
                 let state = $self_.state.clone();
-                let name = attributes::span_name(state.attrs.system, None, None);
-                let span_attrs = build_attributes(&state.attrs, Some(sql), None, None);
+                let annotations: Option<&QueryAnnotations> = $ann;
+                let (op, coll) = annotations.map_or((None, None), |a| {
+                    (a.operation.as_deref(), a.collection.as_deref())
+                });
+                let name = attributes::span_name(state.attrs.system, op, coll);
+                let span_attrs = build_attributes(&state.attrs, Some(sql), annotations);
                 let metric_attrs = state.attrs.base_key_values();
                 let (cx, start) = start_span(&name, span_attrs);
                 let fut = ($inner).describe(sql);
@@ -607,6 +674,23 @@ macro_rules! impl_executor {
 impl_executor!(&'_ crate::Pool<DB>, self => &self.inner);
 impl_executor!(&'c mut crate::PoolConnection<DB>, self => self.inner.as_mut());
 impl_executor!(&'c mut crate::Transaction<'_, DB>, self => &mut *self.inner);
+
+// Annotated wrappers – same instrumentation with per-query annotations threaded through.
+impl_executor!(
+    crate::annotations::Annotated<'c, crate::Pool<DB>>,
+    self => &self.inner.inner,
+    annotations: Some(&self.annotations)
+);
+impl_executor!(
+    crate::annotations::AnnotatedMut<'c, crate::PoolConnection<DB>>,
+    self => self.inner.inner.as_mut(),
+    annotations: Some(&self.annotations)
+);
+impl_executor!(
+    crate::annotations::AnnotatedMut<'c, crate::Transaction<'_, DB>>,
+    self => &mut *self.inner.inner,
+    annotations: Some(&self.annotations)
+);
 
 #[cfg(test)]
 mod tests {
@@ -689,10 +773,14 @@ mod tests {
         }
     }
 
+    // ===========================================================================
+    // query text
+    // ===========================================================================
+
     #[test]
     fn build_attributes_with_full_query_text() {
         let attrs = test_attrs();
-        let kv = build_attributes(&attrs, Some("SELECT 1"), None, None);
+        let kv = build_attributes(&attrs, Some("SELECT 1"), None);
         let keys: Vec<&str> = kv.iter().map(|k| k.key.as_str()).collect();
         assert!(keys.contains(&"db.query.text"));
     }
@@ -701,7 +789,7 @@ mod tests {
     fn build_attributes_with_off_query_text() {
         let mut attrs = test_attrs();
         attrs.query_text_mode = QueryTextMode::Off;
-        let kv = build_attributes(&attrs, Some("SELECT 1"), None, None);
+        let kv = build_attributes(&attrs, Some("SELECT 1"), None);
         let keys: Vec<&str> = kv.iter().map(|k| k.key.as_str()).collect();
         assert!(!keys.contains(&"db.query.text"));
     }
@@ -710,28 +798,107 @@ mod tests {
     fn build_attributes_obfuscated_suppresses_query_text() {
         let mut attrs = test_attrs();
         attrs.query_text_mode = QueryTextMode::Obfuscated;
-        let kv = build_attributes(&attrs, Some("SELECT secret"), None, None);
+        let kv = build_attributes(&attrs, Some("SELECT secret"), None);
         let keys: Vec<&str> = kv.iter().map(|k| k.key.as_str()).collect();
         assert!(!keys.contains(&"db.query.text"));
     }
 
-    #[test]
-    fn build_attributes_with_operation_and_collection() {
-        let attrs = test_attrs();
-        let kv = build_attributes(&attrs, None, Some("SELECT"), Some("users"));
-        let keys: Vec<&str> = kv.iter().map(|k| k.key.as_str()).collect();
-        assert!(keys.contains(&"db.operation.name"));
-        assert!(keys.contains(&"db.collection.name"));
-    }
+    // ===========================================================================
+    // annotations
+    // ===========================================================================
 
     #[test]
-    fn build_attributes_no_sql_no_op() {
+    fn build_attributes_no_sql_no_annotations() {
         let attrs = test_attrs();
-        let kv = build_attributes(&attrs, None, None, None);
+        let kv = build_attributes(&attrs, None, None);
         let keys: Vec<&str> = kv.iter().map(|k| k.key.as_str()).collect();
         assert!(!keys.contains(&"db.query.text"));
         assert!(!keys.contains(&"db.operation.name"));
         assert!(!keys.contains(&"db.collection.name"));
+        assert!(!keys.contains(&"db.query.summary"));
+        assert!(!keys.contains(&"db.stored_procedure.name"));
         assert!(keys.contains(&"db.system.name"));
+    }
+
+    #[test]
+    fn build_attributes_with_all_annotation_fields() {
+        let attrs = test_attrs();
+        let ann = QueryAnnotations::new()
+            .operation("SELECT")
+            .collection("users")
+            .query_summary("SELECT users")
+            .stored_procedure("sp_get");
+        let kv = build_attributes(&attrs, Some("SELECT * FROM users"), Some(&ann));
+        let find = |key: &str| {
+            kv.iter()
+                .find(|k| k.key.as_str() == key)
+                .map(|k| k.value.clone())
+        };
+        assert_eq!(
+            find("db.operation.name"),
+            Some(opentelemetry::Value::String("SELECT".into()))
+        );
+        assert_eq!(
+            find("db.collection.name"),
+            Some(opentelemetry::Value::String("users".into()))
+        );
+        assert_eq!(
+            find("db.query.summary"),
+            Some(opentelemetry::Value::String("SELECT users".into()))
+        );
+        assert_eq!(
+            find("db.stored_procedure.name"),
+            Some(opentelemetry::Value::String("sp_get".into()))
+        );
+        assert_eq!(
+            find("db.query.text"),
+            Some(opentelemetry::Value::String("SELECT * FROM users".into()))
+        );
+    }
+
+    #[test]
+    fn build_attributes_annotation_field_permutations() {
+        type Setter = fn(QueryAnnotations) -> QueryAnnotations;
+
+        let attrs = test_attrs();
+        let fields: &[(&str, Setter)] = &[
+            ("db.operation.name", |a| a.operation("SELECT")),
+            ("db.collection.name", |a| a.collection("users")),
+            ("db.query.summary", |a| a.query_summary("SELECT users")),
+            ("db.stored_procedure.name", |a| a.stored_procedure("sp")),
+        ];
+
+        // Verify every permutation (2^4 = 16) of the four annotation fields: each field that is
+        // `Some` must appear in the output, and each field that is `None` must be absent.
+        for mask in 0u8..16 {
+            let mut ann = QueryAnnotations::new();
+            for (i, &(_, setter)) in fields.iter().enumerate() {
+                if mask & (1 << i) != 0 {
+                    ann = setter(ann);
+                }
+            }
+            let kv = build_attributes(&attrs, None, Some(&ann));
+            let keys: Vec<&str> = kv.iter().map(|k| k.key.as_str()).collect();
+            for (i, &(key, _)) in fields.iter().enumerate() {
+                println!(
+                    "mask: {:08b}, field: {}, key: {}; contains: {}",
+                    mask,
+                    i,
+                    key,
+                    keys.contains(&key)
+                );
+                if mask & (1 << i) != 0 {
+                    assert!(
+                        keys.contains(&key),
+                        "{key} should be present for mask {mask:#06b}"
+                    );
+                } else {
+                    assert!(
+                        !keys.contains(&key),
+                        "{key} should be absent for mask {mask:#06b}"
+                    );
+                }
+            }
+        }
     }
 }

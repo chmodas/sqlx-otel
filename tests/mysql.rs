@@ -11,7 +11,7 @@ use opentelemetry::trace::SpanKind;
 use serial_test::serial;
 use sqlx::Executor as _;
 use sqlx::MySql;
-use sqlx_otel::{Pool, PoolBuilder, Transaction};
+use sqlx_otel::{Pool, PoolBuilder, QueryAnnotations, Transaction};
 use testcontainers::core::IntoContainerPort;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
@@ -61,6 +61,31 @@ async fn test_pool() -> Pool<MySql> {
     PoolBuilder::from(raw).build()
 }
 
+/// Standard annotations used across annotation assertions.
+fn test_annotations() -> QueryAnnotations {
+    QueryAnnotations::new()
+        .operation("SELECT")
+        .collection("users")
+}
+
+/// Assert that the span carries the standard annotation attributes.
+fn assert_annotated_span(span: &opentelemetry_sdk::trace::SpanData) {
+    assert_eq!(span.span_kind, SpanKind::Client);
+    assert_eq!(span.name, "SELECT users");
+    assert_eq!(
+        attr(span, "db.system.name"),
+        Some(opentelemetry::Value::String(SYSTEM.to_owned().into())),
+    );
+    assert_eq!(
+        attr(span, "db.operation.name"),
+        Some(opentelemetry::Value::String("SELECT".into())),
+    );
+    assert_eq!(
+        attr(span, "db.collection.name"),
+        Some(opentelemetry::Value::String("users".into())),
+    );
+}
+
 // ===========================================================================
 // execute
 // ===========================================================================
@@ -81,6 +106,20 @@ async fn execute_creates_span_via_pool() {
     assert_common_span_attributes(&spans[0], SYSTEM);
     assert!(attr(&spans[0], "db.response.returned_rows").is_none());
     assert!(attr(&spans[0], "db.response.affected_rows").is_some());
+
+    // With annotations
+    pool.with_annotations(test_annotations())
+        .execute("CREATE TABLE IF NOT EXISTS exec_pool (id INT AUTO_INCREMENT PRIMARY KEY)")
+        .await
+        .unwrap();
+    assert_annotated_span(tel.spans().last().unwrap());
+
+    // With shorthand
+    pool.with_operation("SELECT", "users")
+        .execute("CREATE TABLE IF NOT EXISTS exec_pool3 (id INT AUTO_INCREMENT PRIMARY KEY)")
+        .await
+        .unwrap();
+    assert_annotated_span(tel.spans().last().unwrap());
 }
 
 #[tokio::test]
@@ -100,6 +139,20 @@ async fn execute_creates_span_via_connection() {
     assert_common_span_attributes(&spans[0], SYSTEM);
     assert!(attr(&spans[0], "db.response.returned_rows").is_none());
     assert!(attr(&spans[0], "db.response.affected_rows").is_some());
+
+    // With annotations
+    conn.with_annotations(test_annotations())
+        .execute("CREATE TABLE IF NOT EXISTS exec_conn (id INT AUTO_INCREMENT PRIMARY KEY)")
+        .await
+        .unwrap();
+    assert_annotated_span(tel.spans().last().unwrap());
+
+    // With shorthand
+    conn.with_operation("SELECT", "users")
+        .execute("CREATE TABLE IF NOT EXISTS exec_conn3 (id INT AUTO_INCREMENT PRIMARY KEY)")
+        .await
+        .unwrap();
+    assert_annotated_span(tel.spans().last().unwrap());
 }
 
 #[tokio::test]
@@ -113,13 +166,26 @@ async fn execute_creates_span_via_transaction() {
         .execute(&mut tx)
         .await
         .unwrap();
+
+    // With annotations
+    tx.with_annotations(test_annotations())
+        .execute("CREATE TABLE IF NOT EXISTS exec_tx (id INT AUTO_INCREMENT PRIMARY KEY)")
+        .await
+        .unwrap();
+
+    // With shorthand
+    tx.with_operation("SELECT", "users")
+        .execute("CREATE TABLE IF NOT EXISTS exec_tx3 (id INT AUTO_INCREMENT PRIMARY KEY)")
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
 
     let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
+    assert_eq!(spans.len(), 3);
     assert_common_span_attributes(&spans[0], SYSTEM);
     assert!(attr(&spans[0], "db.response.returned_rows").is_none());
     assert!(attr(&spans[0], "db.response.affected_rows").is_some());
+    assert_annotated_span(tel.spans().last().unwrap());
 }
 
 #[tokio::test]
@@ -136,6 +202,27 @@ async fn execute_records_error() {
     assert_common_span_attributes(&spans[0], SYSTEM);
     assert_error_span(&spans[0]);
     assert!(attr(&spans[0], "db.response.returned_rows").is_none());
+
+    // With annotations (error path)
+    let result = pool
+        .with_annotations(test_annotations())
+        .execute("INVALID SQL GIBBERISH")
+        .await;
+    assert!(result.is_err());
+    let spans = tel.spans();
+    let last = spans.last().unwrap();
+    assert_annotated_span(last);
+    assert_error_span(last);
+
+    // With shorthand (error path)
+    let result = pool
+        .with_operation("SELECT", "users")
+        .execute("INVALID SQL GIBBERISH")
+        .await;
+    assert!(result.is_err());
+    let last = tel.spans().last().unwrap().clone();
+    assert_annotated_span(&last);
+    assert_error_span(&last);
 }
 
 #[tokio::test]
@@ -264,6 +351,22 @@ async fn execute_many_via_pool() {
         attr(&spans[0], "db.response.returned_rows"),
         Some(opentelemetry::Value::I64(0))
     );
+
+    // With annotations
+    let mut stream = pool
+        .with_annotations(test_annotations())
+        .execute_many("SELECT 1; SELECT 2");
+    while stream.next().await.is_some() {}
+    drop(stream);
+    assert_annotated_span(tel.spans().last().unwrap());
+
+    // With shorthand
+    let mut stream = pool
+        .with_operation("SELECT", "users")
+        .execute_many("SELECT 1; SELECT 2");
+    while stream.next().await.is_some() {}
+    drop(stream);
+    assert_annotated_span(tel.spans().last().unwrap());
 }
 
 #[tokio::test]
@@ -284,6 +387,22 @@ async fn execute_many_via_connection() {
         attr(&spans[0], "db.response.returned_rows"),
         Some(opentelemetry::Value::I64(0))
     );
+
+    // With annotations
+    let mut stream = conn
+        .with_annotations(test_annotations())
+        .execute_many("SELECT 1; SELECT 2");
+    while stream.next().await.is_some() {}
+    drop(stream);
+    assert_annotated_span(tel.spans().last().unwrap());
+
+    // With shorthand
+    let mut stream = conn
+        .with_operation("SELECT", "users")
+        .execute_many("SELECT 1; SELECT 2");
+    while stream.next().await.is_some() {}
+    drop(stream);
+    assert_annotated_span(tel.spans().last().unwrap());
 }
 
 #[tokio::test]
@@ -297,15 +416,30 @@ async fn execute_many_via_transaction() {
     let mut stream = (&mut tx).execute_many("SELECT 1; SELECT 2");
     while stream.next().await.is_some() {}
     drop(stream);
+
+    // With annotations
+    let mut stream = tx
+        .with_annotations(test_annotations())
+        .execute_many("SELECT 1; SELECT 2");
+    while stream.next().await.is_some() {}
+    drop(stream);
+
+    // With shorthand
+    let mut stream = tx
+        .with_operation("SELECT", "users")
+        .execute_many("SELECT 1; SELECT 2");
+    while stream.next().await.is_some() {}
+    drop(stream);
     tx.commit().await.unwrap();
 
     let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
+    assert_eq!(spans.len(), 3);
     assert_common_span_attributes(&spans[0], SYSTEM);
     assert_eq!(
         attr(&spans[0], "db.response.returned_rows"),
         Some(opentelemetry::Value::I64(0))
     );
+    assert_annotated_span(tel.spans().last().unwrap());
 }
 
 #[tokio::test]
@@ -327,6 +461,29 @@ async fn execute_many_records_error() {
         attr(&spans[0], "db.response.returned_rows"),
         Some(opentelemetry::Value::I64(0))
     );
+
+    // With annotations (error path)
+    let mut stream = pool
+        .with_annotations(test_annotations())
+        .execute_many("INVALID SQL GIBBERISH");
+    let result = stream.next().await;
+    assert!(result.is_some_and(|r| r.is_err()));
+    drop(stream);
+    let spans = tel.spans();
+    let last = spans.last().unwrap();
+    assert_annotated_span(last);
+    assert_error_span(last);
+
+    // With shorthand (error path)
+    let mut stream = pool
+        .with_operation("SELECT", "users")
+        .execute_many("INVALID SQL GIBBERISH");
+    let result = stream.next().await;
+    assert!(result.is_some_and(|r| r.is_err()));
+    drop(stream);
+    let last = tel.spans().last().unwrap().clone();
+    assert_annotated_span(&last);
+    assert_error_span(&last);
 }
 
 // ===========================================================================
@@ -354,6 +511,22 @@ async fn fetch_via_pool() {
         attr(&spans[0], "db.response.returned_rows"),
         Some(opentelemetry::Value::I64(2))
     );
+
+    // With annotations
+    let mut stream = pool
+        .with_annotations(test_annotations())
+        .fetch("SELECT 1 UNION ALL SELECT 2");
+    while stream.next().await.is_some() {}
+    drop(stream);
+    assert_annotated_span(tel.spans().last().unwrap());
+
+    // With shorthand
+    let mut stream = pool
+        .with_operation("SELECT", "users")
+        .fetch("SELECT 1 UNION ALL SELECT 2");
+    while stream.next().await.is_some() {}
+    drop(stream);
+    assert_annotated_span(tel.spans().last().unwrap());
 }
 
 #[tokio::test]
@@ -374,6 +547,22 @@ async fn fetch_via_connection() {
         attr(&spans[0], "db.response.returned_rows"),
         Some(opentelemetry::Value::I64(2))
     );
+
+    // With annotations
+    let mut stream = conn
+        .with_annotations(test_annotations())
+        .fetch("SELECT 1 UNION ALL SELECT 2");
+    while stream.next().await.is_some() {}
+    drop(stream);
+    assert_annotated_span(tel.spans().last().unwrap());
+
+    // With shorthand
+    let mut stream = conn
+        .with_operation("SELECT", "users")
+        .fetch("SELECT 1 UNION ALL SELECT 2");
+    while stream.next().await.is_some() {}
+    drop(stream);
+    assert_annotated_span(tel.spans().last().unwrap());
 }
 
 #[tokio::test]
@@ -387,15 +576,30 @@ async fn fetch_via_transaction() {
     let mut stream = (&mut tx).fetch("SELECT 1 UNION ALL SELECT 2");
     while stream.next().await.is_some() {}
     drop(stream);
+
+    // With annotations
+    let mut stream = tx
+        .with_annotations(test_annotations())
+        .fetch("SELECT 1 UNION ALL SELECT 2");
+    while stream.next().await.is_some() {}
+    drop(stream);
+
+    // With shorthand
+    let mut stream = tx
+        .with_operation("SELECT", "users")
+        .fetch("SELECT 1 UNION ALL SELECT 2");
+    while stream.next().await.is_some() {}
+    drop(stream);
     tx.commit().await.unwrap();
 
     let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
+    assert_eq!(spans.len(), 3);
     assert_common_span_attributes(&spans[0], SYSTEM);
     assert_eq!(
         attr(&spans[0], "db.response.returned_rows"),
         Some(opentelemetry::Value::I64(2))
     );
+    assert_annotated_span(tel.spans().last().unwrap());
 }
 
 #[tokio::test]
@@ -437,6 +641,27 @@ async fn fetch_stream_records_error() {
         Some(opentelemetry::Value::I64(0))
     );
     assert_error_span(&spans[0]);
+
+    // With annotations (error path)
+    let mut stream = pool
+        .with_annotations(test_annotations())
+        .fetch("INVALID SQL");
+    let result = stream.next().await;
+    assert!(result.is_some_and(|r| r.is_err()));
+    drop(stream);
+    let spans = tel.spans();
+    let last = spans.last().unwrap();
+    assert_annotated_span(last);
+    assert_error_span(last);
+
+    // With shorthand (error path)
+    let mut stream = pool.with_operation("SELECT", "users").fetch("INVALID SQL");
+    let result = stream.next().await;
+    assert!(result.is_some_and(|r| r.is_err()));
+    drop(stream);
+    let last = tel.spans().last().unwrap().clone();
+    assert_annotated_span(&last);
+    assert_error_span(&last);
 }
 
 // ===========================================================================
@@ -466,6 +691,22 @@ async fn fetch_many_via_pool() {
         attr(&spans[0], "db.response.returned_rows"),
         Some(opentelemetry::Value::I64(2))
     );
+
+    // With annotations
+    let mut stream = pool
+        .with_annotations(test_annotations())
+        .fetch_many("SELECT 1 UNION ALL SELECT 2");
+    while stream.next().await.is_some() {}
+    drop(stream);
+    assert_annotated_span(tel.spans().last().unwrap());
+
+    // With shorthand
+    let mut stream = pool
+        .with_operation("SELECT", "users")
+        .fetch_many("SELECT 1 UNION ALL SELECT 2");
+    while stream.next().await.is_some() {}
+    drop(stream);
+    assert_annotated_span(tel.spans().last().unwrap());
 }
 
 #[tokio::test]
@@ -486,6 +727,22 @@ async fn fetch_many_via_connection() {
         attr(&spans[0], "db.response.returned_rows"),
         Some(opentelemetry::Value::I64(2))
     );
+
+    // With annotations
+    let mut stream = conn
+        .with_annotations(test_annotations())
+        .fetch_many("SELECT 1 UNION ALL SELECT 2");
+    while stream.next().await.is_some() {}
+    drop(stream);
+    assert_annotated_span(tel.spans().last().unwrap());
+
+    // With shorthand
+    let mut stream = conn
+        .with_operation("SELECT", "users")
+        .fetch_many("SELECT 1 UNION ALL SELECT 2");
+    while stream.next().await.is_some() {}
+    drop(stream);
+    assert_annotated_span(tel.spans().last().unwrap());
 }
 
 #[tokio::test]
@@ -499,15 +756,30 @@ async fn fetch_many_via_transaction() {
     let mut stream = (&mut tx).fetch_many("SELECT 1 UNION ALL SELECT 2");
     while stream.next().await.is_some() {}
     drop(stream);
+
+    // With annotations
+    let mut stream = tx
+        .with_annotations(test_annotations())
+        .fetch_many("SELECT 1 UNION ALL SELECT 2");
+    while stream.next().await.is_some() {}
+    drop(stream);
+
+    // With shorthand
+    let mut stream = tx
+        .with_operation("SELECT", "users")
+        .fetch_many("SELECT 1 UNION ALL SELECT 2");
+    while stream.next().await.is_some() {}
+    drop(stream);
     tx.commit().await.unwrap();
 
     let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
+    assert_eq!(spans.len(), 3);
     assert_common_span_attributes(&spans[0], SYSTEM);
     assert_eq!(
         attr(&spans[0], "db.response.returned_rows"),
         Some(opentelemetry::Value::I64(2))
     );
+    assert_annotated_span(tel.spans().last().unwrap());
 }
 
 #[tokio::test]
@@ -549,6 +821,29 @@ async fn fetch_many_records_error() {
         Some(opentelemetry::Value::I64(0))
     );
     assert_error_span(&spans[0]);
+
+    // With annotations (error path)
+    let mut stream = pool
+        .with_annotations(test_annotations())
+        .fetch_many("INVALID SQL GIBBERISH");
+    let result = stream.next().await;
+    assert!(result.is_some_and(|r| r.is_err()));
+    drop(stream);
+    let spans = tel.spans();
+    let last = spans.last().unwrap();
+    assert_annotated_span(last);
+    assert_error_span(last);
+
+    // With shorthand (error path)
+    let mut stream = pool
+        .with_operation("SELECT", "users")
+        .fetch_many("INVALID SQL GIBBERISH");
+    let result = stream.next().await;
+    assert!(result.is_some_and(|r| r.is_err()));
+    drop(stream);
+    let last = tel.spans().last().unwrap().clone();
+    assert_annotated_span(&last);
+    assert_error_span(&last);
 }
 
 // ===========================================================================
@@ -574,6 +869,20 @@ async fn fetch_all_via_pool() {
         attr(&spans[0], "db.response.returned_rows"),
         Some(opentelemetry::Value::I64(3))
     );
+
+    // With annotations
+    pool.with_annotations(test_annotations())
+        .fetch_all("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3")
+        .await
+        .unwrap();
+    assert_annotated_span(tel.spans().last().unwrap());
+
+    // With shorthand
+    pool.with_operation("SELECT", "users")
+        .fetch_all("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3")
+        .await
+        .unwrap();
+    assert_annotated_span(tel.spans().last().unwrap());
 }
 
 #[tokio::test]
@@ -596,6 +905,20 @@ async fn fetch_all_via_connection() {
         attr(&spans[0], "db.response.returned_rows"),
         Some(opentelemetry::Value::I64(2))
     );
+
+    // With annotations
+    conn.with_annotations(test_annotations())
+        .fetch_all("SELECT 1 UNION ALL SELECT 2")
+        .await
+        .unwrap();
+    assert_annotated_span(tel.spans().last().unwrap());
+
+    // With shorthand
+    conn.with_operation("SELECT", "users")
+        .fetch_all("SELECT 1 UNION ALL SELECT 2")
+        .await
+        .unwrap();
+    assert_annotated_span(tel.spans().last().unwrap());
 }
 
 #[tokio::test]
@@ -610,15 +933,28 @@ async fn fetch_all_via_transaction() {
         .await
         .unwrap();
     assert_eq!(rows.len(), 2);
+
+    // With annotations
+    tx.with_annotations(test_annotations())
+        .fetch_all("SELECT 1 UNION ALL SELECT 2")
+        .await
+        .unwrap();
+
+    // With shorthand
+    tx.with_operation("SELECT", "users")
+        .fetch_all("SELECT 1 UNION ALL SELECT 2")
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
 
     let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
+    assert_eq!(spans.len(), 3);
     assert_common_span_attributes(&spans[0], SYSTEM);
     assert_eq!(
         attr(&spans[0], "db.response.returned_rows"),
         Some(opentelemetry::Value::I64(2))
     );
+    assert_annotated_span(tel.spans().last().unwrap());
 }
 
 #[tokio::test]
@@ -635,6 +971,27 @@ async fn fetch_all_records_error() {
     assert_common_span_attributes(&spans[0], SYSTEM);
     assert!(attr(&spans[0], "db.response.returned_rows").is_none());
     assert_error_span(&spans[0]);
+
+    // With annotations (error path)
+    let result = pool
+        .with_annotations(test_annotations())
+        .fetch_all("INVALID SQL GIBBERISH")
+        .await;
+    assert!(result.is_err());
+    let spans = tel.spans();
+    let last = spans.last().unwrap();
+    assert_annotated_span(last);
+    assert_error_span(last);
+
+    // With shorthand (error path)
+    let result = pool
+        .with_operation("SELECT", "users")
+        .fetch_all("INVALID SQL GIBBERISH")
+        .await;
+    assert!(result.is_err());
+    let last = tel.spans().last().unwrap().clone();
+    assert_annotated_span(&last);
+    assert_error_span(&last);
 }
 
 // ===========================================================================
@@ -656,6 +1013,20 @@ async fn fetch_one_via_pool() {
         attr(&spans[0], "db.response.returned_rows"),
         Some(opentelemetry::Value::I64(1))
     );
+
+    // With annotations
+    pool.with_annotations(test_annotations())
+        .fetch_one("SELECT 1")
+        .await
+        .unwrap();
+    assert_annotated_span(tel.spans().last().unwrap());
+
+    // With shorthand
+    pool.with_operation("SELECT", "users")
+        .fetch_one("SELECT 1")
+        .await
+        .unwrap();
+    assert_annotated_span(tel.spans().last().unwrap());
 }
 
 #[tokio::test]
@@ -674,6 +1045,20 @@ async fn fetch_one_via_connection() {
         attr(&spans[0], "db.response.returned_rows"),
         Some(opentelemetry::Value::I64(1))
     );
+
+    // With annotations
+    conn.with_annotations(test_annotations())
+        .fetch_one("SELECT 1")
+        .await
+        .unwrap();
+    assert_annotated_span(tel.spans().last().unwrap());
+
+    // With shorthand
+    conn.with_operation("SELECT", "users")
+        .fetch_one("SELECT 1")
+        .await
+        .unwrap();
+    assert_annotated_span(tel.spans().last().unwrap());
 }
 
 #[tokio::test]
@@ -684,15 +1069,28 @@ async fn fetch_one_via_transaction() {
 
     let mut tx: Transaction<'_, MySql> = pool.begin().await.unwrap();
     let _row = (&mut tx).fetch_one("SELECT 1").await.unwrap();
+
+    // With annotations
+    tx.with_annotations(test_annotations())
+        .fetch_one("SELECT 1")
+        .await
+        .unwrap();
+
+    // With shorthand
+    tx.with_operation("SELECT", "users")
+        .fetch_one("SELECT 1")
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
 
     let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
+    assert_eq!(spans.len(), 3);
     assert_common_span_attributes(&spans[0], SYSTEM);
     assert_eq!(
         attr(&spans[0], "db.response.returned_rows"),
         Some(opentelemetry::Value::I64(1))
     );
+    assert_annotated_span(tel.spans().last().unwrap());
 }
 
 #[tokio::test]
@@ -709,6 +1107,27 @@ async fn fetch_one_records_error() {
     assert_common_span_attributes(&spans[0], SYSTEM);
     assert!(attr(&spans[0], "db.response.returned_rows").is_none());
     assert_error_span(&spans[0]);
+
+    // With annotations (error path)
+    let result = pool
+        .with_annotations(test_annotations())
+        .fetch_one("INVALID SQL GIBBERISH")
+        .await;
+    assert!(result.is_err());
+    let spans = tel.spans();
+    let last = spans.last().unwrap();
+    assert_annotated_span(last);
+    assert_error_span(last);
+
+    // With shorthand (error path)
+    let result = pool
+        .with_operation("SELECT", "users")
+        .fetch_one("INVALID SQL GIBBERISH")
+        .await;
+    assert!(result.is_err());
+    let last = tel.spans().last().unwrap().clone();
+    assert_annotated_span(&last);
+    assert_error_span(&last);
 }
 
 // ===========================================================================
@@ -731,6 +1150,20 @@ async fn fetch_optional_records_one_row() {
         attr(&spans[0], "db.response.returned_rows"),
         Some(opentelemetry::Value::I64(1))
     );
+
+    // With annotations
+    pool.with_annotations(test_annotations())
+        .fetch_optional("SELECT 1")
+        .await
+        .unwrap();
+    assert_annotated_span(tel.spans().last().unwrap());
+
+    // With shorthand
+    pool.with_operation("SELECT", "users")
+        .fetch_optional("SELECT 1")
+        .await
+        .unwrap();
+    assert_annotated_span(tel.spans().last().unwrap());
 }
 
 #[tokio::test]
@@ -781,6 +1214,20 @@ async fn fetch_optional_via_connection() {
         attr(&spans[0], "db.response.returned_rows"),
         Some(opentelemetry::Value::I64(1))
     );
+
+    // With annotations
+    conn.with_annotations(test_annotations())
+        .fetch_optional("SELECT 42")
+        .await
+        .unwrap();
+    assert_annotated_span(tel.spans().last().unwrap());
+
+    // With shorthand
+    conn.with_operation("SELECT", "users")
+        .fetch_optional("SELECT 42")
+        .await
+        .unwrap();
+    assert_annotated_span(tel.spans().last().unwrap());
 }
 
 #[tokio::test]
@@ -792,15 +1239,28 @@ async fn fetch_optional_via_transaction() {
     let mut tx: Transaction<'_, MySql> = pool.begin().await.unwrap();
     let result = (&mut tx).fetch_optional("SELECT 99").await.unwrap();
     assert!(result.is_some());
+
+    // With annotations
+    tx.with_annotations(test_annotations())
+        .fetch_optional("SELECT 99")
+        .await
+        .unwrap();
+
+    // With shorthand
+    tx.with_operation("SELECT", "users")
+        .fetch_optional("SELECT 99")
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
 
     let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
+    assert_eq!(spans.len(), 3);
     assert_common_span_attributes(&spans[0], SYSTEM);
     assert_eq!(
         attr(&spans[0], "db.response.returned_rows"),
         Some(opentelemetry::Value::I64(1))
     );
+    assert_annotated_span(tel.spans().last().unwrap());
 }
 
 #[tokio::test]
@@ -817,6 +1277,27 @@ async fn fetch_optional_records_error() {
     assert_common_span_attributes(&spans[0], SYSTEM);
     assert!(attr(&spans[0], "db.response.returned_rows").is_none());
     assert_error_span(&spans[0]);
+
+    // With annotations (error path)
+    let result = pool
+        .with_annotations(test_annotations())
+        .fetch_optional("INVALID SQL GIBBERISH")
+        .await;
+    assert!(result.is_err());
+    let spans = tel.spans();
+    let last = spans.last().unwrap();
+    assert_annotated_span(last);
+    assert_error_span(last);
+
+    // With shorthand (error path)
+    let result = pool
+        .with_operation("SELECT", "users")
+        .fetch_optional("INVALID SQL GIBBERISH")
+        .await;
+    assert!(result.is_err());
+    let last = tel.spans().last().unwrap().clone();
+    assert_annotated_span(&last);
+    assert_error_span(&last);
 }
 
 // ===========================================================================
@@ -835,6 +1316,20 @@ async fn prepare_via_pool() {
     assert_eq!(spans.len(), 1);
     assert_common_span_attributes(&spans[0], SYSTEM);
     assert!(attr(&spans[0], "db.response.returned_rows").is_none());
+
+    // With annotations
+    pool.with_annotations(test_annotations())
+        .prepare("SELECT 1")
+        .await
+        .unwrap();
+    assert_annotated_span(tel.spans().last().unwrap());
+
+    // With shorthand
+    pool.with_operation("SELECT", "users")
+        .prepare("SELECT 1")
+        .await
+        .unwrap();
+    assert_annotated_span(tel.spans().last().unwrap());
 }
 
 #[tokio::test]
@@ -850,6 +1345,20 @@ async fn prepare_via_connection() {
     assert_eq!(spans.len(), 1);
     assert_common_span_attributes(&spans[0], SYSTEM);
     assert!(attr(&spans[0], "db.response.returned_rows").is_none());
+
+    // With annotations
+    conn.with_annotations(test_annotations())
+        .prepare("SELECT 1")
+        .await
+        .unwrap();
+    assert_annotated_span(tel.spans().last().unwrap());
+
+    // With shorthand
+    conn.with_operation("SELECT", "users")
+        .prepare("SELECT 1")
+        .await
+        .unwrap();
+    assert_annotated_span(tel.spans().last().unwrap());
 }
 
 #[tokio::test]
@@ -860,12 +1369,25 @@ async fn prepare_via_transaction() {
 
     let mut tx: Transaction<'_, MySql> = pool.begin().await.unwrap();
     let _stmt = (&mut tx).prepare("SELECT 1").await.unwrap();
+
+    // With annotations
+    tx.with_annotations(test_annotations())
+        .prepare("SELECT 1")
+        .await
+        .unwrap();
+
+    // With shorthand
+    tx.with_operation("SELECT", "users")
+        .prepare("SELECT 1")
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
 
     let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
+    assert_eq!(spans.len(), 3);
     assert_common_span_attributes(&spans[0], SYSTEM);
     assert!(attr(&spans[0], "db.response.returned_rows").is_none());
+    assert_annotated_span(tel.spans().last().unwrap());
 }
 
 #[tokio::test]
@@ -883,6 +1405,27 @@ async fn prepare_records_error() {
     assert_common_span_attributes(&spans[0], SYSTEM);
     assert!(attr(&spans[0], "db.response.returned_rows").is_none());
     assert_error_span(&spans[0]);
+
+    // With annotations (error path)
+    let result = conn
+        .with_annotations(test_annotations())
+        .prepare("INVALID SQL GIBBERISH")
+        .await;
+    assert!(result.is_err());
+    let spans = tel.spans();
+    let last = spans.last().unwrap();
+    assert_annotated_span(last);
+    assert_error_span(last);
+
+    // With shorthand (error path)
+    let result = conn
+        .with_operation("SELECT", "users")
+        .prepare("INVALID SQL GIBBERISH")
+        .await;
+    assert!(result.is_err());
+    let last = tel.spans().last().unwrap().clone();
+    assert_annotated_span(&last);
+    assert_error_span(&last);
 }
 
 // ===========================================================================
@@ -901,6 +1444,20 @@ async fn prepare_with_via_pool() {
     assert_eq!(spans.len(), 1);
     assert_common_span_attributes(&spans[0], SYSTEM);
     assert!(attr(&spans[0], "db.response.returned_rows").is_none());
+
+    // With annotations
+    pool.with_annotations(test_annotations())
+        .prepare_with("SELECT ?", &[])
+        .await
+        .unwrap();
+    assert_annotated_span(tel.spans().last().unwrap());
+
+    // With shorthand
+    pool.with_operation("SELECT", "users")
+        .prepare_with("SELECT ?", &[])
+        .await
+        .unwrap();
+    assert_annotated_span(tel.spans().last().unwrap());
 }
 
 #[tokio::test]
@@ -916,6 +1473,20 @@ async fn prepare_with_via_connection() {
     assert_eq!(spans.len(), 1);
     assert_common_span_attributes(&spans[0], SYSTEM);
     assert!(attr(&spans[0], "db.response.returned_rows").is_none());
+
+    // With annotations
+    conn.with_annotations(test_annotations())
+        .prepare_with("SELECT ?", &[])
+        .await
+        .unwrap();
+    assert_annotated_span(tel.spans().last().unwrap());
+
+    // With shorthand
+    conn.with_operation("SELECT", "users")
+        .prepare_with("SELECT ?", &[])
+        .await
+        .unwrap();
+    assert_annotated_span(tel.spans().last().unwrap());
 }
 
 #[tokio::test]
@@ -926,12 +1497,25 @@ async fn prepare_with_via_transaction() {
 
     let mut tx: Transaction<'_, MySql> = pool.begin().await.unwrap();
     let _stmt = (&mut tx).prepare_with("SELECT ?", &[]).await.unwrap();
+
+    // With annotations
+    tx.with_annotations(test_annotations())
+        .prepare_with("SELECT ?", &[])
+        .await
+        .unwrap();
+
+    // With shorthand
+    tx.with_operation("SELECT", "users")
+        .prepare_with("SELECT ?", &[])
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
 
     let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
+    assert_eq!(spans.len(), 3);
     assert_common_span_attributes(&spans[0], SYSTEM);
     assert!(attr(&spans[0], "db.response.returned_rows").is_none());
+    assert_annotated_span(tel.spans().last().unwrap());
 }
 
 #[tokio::test]
@@ -949,6 +1533,27 @@ async fn prepare_with_records_error() {
     assert_common_span_attributes(&spans[0], SYSTEM);
     assert!(attr(&spans[0], "db.response.returned_rows").is_none());
     assert_error_span(&spans[0]);
+
+    // With annotations (error path)
+    let result = conn
+        .with_annotations(test_annotations())
+        .prepare_with("INVALID SQL GIBBERISH", &[])
+        .await;
+    assert!(result.is_err());
+    let spans = tel.spans();
+    let last = spans.last().unwrap();
+    assert_annotated_span(last);
+    assert_error_span(last);
+
+    // With shorthand (error path)
+    let result = conn
+        .with_operation("SELECT", "users")
+        .prepare_with("INVALID SQL GIBBERISH", &[])
+        .await;
+    assert!(result.is_err());
+    let last = tel.spans().last().unwrap().clone();
+    assert_annotated_span(&last);
+    assert_error_span(&last);
 }
 
 // ===========================================================================
@@ -967,6 +1572,20 @@ async fn describe_via_pool() {
     assert_eq!(spans.len(), 1);
     assert_common_span_attributes(&spans[0], SYSTEM);
     assert!(attr(&spans[0], "db.response.returned_rows").is_none());
+
+    // With annotations
+    pool.with_annotations(test_annotations())
+        .describe("SELECT 1")
+        .await
+        .unwrap();
+    assert_annotated_span(tel.spans().last().unwrap());
+
+    // With shorthand
+    pool.with_operation("SELECT", "users")
+        .describe("SELECT 1")
+        .await
+        .unwrap();
+    assert_annotated_span(tel.spans().last().unwrap());
 }
 
 #[tokio::test]
@@ -982,6 +1601,20 @@ async fn describe_via_connection() {
     assert_eq!(spans.len(), 1);
     assert_common_span_attributes(&spans[0], SYSTEM);
     assert!(attr(&spans[0], "db.response.returned_rows").is_none());
+
+    // With annotations
+    conn.with_annotations(test_annotations())
+        .describe("SELECT 1")
+        .await
+        .unwrap();
+    assert_annotated_span(tel.spans().last().unwrap());
+
+    // With shorthand
+    conn.with_operation("SELECT", "users")
+        .describe("SELECT 1")
+        .await
+        .unwrap();
+    assert_annotated_span(tel.spans().last().unwrap());
 }
 
 #[tokio::test]
@@ -992,12 +1625,25 @@ async fn describe_via_transaction() {
 
     let mut tx: Transaction<'_, MySql> = pool.begin().await.unwrap();
     let _desc = (&mut tx).describe("SELECT 1").await.unwrap();
+
+    // With annotations
+    tx.with_annotations(test_annotations())
+        .describe("SELECT 1")
+        .await
+        .unwrap();
+
+    // With shorthand
+    tx.with_operation("SELECT", "users")
+        .describe("SELECT 1")
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
 
     let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
+    assert_eq!(spans.len(), 3);
     assert_common_span_attributes(&spans[0], SYSTEM);
     assert!(attr(&spans[0], "db.response.returned_rows").is_none());
+    assert_annotated_span(tel.spans().last().unwrap());
 }
 
 #[tokio::test]
@@ -1015,6 +1661,27 @@ async fn describe_records_error() {
     assert_common_span_attributes(&spans[0], SYSTEM);
     assert!(attr(&spans[0], "db.response.returned_rows").is_none());
     assert_error_span(&spans[0]);
+
+    // With annotations (error path)
+    let result = conn
+        .with_annotations(test_annotations())
+        .describe("INVALID SQL GIBBERISH")
+        .await;
+    assert!(result.is_err());
+    let spans = tel.spans();
+    let last = spans.last().unwrap();
+    assert_annotated_span(last);
+    assert_error_span(last);
+
+    // With shorthand (error path)
+    let result = conn
+        .with_operation("SELECT", "users")
+        .describe("INVALID SQL GIBBERISH")
+        .await;
+    assert!(result.is_err());
+    let last = tel.spans().last().unwrap().clone();
+    assert_annotated_span(&last);
+    assert_error_span(&last);
 }
 
 // ===========================================================================
@@ -1293,5 +1960,47 @@ async fn query_text_mode_off_suppresses_sql() {
     assert!(
         attr(&spans[0], "db.query.text").is_none(),
         "db.query.text should not be present when QueryTextMode::Off"
+    );
+}
+
+// ===========================================================================
+// Annotations
+// ===========================================================================
+
+#[tokio::test]
+#[serial]
+async fn annotation_all_four_fields() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    pool.with_annotations(
+        QueryAnnotations::new()
+            .operation("SELECT")
+            .collection("users")
+            .query_summary("SELECT users")
+            .stored_procedure("sp_get_users"),
+    )
+    .fetch_all("SELECT 1")
+    .await
+    .unwrap();
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].name, "SELECT users");
+    assert_eq!(
+        attr(&spans[0], "db.operation.name"),
+        Some(opentelemetry::Value::String("SELECT".into())),
+    );
+    assert_eq!(
+        attr(&spans[0], "db.collection.name"),
+        Some(opentelemetry::Value::String("users".into())),
+    );
+    assert_eq!(
+        attr(&spans[0], "db.query.summary"),
+        Some(opentelemetry::Value::String("SELECT users".into())),
+    );
+    assert_eq!(
+        attr(&spans[0], "db.stored_procedure.name"),
+        Some(opentelemetry::Value::String("sp_get_users".into())),
     );
 }

@@ -4,6 +4,7 @@ use std::time::Instant;
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::Histogram;
 
+use crate::database::Database;
 use crate::pool::SharedState;
 
 /// A pooled connection instrumented for OpenTelemetry.
@@ -32,4 +33,8 @@ impl<DB: sqlx::Database> std::fmt::Debug for PoolConnection<DB> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PoolConnection").finish_non_exhaustive()
     }
+}
+
+impl<DB: Database> PoolConnection<DB> {
+    impl_with_annotations_mut!();
 }

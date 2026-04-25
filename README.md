@@ -67,8 +67,11 @@ Every `Executor` method (`execute`, `fetch`, `fetch_all`, `fetch_one`, `fetch_op
 | `network.peer.port`         | Resolved port                                   | When set via builder        |
 | `db.query.text`             | The SQL query string                            | Unless `QueryTextMode::Off` |
 | `db.response.returned_rows` | Row count                                       | On `fetch*` methods         |
+| `db.response.affected_rows` | Rows affected (`rows_affected()`)               | On `execute`                |
 | `db.response.status_code`   | SQLSTATE error code                             | On database errors          |
 | `error.type`                | Error variant name                              | On any error                |
+
+`db.response.affected_rows` is not part of the OpenTelemetry semantic conventions but we find it useful so have included it. It is a custom attribute that reports the database-confirmed count from `QueryResult::rows_affected()`, carrying the same connection-level attributes as `db.response.returned_rows`. It is not recorded for `execute_many`, which is [considered deprecated by the SQLx team](https://github.com/launchbadge/sqlx/issues/3108).
 
 On error, the span status is set to `Error` and an `exception` event is added with `exception.type` and `exception.message` attributes.
 

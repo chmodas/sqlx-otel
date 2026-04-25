@@ -80,6 +80,7 @@ async fn execute_creates_span_via_pool() {
     assert_eq!(spans.len(), 1);
     assert_common_span_attributes(&spans[0], SYSTEM);
     assert!(attr(&spans[0], "db.response.returned_rows").is_none());
+    assert!(attr(&spans[0], "db.response.affected_rows").is_some());
 }
 
 #[tokio::test]
@@ -98,6 +99,7 @@ async fn execute_creates_span_via_connection() {
     assert_eq!(spans.len(), 1);
     assert_common_span_attributes(&spans[0], SYSTEM);
     assert!(attr(&spans[0], "db.response.returned_rows").is_none());
+    assert!(attr(&spans[0], "db.response.affected_rows").is_some());
 }
 
 #[tokio::test]
@@ -117,6 +119,7 @@ async fn execute_creates_span_via_transaction() {
     assert_eq!(spans.len(), 1);
     assert_common_span_attributes(&spans[0], SYSTEM);
     assert!(attr(&spans[0], "db.response.returned_rows").is_none());
+    assert!(attr(&spans[0], "db.response.affected_rows").is_some());
 }
 
 #[tokio::test]
@@ -133,6 +136,111 @@ async fn execute_records_error() {
     assert_common_span_attributes(&spans[0], SYSTEM);
     assert_error_span(&spans[0]);
     assert!(attr(&spans[0], "db.response.returned_rows").is_none());
+}
+
+#[tokio::test]
+#[serial]
+async fn execute_records_affected_rows() {
+    let _setup_tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS affected_test (id INT PRIMARY KEY, name VARCHAR(255) NOT NULL)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM affected_test")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // --- Bulk insert ---
+    let tel = common::TestTelemetry::install();
+
+    sqlx::query(
+        "INSERT INTO affected_test (id, name) VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(
+        attr(&spans[0], "db.response.affected_rows"),
+        Some(opentelemetry::Value::I64(3)),
+        "inserting 3 rows in one statement should affect 3 rows"
+    );
+
+    // --- Upsert (INSERT ON DUPLICATE KEY UPDATE) ---
+    let tel = common::TestTelemetry::install();
+
+    sqlx::query(
+        "INSERT INTO affected_test (id, name) VALUES (1, 'alice_updated') \
+         ON DUPLICATE KEY UPDATE name = VALUES(name)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    // MySQL reports 2 for ON DUPLICATE KEY UPDATE – it counts the matched row plus the
+    // updated row.
+    assert_eq!(
+        attr(&spans[0], "db.response.affected_rows"),
+        Some(opentelemetry::Value::I64(2)),
+        "MySQL upsert reports 2 affected rows (match + update)"
+    );
+
+    // --- Update multiple rows ---
+    let tel = common::TestTelemetry::install();
+
+    sqlx::query("UPDATE affected_test SET name = CONCAT(name, '_updated') WHERE id IN (2, 3)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(
+        attr(&spans[0], "db.response.affected_rows"),
+        Some(opentelemetry::Value::I64(2)),
+        "updating two rows should affect 2 rows"
+    );
+
+    // --- Delete multiple rows ---
+    let tel = common::TestTelemetry::install();
+
+    sqlx::query("DELETE FROM affected_test WHERE id IN (1, 2, 3)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(
+        attr(&spans[0], "db.response.affected_rows"),
+        Some(opentelemetry::Value::I64(3)),
+        "deleting three rows should affect 3 rows"
+    );
+
+    // --- Delete with no matching rows ---
+    let tel = common::TestTelemetry::install();
+
+    sqlx::query("DELETE FROM affected_test WHERE id = 999")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(
+        attr(&spans[0], "db.response.affected_rows"),
+        Some(opentelemetry::Value::I64(0)),
+        "deleting non-existent rows should affect 0 rows"
+    );
 }
 
 // ===========================================================================

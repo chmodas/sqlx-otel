@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use opentelemetry_semantic_conventions::metric as semconv_metric;
 
+use crate::annotations::{Annotated, QueryAnnotations};
 use crate::attributes::{ConnectionAttributes, QueryTextMode};
 use crate::connection::PoolConnection;
 use crate::database::Database;
@@ -336,5 +337,46 @@ impl<DB: Database> Pool<DB> {
     #[must_use]
     pub fn is_closed(&self) -> bool {
         self.inner.is_closed()
+    }
+
+    /// Return an annotated executor that attaches per-query semantic convention attributes
+    /// to every span created by the next operation.
+    ///
+    /// The returned wrapper borrows the pool and implements `sqlx::Executor` with the
+    /// same instrumentation, but with annotation values threaded through to span creation.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// pool.with_annotations(QueryAnnotations::new()
+    ///         .operation("SELECT")
+    ///         .collection("users"))
+    ///     .fetch_all("SELECT * FROM users")
+    ///     .await?;
+    /// ```
+    #[must_use]
+    pub fn with_annotations(&self, annotations: QueryAnnotations) -> Annotated<'_, Self> {
+        Annotated {
+            inner: self,
+            annotations,
+            state: self.state.clone(),
+        }
+    }
+
+    /// Shorthand for annotating the next operation with `db.operation.name` and
+    /// `db.collection.name`.
+    ///
+    /// Equivalent to `self.with_annotations(QueryAnnotations::new().operation(op).collection(coll))`.
+    #[must_use]
+    pub fn with_operation(
+        &self,
+        operation: impl Into<String>,
+        collection: impl Into<String>,
+    ) -> Annotated<'_, Self> {
+        self.with_annotations(
+            QueryAnnotations::new()
+                .operation(operation)
+                .collection(collection),
+        )
     }
 }

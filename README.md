@@ -66,6 +66,10 @@ Every `Executor` method (`execute`, `fetch`, `fetch_all`, `fetch_one`, `fetch_op
 | `network.peer.address`      | Resolved IP address                             | When set via builder        |
 | `network.peer.port`         | Resolved port                                   | When set via builder        |
 | `db.query.text`             | The SQL query string                            | Unless `QueryTextMode::Off` |
+| `db.operation.name`         | Database operation (e.g. `SELECT`)              | When annotated              |
+| `db.collection.name`        | Target table or collection                      | When annotated              |
+| `db.query.summary`          | Low-cardinality query summary                   | When annotated              |
+| `db.stored_procedure.name`  | Stored procedure name                           | When annotated              |
 | `db.response.returned_rows` | Row count                                       | On `fetch*` methods         |
 | `db.response.affected_rows` | Rows affected (`rows_affected()`)               | On `execute`                |
 | `db.response.status_code`   | SQLSTATE error code                             | On database errors          |
@@ -118,6 +122,42 @@ let pool = PoolBuilder::from(raw_pool)
     .with_pool_metrics_interval(Duration::from_secs(5))
     .build();
 ```
+
+## Per-query annotations
+
+The library does not parse SQL. Per-query attributes like the operation name and target table are the caller's responsibility via the annotation API:
+
+```rust
+use sqlx_otel::QueryAnnotations;
+
+// Full builder – set whichever fields apply.
+pool.with_annotations(
+        QueryAnnotations::new()
+            .operation("SELECT")
+            .collection("users"))
+    .fetch_all("SELECT * FROM users WHERE active = true")
+    .await?;
+
+// Shorthand for the common two-attribute case.
+pool.with_operation("INSERT", "orders")
+    .execute("INSERT INTO orders (id) VALUES ($1)")
+    .await?;
+```
+
+Annotations work on `Pool`, `PoolConnection`, and `Transaction`. The wrapper borrows the underlying executor for a single operation and is then dropped.
+
+When annotations are provided the span name follows the semantic convention hierarchy:
+
+1. `"{db.operation.name} {db.collection.name}"` – e.g. `"SELECT users"`
+2. `"{db.operation.name}"` – e.g. `"INSERT"`
+3. `"{db.system.name}"` – fallback when no annotations are set
+
+| Attribute                   | Builder method      |
+|-----------------------------|---------------------|
+| `db.operation.name`         | `.operation()`      |
+| `db.collection.name`        | `.collection()`     |
+| `db.query.summary`          | `.query_summary()`  |
+| `db.stored_procedure.name`  | `.stored_procedure()` |
 
 ### Query text modes
 

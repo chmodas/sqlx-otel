@@ -33,4 +33,6 @@ where
     pub async fn rollback(self) -> Result<(), sqlx::Error> {
         self.inner.rollback().await
     }
+
+    impl_with_annotations_mut!();
 }

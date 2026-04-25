@@ -17,6 +17,13 @@ pub trait Database: sqlx::Database {
     fn connection_attributes(
         pool: &sqlx::Pool<Self>,
     ) -> (Option<String>, Option<u16>, Option<String>);
+
+    /// Extract the number of rows affected from a `QueryResult`.
+    ///
+    /// Each `SQLx` backend defines its own `QueryResult` type with an inherent
+    /// `rows_affected()` method. This trait method provides a uniform interface for the
+    /// instrumentation layer.
+    fn rows_affected(result: &<Self as sqlx::Database>::QueryResult) -> u64;
 }
 
 #[cfg(feature = "sqlite")]
@@ -32,6 +39,10 @@ impl Database for sqlx::Sqlite {
             .to_str()
             .map(String::from);
         (None, None, namespace)
+    }
+
+    fn rows_affected(result: &sqlx::sqlite::SqliteQueryResult) -> u64 {
+        result.rows_affected()
     }
 }
 
@@ -52,6 +63,10 @@ impl Database for sqlx::Postgres {
             .and_then(|mut segments| segments.next().map(String::from));
         (host, port, namespace)
     }
+
+    fn rows_affected(result: &sqlx::postgres::PgQueryResult) -> u64 {
+        result.rows_affected()
+    }
 }
 
 #[cfg(feature = "mysql")]
@@ -70,5 +85,9 @@ impl Database for sqlx::MySql {
             .path_segments()
             .and_then(|mut segments| segments.next().map(String::from));
         (host, port, namespace)
+    }
+
+    fn rows_affected(result: &sqlx::mysql::MySqlQueryResult) -> u64 {
+        result.rows_affected()
     }
 }

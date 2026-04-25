@@ -115,7 +115,14 @@ fn record_rows(cx: &OtelContext, rows: u64) {
     ));
 }
 
-/// End the span and record metrics.
+/// Record affected rows on the span (for `execute` operations).
+fn record_affected_rows(cx: &OtelContext, rows: u64) {
+    cx.span().set_attribute(KeyValue::new(
+        "db.response.affected_rows",
+        i64::try_from(rows).unwrap_or(i64::MAX),
+    ));
+}
+
 /// End the span and record metrics.
 fn finish(
     cx: &OtelContext,
@@ -303,9 +310,19 @@ macro_rules! impl_executor {
                 let metric_attrs = state.attrs.base_key_values();
                 let (cx, start) = start_span(&name, span_attrs);
                 let fut = ($inner).execute(query);
-                Box::pin(execute_instrumented(
-                    fut, cx, start, state.metrics, metric_attrs,
-                ))
+                Box::pin(async move {
+                    let result = fut.await;
+                    match &result {
+                        Ok(qr) => {
+                            record_affected_rows(&cx, DB::rows_affected(qr));
+                        }
+                        Err(err) => {
+                            record_error(&cx, err);
+                        }
+                    }
+                    finish(&cx, start, None, &state.metrics, &metric_attrs);
+                    result
+                })
             }
 
             /// Execute multiple queries and return the rows affected from each query, in a stream.

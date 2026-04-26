@@ -146,11 +146,14 @@ pool.with_operation("INSERT", "orders")
 
 Annotations work on `Pool`, `PoolConnection`, and `Transaction`. The wrapper borrows the underlying executor for a single operation and is then dropped.
 
-When annotations are provided the span name follows the semantic convention hierarchy:
+When annotations are provided the span name follows the [semantic convention hierarchy](https://opentelemetry.io/docs/specs/semconv/database/database-spans/#name):
 
-1. `"{db.operation.name} {db.collection.name}"` – e.g. `"SELECT users"`
-2. `"{db.operation.name}"` – e.g. `"INSERT"`
-3. `"{db.system.name}"` – fallback when no annotations are set
+1. `db.query.summary` – the caller-supplied summary, e.g. `"users by tenant"`
+2. `"{db.operation.name} {db.collection.name}"` – e.g. `"SELECT users"`
+3. `"{db.operation.name}"` – e.g. `"INSERT"`
+4. `"{db.system.name}"` – fallback when no annotations are set
+
+`db.query.summary` wins unconditionally when set – this is the spec's escape hatch for callers who cannot guarantee a low-cardinality `db.operation.name` (dynamic SQL, complex pipelines).
 
 | Attribute                   | Builder method      |
 |-----------------------------|---------------------|
@@ -161,11 +164,13 @@ When annotations are provided the span name follows the semantic convention hier
 
 ### Query text modes
 
-| Mode             | Behaviour                                                                      |
-|------------------|--------------------------------------------------------------------------------|
-| `Full` (default) | Capture the parameterised query as-is. Safe because SQLx uses bind parameters. |
-| `Obfuscated`     | Suppress query text (obfuscation not yet implemented).                         |
-| `Off`            | Do not capture `db.query.text`.                                                |
+| Mode             | Behaviour                                                                                          |
+|------------------|----------------------------------------------------------------------------------------------------|
+| `Full` (default) | Capture the parameterised query as-is. Safe because SQLx uses bind parameters.                     |
+| `Obfuscated`     | Replace literal values (string, numeric, hex, boolean, dollar-quoted) with `?` in `db.query.text`. |
+| `Off`            | Do not capture `db.query.text`.                                                                    |
+
+`Obfuscated` is useful when SQL is constructed via string interpolation rather than bind parameters – the structure of the query is preserved while sensitive literal values are redacted. Comments, identifiers (quoted or otherwise), operators, and `NULL` are kept verbatim.
 
 ## License
 

@@ -75,6 +75,31 @@ fn start_span(name: &str, span_attrs: Vec<KeyValue>) -> (OtelContext, Instant) {
     (cx, Instant::now())
 }
 
+/// Start an instrumented query: derive the span name from the connection attributes and
+/// per-query annotations, build the span and metric attribute lists, and open the span.
+///
+/// Returns the span's context, the timing reference for `finish()`, and the metric
+/// attribute list. This consolidates the boilerplate that every `Executor` method shares
+/// before delegating to the inner `SQLx` call.
+fn begin_query_span(
+    attrs: &ConnectionAttributes,
+    sql: Option<&str>,
+    annotations: Option<&QueryAnnotations>,
+) -> (OtelContext, Instant, Vec<KeyValue>) {
+    let (op, coll, summary) = annotations.map_or((None, None, None), |a| {
+        (
+            a.operation.as_deref(),
+            a.collection.as_deref(),
+            a.query_summary.as_deref(),
+        )
+    });
+    let name = attributes::span_name(attrs.system, op, coll, summary);
+    let span_attrs = build_attributes(attrs, sql, annotations);
+    let metric_attrs = attrs.base_key_values();
+    let (cx, start) = start_span(&name, span_attrs);
+    (cx, start, metric_attrs)
+}
+
 /// Classify a `sqlx::Error` variant into a string suitable for `error.type`.
 fn error_type(err: &sqlx::Error) -> &'static str {
     match err {
@@ -332,18 +357,8 @@ macro_rules! impl_executor {
             {
                 let sql = query.sql().to_owned();
                 let state = $self_.state.clone();
-                let annotations: Option<&QueryAnnotations> = $ann;
-                let (op, coll, summary) = annotations.map_or((None, None, None), |a| {
-                    (
-                        a.operation.as_deref(),
-                        a.collection.as_deref(),
-                        a.query_summary.as_deref(),
-                    )
-                });
-                let name = attributes::span_name(state.attrs.system, op, coll, summary);
-                let span_attrs = build_attributes(&state.attrs, Some(&sql), annotations);
-                let metric_attrs = state.attrs.base_key_values();
-                let (cx, start) = start_span(&name, span_attrs);
+                let (cx, start, metric_attrs) =
+                    begin_query_span(&state.attrs, Some(&sql), $ann);
                 let fut = ($inner).execute(query);
                 Box::pin(async move {
                     let result = fut.await;
@@ -372,18 +387,8 @@ macro_rules! impl_executor {
             {
                 let sql = query.sql().to_owned();
                 let state = $self_.state.clone();
-                let annotations: Option<&QueryAnnotations> = $ann;
-                let (op, coll, summary) = annotations.map_or((None, None, None), |a| {
-                    (
-                        a.operation.as_deref(),
-                        a.collection.as_deref(),
-                        a.query_summary.as_deref(),
-                    )
-                });
-                let name = attributes::span_name(state.attrs.system, op, coll, summary);
-                let span_attrs = build_attributes(&state.attrs, Some(&sql), annotations);
-                let metric_attrs = state.attrs.base_key_values();
-                let (cx, start) = start_span(&name, span_attrs);
+                let (cx, start, metric_attrs) =
+                    begin_query_span(&state.attrs, Some(&sql), $ann);
                 let stream = ($inner).execute_many(query);
                 Box::pin(InstrumentedStream::<_, CountNone>::new(
                     stream,
@@ -405,18 +410,8 @@ macro_rules! impl_executor {
             {
                 let sql = query.sql().to_owned();
                 let state = $self_.state.clone();
-                let annotations: Option<&QueryAnnotations> = $ann;
-                let (op, coll, summary) = annotations.map_or((None, None, None), |a| {
-                    (
-                        a.operation.as_deref(),
-                        a.collection.as_deref(),
-                        a.query_summary.as_deref(),
-                    )
-                });
-                let name = attributes::span_name(state.attrs.system, op, coll, summary);
-                let span_attrs = build_attributes(&state.attrs, Some(&sql), annotations);
-                let metric_attrs = state.attrs.base_key_values();
-                let (cx, start) = start_span(&name, span_attrs);
+                let (cx, start, metric_attrs) =
+                    begin_query_span(&state.attrs, Some(&sql), $ann);
                 let stream = ($inner).fetch(query);
                 Box::pin(InstrumentedStream::<_, CountAll>::new(
                     stream,
@@ -448,18 +443,8 @@ macro_rules! impl_executor {
             {
                 let sql = query.sql().to_owned();
                 let state = $self_.state.clone();
-                let annotations: Option<&QueryAnnotations> = $ann;
-                let (op, coll, summary) = annotations.map_or((None, None, None), |a| {
-                    (
-                        a.operation.as_deref(),
-                        a.collection.as_deref(),
-                        a.query_summary.as_deref(),
-                    )
-                });
-                let name = attributes::span_name(state.attrs.system, op, coll, summary);
-                let span_attrs = build_attributes(&state.attrs, Some(&sql), annotations);
-                let metric_attrs = state.attrs.base_key_values();
-                let (cx, start) = start_span(&name, span_attrs);
+                let (cx, start, metric_attrs) =
+                    begin_query_span(&state.attrs, Some(&sql), $ann);
                 let stream = ($inner).fetch_many(query);
                 Box::pin(InstrumentedStream::<_, CountRight>::new(
                     stream,
@@ -485,18 +470,8 @@ macro_rules! impl_executor {
             {
                 let sql = query.sql().to_owned();
                 let state = $self_.state.clone();
-                let annotations: Option<&QueryAnnotations> = $ann;
-                let (op, coll, summary) = annotations.map_or((None, None, None), |a| {
-                    (
-                        a.operation.as_deref(),
-                        a.collection.as_deref(),
-                        a.query_summary.as_deref(),
-                    )
-                });
-                let name = attributes::span_name(state.attrs.system, op, coll, summary);
-                let span_attrs = build_attributes(&state.attrs, Some(&sql), annotations);
-                let metric_attrs = state.attrs.base_key_values();
-                let (cx, start) = start_span(&name, span_attrs);
+                let (cx, start, metric_attrs) =
+                    begin_query_span(&state.attrs, Some(&sql), $ann);
                 let fut = ($inner).fetch_all(query);
                 Box::pin(async move {
                     let result = fut.await;
@@ -529,18 +504,8 @@ macro_rules! impl_executor {
             {
                 let sql = query.sql().to_owned();
                 let state = $self_.state.clone();
-                let annotations: Option<&QueryAnnotations> = $ann;
-                let (op, coll, summary) = annotations.map_or((None, None, None), |a| {
-                    (
-                        a.operation.as_deref(),
-                        a.collection.as_deref(),
-                        a.query_summary.as_deref(),
-                    )
-                });
-                let name = attributes::span_name(state.attrs.system, op, coll, summary);
-                let span_attrs = build_attributes(&state.attrs, Some(&sql), annotations);
-                let metric_attrs = state.attrs.base_key_values();
-                let (cx, start) = start_span(&name, span_attrs);
+                let (cx, start, metric_attrs) =
+                    begin_query_span(&state.attrs, Some(&sql), $ann);
                 let fut = ($inner).fetch_one(query);
                 Box::pin(async move {
                     let result = fut.await;
@@ -572,18 +537,8 @@ macro_rules! impl_executor {
             {
                 let sql = query.sql().to_owned();
                 let state = $self_.state.clone();
-                let annotations: Option<&QueryAnnotations> = $ann;
-                let (op, coll, summary) = annotations.map_or((None, None, None), |a| {
-                    (
-                        a.operation.as_deref(),
-                        a.collection.as_deref(),
-                        a.query_summary.as_deref(),
-                    )
-                });
-                let name = attributes::span_name(state.attrs.system, op, coll, summary);
-                let span_attrs = build_attributes(&state.attrs, Some(&sql), annotations);
-                let metric_attrs = state.attrs.base_key_values();
-                let (cx, start) = start_span(&name, span_attrs);
+                let (cx, start, metric_attrs) =
+                    begin_query_span(&state.attrs, Some(&sql), $ann);
                 let fut = ($inner).fetch_optional(query);
                 Box::pin(async move {
                     let result = fut.await;
@@ -621,18 +576,7 @@ macro_rules! impl_executor {
                 'c: 'e,
             {
                 let state = $self_.state.clone();
-                let annotations: Option<&QueryAnnotations> = $ann;
-                let (op, coll, summary) = annotations.map_or((None, None, None), |a| {
-                    (
-                        a.operation.as_deref(),
-                        a.collection.as_deref(),
-                        a.query_summary.as_deref(),
-                    )
-                });
-                let name = attributes::span_name(state.attrs.system, op, coll, summary);
-                let span_attrs = build_attributes(&state.attrs, Some(query), annotations);
-                let metric_attrs = state.attrs.base_key_values();
-                let (cx, start) = start_span(&name, span_attrs);
+                let (cx, start, metric_attrs) = begin_query_span(&state.attrs, Some(query), $ann);
                 let fut = ($inner).prepare(query);
                 Box::pin(execute_instrumented(
                     fut, cx, start, state.metrics, metric_attrs,
@@ -656,18 +600,7 @@ macro_rules! impl_executor {
                 'c: 'e,
             {
                 let state = $self_.state.clone();
-                let annotations: Option<&QueryAnnotations> = $ann;
-                let (op, coll, summary) = annotations.map_or((None, None, None), |a| {
-                    (
-                        a.operation.as_deref(),
-                        a.collection.as_deref(),
-                        a.query_summary.as_deref(),
-                    )
-                });
-                let name = attributes::span_name(state.attrs.system, op, coll, summary);
-                let span_attrs = build_attributes(&state.attrs, Some(sql), annotations);
-                let metric_attrs = state.attrs.base_key_values();
-                let (cx, start) = start_span(&name, span_attrs);
+                let (cx, start, metric_attrs) = begin_query_span(&state.attrs, Some(sql), $ann);
                 let fut = ($inner).prepare_with(sql, parameters);
                 Box::pin(execute_instrumented(
                     fut, cx, start, state.metrics, metric_attrs,
@@ -691,18 +624,7 @@ macro_rules! impl_executor {
                 'c: 'e,
             {
                 let state = $self_.state.clone();
-                let annotations: Option<&QueryAnnotations> = $ann;
-                let (op, coll, summary) = annotations.map_or((None, None, None), |a| {
-                    (
-                        a.operation.as_deref(),
-                        a.collection.as_deref(),
-                        a.query_summary.as_deref(),
-                    )
-                });
-                let name = attributes::span_name(state.attrs.system, op, coll, summary);
-                let span_attrs = build_attributes(&state.attrs, Some(sql), annotations);
-                let metric_attrs = state.attrs.base_key_values();
-                let (cx, start) = start_span(&name, span_attrs);
+                let (cx, start, metric_attrs) = begin_query_span(&state.attrs, Some(sql), $ann);
                 let fut = ($inner).describe(sql);
                 Box::pin(execute_instrumented(
                     fut, cx, start, state.metrics, metric_attrs,

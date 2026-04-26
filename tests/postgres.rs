@@ -1961,6 +1961,29 @@ async fn query_text_mode_off_suppresses_sql() {
     );
 }
 
+#[tokio::test]
+#[serial]
+async fn query_text_mode_obfuscated_replaces_literals() {
+    let shared = shared_container().await;
+    let raw = sqlx::PgPool::connect(&shared.url).await.unwrap();
+    let pool = PoolBuilder::from(raw)
+        .with_query_text_mode(sqlx_otel::QueryTextMode::Obfuscated)
+        .build();
+
+    let tel = common::TestTelemetry::install();
+    let _row = (&pool)
+        .fetch_optional("SELECT 1, 'alice', 3.14")
+        .await
+        .unwrap();
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(
+        attr(&spans[0], "db.query.text"),
+        Some(opentelemetry::Value::String("SELECT ?, ?, ?".into()))
+    );
+}
+
 // ===========================================================================
 // Annotations
 // ===========================================================================

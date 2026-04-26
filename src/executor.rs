@@ -51,8 +51,13 @@ fn build_attributes(
             QueryTextMode::Full => {
                 kv.push(KeyValue::new(attribute::DB_QUERY_TEXT, sql.to_owned()));
             }
-            // Obfuscation not yet implemented; suppress to avoid leaking literals.
-            QueryTextMode::Obfuscated | QueryTextMode::Off => {}
+            QueryTextMode::Obfuscated => {
+                kv.push(KeyValue::new(
+                    attribute::DB_QUERY_TEXT,
+                    crate::obfuscate::obfuscate(sql),
+                ));
+            }
+            QueryTextMode::Off => {}
         }
     }
     kv
@@ -795,12 +800,24 @@ mod tests {
     }
 
     #[test]
-    fn build_attributes_obfuscated_suppresses_query_text() {
+    fn build_attributes_obfuscated_replaces_literals() {
         let mut attrs = test_attrs();
         attrs.query_text_mode = QueryTextMode::Obfuscated;
-        let kv = build_attributes(&attrs, Some("SELECT secret"), None);
-        let keys: Vec<&str> = kv.iter().map(|k| k.key.as_str()).collect();
-        assert!(!keys.contains(&"db.query.text"));
+        let kv = build_attributes(
+            &attrs,
+            Some("INSERT INTO t (id, name) VALUES (1, 'alice')"),
+            None,
+        );
+        let text = kv
+            .iter()
+            .find(|k| k.key.as_str() == "db.query.text")
+            .map(|k| k.value.clone());
+        assert_eq!(
+            text,
+            Some(opentelemetry::Value::String(
+                "INSERT INTO t (id, name) VALUES (?, ?)".into()
+            ))
+        );
     }
 
     // ===========================================================================

@@ -2,6 +2,8 @@
 
 [![CI build](https://github.com/chmodas/sqlx-otel/actions/workflows/ci.yml/badge.svg)](https://github.com/chmodas/sqlx-otel/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/chmodas/sqlx-otel/graph/badge.svg?token=EFVNRZB3WN)](https://codecov.io/gh/chmodas/sqlx-otel)
+[![crates.io](https://img.shields.io/crates/v/sqlx-otel.svg)](https://crates.io/crates/sqlx-otel)
+[![docs.rs](https://img.shields.io/docsrs/sqlx-otel)](https://docs.rs/sqlx-otel)
 
 Lightweight [SQLx](https://github.com/launchbadge/sqlx) wrapper that emits OpenTelemetry-native spans and metrics following the [database client semantic conventions](https://opentelemetry.io/docs/specs/semconv/database/).
 
@@ -36,7 +38,7 @@ Every operation through the pool automatically emits an OpenTelemetry span and r
 
 ```toml
 [dependencies]
-sqlx-otel = { version = "0.0.0", features = ["postgres"] }
+sqlx-otel = { version = "0.1.0", features = ["postgres"] }
 # or "sqlite", "mysql"
 ```
 

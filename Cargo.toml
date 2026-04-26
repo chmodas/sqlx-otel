@@ -7,6 +7,7 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/chmodas/sqlx-otel"
 homepage = "https://github.com/chmodas/sqlx-otel"
+documentation = "https://docs.rs/sqlx-otel/"
 description = "Thin wrapper around SQLx that emits OpenTelemetry spans and metrics following the database client semantic conventions."
 categories = ["database", "asynchronous", "development-tools::profiling"]
 keywords = ["sqlx", "opentelemetry", "metrics", "database", "instrumentation"]

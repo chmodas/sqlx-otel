@@ -8,6 +8,7 @@ mod connection;
 mod database;
 mod executor;
 mod metrics;
+mod obfuscate;
 mod pool;
 mod pool_metrics;
 mod runtime;

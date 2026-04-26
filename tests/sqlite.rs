@@ -1726,6 +1726,34 @@ async fn query_text_mode_off_suppresses_sql() {
     );
 }
 
+#[tokio::test]
+#[serial]
+async fn query_text_mode_obfuscated_replaces_literals() {
+    let tel = common::TestTelemetry::install();
+    let raw = sqlx::SqlitePool::connect(":memory:").await.unwrap();
+    let pool = PoolBuilder::from(raw)
+        .with_query_text_mode(sqlx_otel::QueryTextMode::Obfuscated)
+        .build();
+
+    sqlx::query("CREATE TABLE t (id INTEGER, name TEXT)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO t (id, name) VALUES (1, 'alice')")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 2);
+    assert_eq!(
+        attr(&spans[1], "db.query.text"),
+        Some(opentelemetry::Value::String(
+            "INSERT INTO t (id, name) VALUES (?, ?)".into()
+        ))
+    );
+}
+
 // ===========================================================================
 // Transaction rollback
 // ===========================================================================

@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.1.0] – 2026-04-26
+
 ### Added
 
 - Span name follows the OpenTelemetry [Database Spans § Name](https://opentelemetry.io/docs/specs/semconv/database/database-spans/) hierarchy in full: `db.query.summary` (set via `QueryAnnotations::query_summary()`) takes precedence over the `{operation} {collection}` synthesis ([#18](https://github.com/chmodas/sqlx-otel/pull/18)).
@@ -17,3 +19,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - PostgreSQL backend ([#4](https://github.com/chmodas/sqlx-otel/pull/4)).
 - SQLite backend ([#3](https://github.com/chmodas/sqlx-otel/pull/3)).
 - Backend-agnostic instrumentation core: `Pool`, `PoolBuilder`, `Transaction`, `PoolConnection`, and the `Executor` trait wiring that emits OpenTelemetry-native spans and metrics following the [database calls and systems](https://opentelemetry.io/docs/specs/semconv/db/) semantic conventions ([#2](https://github.com/chmodas/sqlx-otel/pull/2)).
+
+[Unreleased]: https://github.com/chmodas/sqlx-otel/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/chmodas/sqlx-otel/releases/tag/v0.1.0

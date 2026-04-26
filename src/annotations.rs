@@ -84,6 +84,12 @@ impl QueryAnnotations {
 
     /// Set the `db.operation.name` attribute – the database operation being performed
     /// (e.g. `"SELECT"`, `"INSERT"`, `"findAndModify"`).
+    ///
+    /// The OpenTelemetry semantic conventions require this value to be low cardinality,
+    /// since it is used to construct span names when [`query_summary`](Self::query_summary)
+    /// is not set. Callers who cannot guarantee low cardinality should set
+    /// `query_summary` instead – the library uses that path without a low-cardinality
+    /// assumption.
     #[must_use]
     pub fn operation(mut self, operation: impl Into<String>) -> Self {
         self.operation = Some(operation.into());
@@ -99,7 +105,12 @@ impl QueryAnnotations {
     }
 
     /// Set the `db.query.summary` attribute – a low-cardinality summary of the query
-    /// (e.g. `"SELECT users"`, `"INSERT orders"`). This is independent of the span name.
+    /// (e.g. `"SELECT users"`, `"INSERT orders"`).
+    ///
+    /// When set, this value also drives the span name (level 1 of the OpenTelemetry
+    /// database span name hierarchy), overriding the `{operation} {collection}`
+    /// synthesis. Cardinality control is the caller's responsibility – a high-cardinality
+    /// summary will produce high-cardinality span names.
     #[must_use]
     pub fn query_summary(mut self, summary: impl Into<String>) -> Self {
         self.query_summary = Some(summary.into());

@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Span name follows the OpenTelemetry [Database Spans § Name](https://opentelemetry.io/docs/specs/semconv/database/database-spans/) hierarchy in full: `db.query.summary` (set via `QueryAnnotations::query_summary()`) takes precedence over the `{operation} {collection}` synthesis ([#18](https://github.com/chmodas/sqlx-otel/pull/18)).
 - Obfuscation mode for `db.query.text`: `QueryTextMode::Obfuscated` now replaces string, numeric, hex, boolean, and dollar-quoted literals with `?` while preserving comments, identifiers, operators, and `NULL` ([#16](https://github.com/chmodas/sqlx-otel/pull/16)).
 - Per-query annotation API for the semantic convention attributes the library cannot derive from SQL: `db.operation.name`, `db.collection.name`, `db.query.summary`, `db.stored_procedure.name` ([#15](https://github.com/chmodas/sqlx-otel/pull/15)).
 - `db.response.affected_rows` recorded on `execute()` spans ([#13](https://github.com/chmodas/sqlx-otel/pull/13)).

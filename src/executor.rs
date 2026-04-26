@@ -333,10 +333,14 @@ macro_rules! impl_executor {
                 let sql = query.sql().to_owned();
                 let state = $self_.state.clone();
                 let annotations: Option<&QueryAnnotations> = $ann;
-                let (op, coll) = annotations.map_or((None, None), |a| {
-                    (a.operation.as_deref(), a.collection.as_deref())
+                let (op, coll, summary) = annotations.map_or((None, None, None), |a| {
+                    (
+                        a.operation.as_deref(),
+                        a.collection.as_deref(),
+                        a.query_summary.as_deref(),
+                    )
                 });
-                let name = attributes::span_name(state.attrs.system, op, coll);
+                let name = attributes::span_name(state.attrs.system, op, coll, summary);
                 let span_attrs = build_attributes(&state.attrs, Some(&sql), annotations);
                 let metric_attrs = state.attrs.base_key_values();
                 let (cx, start) = start_span(&name, span_attrs);
@@ -369,10 +373,14 @@ macro_rules! impl_executor {
                 let sql = query.sql().to_owned();
                 let state = $self_.state.clone();
                 let annotations: Option<&QueryAnnotations> = $ann;
-                let (op, coll) = annotations.map_or((None, None), |a| {
-                    (a.operation.as_deref(), a.collection.as_deref())
+                let (op, coll, summary) = annotations.map_or((None, None, None), |a| {
+                    (
+                        a.operation.as_deref(),
+                        a.collection.as_deref(),
+                        a.query_summary.as_deref(),
+                    )
                 });
-                let name = attributes::span_name(state.attrs.system, op, coll);
+                let name = attributes::span_name(state.attrs.system, op, coll, summary);
                 let span_attrs = build_attributes(&state.attrs, Some(&sql), annotations);
                 let metric_attrs = state.attrs.base_key_values();
                 let (cx, start) = start_span(&name, span_attrs);
@@ -398,10 +406,14 @@ macro_rules! impl_executor {
                 let sql = query.sql().to_owned();
                 let state = $self_.state.clone();
                 let annotations: Option<&QueryAnnotations> = $ann;
-                let (op, coll) = annotations.map_or((None, None), |a| {
-                    (a.operation.as_deref(), a.collection.as_deref())
+                let (op, coll, summary) = annotations.map_or((None, None, None), |a| {
+                    (
+                        a.operation.as_deref(),
+                        a.collection.as_deref(),
+                        a.query_summary.as_deref(),
+                    )
                 });
-                let name = attributes::span_name(state.attrs.system, op, coll);
+                let name = attributes::span_name(state.attrs.system, op, coll, summary);
                 let span_attrs = build_attributes(&state.attrs, Some(&sql), annotations);
                 let metric_attrs = state.attrs.base_key_values();
                 let (cx, start) = start_span(&name, span_attrs);
@@ -437,10 +449,14 @@ macro_rules! impl_executor {
                 let sql = query.sql().to_owned();
                 let state = $self_.state.clone();
                 let annotations: Option<&QueryAnnotations> = $ann;
-                let (op, coll) = annotations.map_or((None, None), |a| {
-                    (a.operation.as_deref(), a.collection.as_deref())
+                let (op, coll, summary) = annotations.map_or((None, None, None), |a| {
+                    (
+                        a.operation.as_deref(),
+                        a.collection.as_deref(),
+                        a.query_summary.as_deref(),
+                    )
                 });
-                let name = attributes::span_name(state.attrs.system, op, coll);
+                let name = attributes::span_name(state.attrs.system, op, coll, summary);
                 let span_attrs = build_attributes(&state.attrs, Some(&sql), annotations);
                 let metric_attrs = state.attrs.base_key_values();
                 let (cx, start) = start_span(&name, span_attrs);
@@ -470,10 +486,14 @@ macro_rules! impl_executor {
                 let sql = query.sql().to_owned();
                 let state = $self_.state.clone();
                 let annotations: Option<&QueryAnnotations> = $ann;
-                let (op, coll) = annotations.map_or((None, None), |a| {
-                    (a.operation.as_deref(), a.collection.as_deref())
+                let (op, coll, summary) = annotations.map_or((None, None, None), |a| {
+                    (
+                        a.operation.as_deref(),
+                        a.collection.as_deref(),
+                        a.query_summary.as_deref(),
+                    )
                 });
-                let name = attributes::span_name(state.attrs.system, op, coll);
+                let name = attributes::span_name(state.attrs.system, op, coll, summary);
                 let span_attrs = build_attributes(&state.attrs, Some(&sql), annotations);
                 let metric_attrs = state.attrs.base_key_values();
                 let (cx, start) = start_span(&name, span_attrs);
@@ -510,10 +530,14 @@ macro_rules! impl_executor {
                 let sql = query.sql().to_owned();
                 let state = $self_.state.clone();
                 let annotations: Option<&QueryAnnotations> = $ann;
-                let (op, coll) = annotations.map_or((None, None), |a| {
-                    (a.operation.as_deref(), a.collection.as_deref())
+                let (op, coll, summary) = annotations.map_or((None, None, None), |a| {
+                    (
+                        a.operation.as_deref(),
+                        a.collection.as_deref(),
+                        a.query_summary.as_deref(),
+                    )
                 });
-                let name = attributes::span_name(state.attrs.system, op, coll);
+                let name = attributes::span_name(state.attrs.system, op, coll, summary);
                 let span_attrs = build_attributes(&state.attrs, Some(&sql), annotations);
                 let metric_attrs = state.attrs.base_key_values();
                 let (cx, start) = start_span(&name, span_attrs);
@@ -549,10 +573,14 @@ macro_rules! impl_executor {
                 let sql = query.sql().to_owned();
                 let state = $self_.state.clone();
                 let annotations: Option<&QueryAnnotations> = $ann;
-                let (op, coll) = annotations.map_or((None, None), |a| {
-                    (a.operation.as_deref(), a.collection.as_deref())
+                let (op, coll, summary) = annotations.map_or((None, None, None), |a| {
+                    (
+                        a.operation.as_deref(),
+                        a.collection.as_deref(),
+                        a.query_summary.as_deref(),
+                    )
                 });
-                let name = attributes::span_name(state.attrs.system, op, coll);
+                let name = attributes::span_name(state.attrs.system, op, coll, summary);
                 let span_attrs = build_attributes(&state.attrs, Some(&sql), annotations);
                 let metric_attrs = state.attrs.base_key_values();
                 let (cx, start) = start_span(&name, span_attrs);
@@ -594,10 +622,14 @@ macro_rules! impl_executor {
             {
                 let state = $self_.state.clone();
                 let annotations: Option<&QueryAnnotations> = $ann;
-                let (op, coll) = annotations.map_or((None, None), |a| {
-                    (a.operation.as_deref(), a.collection.as_deref())
+                let (op, coll, summary) = annotations.map_or((None, None, None), |a| {
+                    (
+                        a.operation.as_deref(),
+                        a.collection.as_deref(),
+                        a.query_summary.as_deref(),
+                    )
                 });
-                let name = attributes::span_name(state.attrs.system, op, coll);
+                let name = attributes::span_name(state.attrs.system, op, coll, summary);
                 let span_attrs = build_attributes(&state.attrs, Some(query), annotations);
                 let metric_attrs = state.attrs.base_key_values();
                 let (cx, start) = start_span(&name, span_attrs);
@@ -625,10 +657,14 @@ macro_rules! impl_executor {
             {
                 let state = $self_.state.clone();
                 let annotations: Option<&QueryAnnotations> = $ann;
-                let (op, coll) = annotations.map_or((None, None), |a| {
-                    (a.operation.as_deref(), a.collection.as_deref())
+                let (op, coll, summary) = annotations.map_or((None, None, None), |a| {
+                    (
+                        a.operation.as_deref(),
+                        a.collection.as_deref(),
+                        a.query_summary.as_deref(),
+                    )
                 });
-                let name = attributes::span_name(state.attrs.system, op, coll);
+                let name = attributes::span_name(state.attrs.system, op, coll, summary);
                 let span_attrs = build_attributes(&state.attrs, Some(sql), annotations);
                 let metric_attrs = state.attrs.base_key_values();
                 let (cx, start) = start_span(&name, span_attrs);
@@ -656,10 +692,14 @@ macro_rules! impl_executor {
             {
                 let state = $self_.state.clone();
                 let annotations: Option<&QueryAnnotations> = $ann;
-                let (op, coll) = annotations.map_or((None, None), |a| {
-                    (a.operation.as_deref(), a.collection.as_deref())
+                let (op, coll, summary) = annotations.map_or((None, None, None), |a| {
+                    (
+                        a.operation.as_deref(),
+                        a.collection.as_deref(),
+                        a.query_summary.as_deref(),
+                    )
                 });
-                let name = attributes::span_name(state.attrs.system, op, coll);
+                let name = attributes::span_name(state.attrs.system, op, coll, summary);
                 let span_attrs = build_attributes(&state.attrs, Some(sql), annotations);
                 let metric_attrs = state.attrs.base_key_values();
                 let (cx, start) = start_span(&name, span_attrs);

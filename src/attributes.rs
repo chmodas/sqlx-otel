@@ -77,10 +77,21 @@ impl ConnectionAttributes {
 
 /// Build a span name following the database client semconv hierarchy:
 ///
-/// 1. `"{db.operation.name} {db.collection.name}"` when both are provided.
-/// 2. `"{db.operation.name}"` when only the operation is known.
-/// 3. `"{db.system.name}"` as the final fallback.
-pub(crate) fn span_name(system: &str, operation: Option<&str>, collection: Option<&str>) -> String {
+/// 1. `db.query.summary` when provided (wins unconditionally – this is the spec's
+///    designated slot for callers who cannot guarantee a low-cardinality
+///    `db.operation.name`).
+/// 2. `"{db.operation.name} {db.collection.name}"` when both are provided.
+/// 3. `"{db.operation.name}"` when only the operation is known.
+/// 4. `"{db.system.name}"` as the final fallback.
+pub(crate) fn span_name(
+    system: &str,
+    operation: Option<&str>,
+    collection: Option<&str>,
+    summary: Option<&str>,
+) -> String {
+    if let Some(s) = summary {
+        return s.to_owned();
+    }
     match (operation, collection) {
         (Some(op), Some(coll)) => format!("{op} {coll}"),
         (Some(op), None) => op.to_owned(),
@@ -95,24 +106,48 @@ mod tests {
     #[test]
     fn span_name_with_operation_and_collection() {
         assert_eq!(
-            span_name("postgresql", Some("SELECT"), Some("users")),
+            span_name("postgresql", Some("SELECT"), Some("users"), None),
             "SELECT users"
         );
     }
 
     #[test]
     fn span_name_with_operation_only() {
-        assert_eq!(span_name("postgresql", Some("SELECT"), None), "SELECT");
+        assert_eq!(
+            span_name("postgresql", Some("SELECT"), None, None),
+            "SELECT"
+        );
     }
 
     #[test]
     fn span_name_fallback_to_system() {
-        assert_eq!(span_name("sqlite", None, None), "sqlite");
+        assert_eq!(span_name("sqlite", None, None, None), "sqlite");
     }
 
     #[test]
     fn span_name_collection_without_operation_falls_back() {
-        assert_eq!(span_name("mysql", None, Some("orders")), "mysql");
+        assert_eq!(span_name("mysql", None, Some("orders"), None), "mysql");
+    }
+
+    #[test]
+    fn span_name_summary_wins_over_operation_and_collection() {
+        assert_eq!(
+            span_name(
+                "postgresql",
+                Some("SELECT"),
+                Some("users"),
+                Some("daily report")
+            ),
+            "daily report"
+        );
+    }
+
+    #[test]
+    fn span_name_summary_alone() {
+        assert_eq!(
+            span_name("sqlite", None, None, Some("custom name")),
+            "custom name"
+        );
     }
 
     #[test]

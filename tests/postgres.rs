@@ -1998,7 +1998,7 @@ async fn annotation_all_four_fields() {
         QueryAnnotations::new()
             .operation("SELECT")
             .collection("users")
-            .query_summary("SELECT users")
+            .query_summary("users by id")
             .stored_procedure("sp_get_users"),
     )
     .fetch_all("SELECT 1")
@@ -2007,7 +2007,9 @@ async fn annotation_all_four_fields() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_eq!(spans[0].name, "SELECT users");
+    // Summary drives the span name (semconv level 1), distinct from "SELECT users" so
+    // the assertion proves the summary path won rather than coinciding with level 2.
+    assert_eq!(spans[0].name, "users by id");
     assert_eq!(
         attr(&spans[0], "db.operation.name"),
         Some(opentelemetry::Value::String("SELECT".into())),
@@ -2018,10 +2020,44 @@ async fn annotation_all_four_fields() {
     );
     assert_eq!(
         attr(&spans[0], "db.query.summary"),
-        Some(opentelemetry::Value::String("SELECT users".into())),
+        Some(opentelemetry::Value::String("users by id".into())),
     );
     assert_eq!(
         attr(&spans[0], "db.stored_procedure.name"),
         Some(opentelemetry::Value::String("sp_get_users".into())),
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn query_summary_drives_span_name() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    pool.with_annotations(
+        QueryAnnotations::new()
+            .operation("SELECT")
+            .collection("users")
+            .query_summary("users by tenant"),
+    )
+    .fetch_all("SELECT 1")
+    .await
+    .unwrap();
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].name, "users by tenant");
+    // Summary drives the *name*, but does not suppress the other attributes.
+    assert_eq!(
+        attr(&spans[0], "db.query.summary"),
+        Some(opentelemetry::Value::String("users by tenant".into())),
+    );
+    assert_eq!(
+        attr(&spans[0], "db.operation.name"),
+        Some(opentelemetry::Value::String("SELECT".into())),
+    );
+    assert_eq!(
+        attr(&spans[0], "db.collection.name"),
+        Some(opentelemetry::Value::String("users".into())),
     );
 }

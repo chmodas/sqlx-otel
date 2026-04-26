@@ -26,6 +26,25 @@ pub trait Database: sqlx::Database {
     fn rows_affected(result: &<Self as sqlx::Database>::QueryResult) -> u64;
 }
 
+/// Extract `(host, port, namespace)` from a network-style backend's connect options by
+/// rendering them to a URL and parsing the components.
+///
+/// Used by the Postgres and `MySQL` impls of [`Database::connection_attributes`] – both
+/// share the same URL-based extraction logic. `SQLite` supplies a filename instead and
+/// does not need this helper.
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+fn url_based_connection_attributes<O: sqlx::ConnectOptions>(
+    options: &O,
+) -> (Option<String>, Option<u16>, Option<String>) {
+    let url = options.to_url_lossy();
+    let host = url.host_str().map(String::from);
+    let port = url.port();
+    let namespace = url
+        .path_segments()
+        .and_then(|mut segments| segments.next().map(String::from));
+    (host, port, namespace)
+}
+
 #[cfg(feature = "sqlite")]
 impl Database for sqlx::Sqlite {
     const SYSTEM: &'static str = "sqlite";
@@ -53,15 +72,7 @@ impl Database for sqlx::Postgres {
     fn connection_attributes(
         pool: &sqlx::Pool<Self>,
     ) -> (Option<String>, Option<u16>, Option<String>) {
-        use sqlx::ConnectOptions;
-
-        let url = pool.connect_options().to_url_lossy();
-        let host = url.host_str().map(String::from);
-        let port = url.port();
-        let namespace = url
-            .path_segments()
-            .and_then(|mut segments| segments.next().map(String::from));
-        (host, port, namespace)
+        url_based_connection_attributes(pool.connect_options().as_ref())
     }
 
     fn rows_affected(result: &sqlx::postgres::PgQueryResult) -> u64 {
@@ -76,15 +87,7 @@ impl Database for sqlx::MySql {
     fn connection_attributes(
         pool: &sqlx::Pool<Self>,
     ) -> (Option<String>, Option<u16>, Option<String>) {
-        use sqlx::ConnectOptions;
-
-        let url = pool.connect_options().to_url_lossy();
-        let host = url.host_str().map(String::from);
-        let port = url.port();
-        let namespace = url
-            .path_segments()
-            .and_then(|mut segments| segments.next().map(String::from));
-        (host, port, namespace)
+        url_based_connection_attributes(pool.connect_options().as_ref())
     }
 
     fn rows_affected(result: &sqlx::mysql::MySqlQueryResult) -> u64 {

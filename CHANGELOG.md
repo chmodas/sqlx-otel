@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Query-side `with_annotations` / `with_operation` via the new `QueryAnnotateExt` trait on `sqlx::query`, `sqlx::query_as`, and `sqlx::query_scalar`, so per-query attributes can sit next to the query text. `bind` and `with_annotations` compose in either order ([#22](https://github.com/chmodas/sqlx-otel/pull/22)).
+
 ## [0.1.0] – 2026-04-26
 
 ### Added

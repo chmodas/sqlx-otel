@@ -7,8 +7,9 @@ use futures::StreamExt;
 use opentelemetry::trace::SpanKind;
 use serial_test::serial;
 use sqlx::Executor as _;
+use sqlx::Row as _;
 use sqlx::Sqlite;
-use sqlx_otel::{Pool, PoolBuilder, QueryAnnotations, Transaction};
+use sqlx_otel::{Pool, PoolBuilder, QueryAnnotateExt, QueryAnnotations, Transaction};
 
 const SYSTEM: &str = "sqlite";
 
@@ -1958,4 +1959,471 @@ async fn query_summary_drives_span_name() {
         attr(&spans[0], "db.collection.name"),
         Some(opentelemetry::Value::String("users".into())),
     );
+}
+
+// ===========================================================================
+// query-side annotations: sqlx::query(...).with_annotations(...).execute(&pool)
+// ===========================================================================
+
+#[tokio::test]
+#[serial]
+async fn query_execute_with_annotations_via_pool() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    sqlx::query("CREATE TABLE qe_pool (id INTEGER PRIMARY KEY)")
+        .with_annotations(test_annotations())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+    assert!(attr(&spans[0], "db.response.affected_rows").is_some());
+}
+
+#[tokio::test]
+#[serial]
+async fn query_execute_many_with_annotations_via_pool() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    #[allow(deprecated)]
+    let mut stream = sqlx::query("SELECT 1; SELECT 2")
+        .with_annotations(test_annotations())
+        .execute_many(&pool)
+        .await;
+    while stream.next().await.is_some() {}
+    drop(stream);
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+#[tokio::test]
+#[serial]
+async fn query_fetch_with_annotations_via_pool() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    let mut stream = sqlx::query("SELECT 1 UNION ALL SELECT 2")
+        .with_annotations(test_annotations())
+        .fetch(&pool);
+    while stream.next().await.is_some() {}
+    drop(stream);
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+    assert_eq!(
+        attr(&spans[0], "db.response.returned_rows"),
+        Some(opentelemetry::Value::I64(2))
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn query_fetch_many_with_annotations_via_pool() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    #[allow(deprecated)]
+    let mut stream = sqlx::query("SELECT 1 UNION ALL SELECT 2")
+        .with_annotations(test_annotations())
+        .fetch_many(&pool);
+    while stream.next().await.is_some() {}
+    drop(stream);
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+#[tokio::test]
+#[serial]
+async fn query_fetch_all_with_annotations_via_pool() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    let rows = sqlx::query("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3")
+        .with_annotations(test_annotations())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+    assert_eq!(
+        attr(&spans[0], "db.response.returned_rows"),
+        Some(opentelemetry::Value::I64(3))
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn query_fetch_one_with_annotations_via_pool() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    let _row = sqlx::query("SELECT 1")
+        .with_annotations(test_annotations())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+    assert_eq!(
+        attr(&spans[0], "db.response.returned_rows"),
+        Some(opentelemetry::Value::I64(1))
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn query_fetch_optional_with_annotations_via_pool() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    sqlx::query("CREATE TABLE qfo_pool (id INTEGER PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let _setup_tel = tel; // discard CREATE span
+    let tel = common::TestTelemetry::install();
+
+    let row = sqlx::query("SELECT id FROM qfo_pool WHERE id = 1")
+        .with_annotations(test_annotations())
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+    assert!(row.is_none());
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+    assert_eq!(
+        attr(&spans[0], "db.response.returned_rows"),
+        Some(opentelemetry::Value::I64(0))
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn query_bind_first_then_annotations_via_pool() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    let row = sqlx::query("SELECT ?1 + ?2 AS sum")
+        .bind(2_i32)
+        .bind(3_i32)
+        .with_annotations(test_annotations())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let sum: i32 = row.try_get("sum").unwrap();
+    assert_eq!(sum, 5);
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+#[tokio::test]
+#[serial]
+async fn query_annotations_first_then_bind_via_pool() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    let row = sqlx::query("SELECT ?1 + ?2 AS sum")
+        .with_annotations(test_annotations())
+        .bind(10_i32)
+        .bind(20_i32)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let sum: i32 = row.try_get("sum").unwrap();
+    assert_eq!(sum, 30);
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+#[tokio::test]
+#[serial]
+async fn query_with_operation_shorthand_via_pool() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    sqlx::query("CREATE TABLE qop_pool (id INTEGER PRIMARY KEY)")
+        .with_operation("SELECT", "users")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+#[tokio::test]
+#[serial]
+async fn query_execute_with_annotations_via_connection() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    let mut conn = pool.acquire().await.unwrap();
+    sqlx::query("CREATE TABLE qe_conn (id INTEGER PRIMARY KEY)")
+        .with_annotations(test_annotations())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+#[tokio::test]
+#[serial]
+async fn query_execute_with_annotations_via_transaction() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    let mut tx: Transaction<'_, Sqlite> = pool.begin().await.unwrap();
+    sqlx::query("CREATE TABLE qe_tx (id INTEGER PRIMARY KEY)")
+        .with_annotations(test_annotations())
+        .execute(&mut tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+#[tokio::test]
+#[serial]
+async fn query_execute_with_annotations_records_error() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    let result = sqlx::query("INVALID SQL GIBBERISH")
+        .with_annotations(test_annotations())
+        .execute(&pool)
+        .await;
+    assert!(result.is_err());
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+    assert_error_span(&spans[0]);
+}
+
+// --- query_as side ---------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn query_as_fetch_with_annotations_via_pool() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    let mut stream = sqlx::query_as::<_, (i32,)>("SELECT 1 UNION ALL SELECT 2")
+        .with_annotations(test_annotations())
+        .fetch(&pool);
+    while stream.next().await.is_some() {}
+    drop(stream);
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+#[tokio::test]
+#[serial]
+async fn query_as_fetch_many_with_annotations_via_pool() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    #[allow(deprecated)]
+    let mut stream = sqlx::query_as::<_, (i32,)>("SELECT 1 UNION ALL SELECT 2")
+        .with_annotations(test_annotations())
+        .fetch_many(&pool);
+    while stream.next().await.is_some() {}
+    drop(stream);
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+#[tokio::test]
+#[serial]
+async fn query_as_fetch_all_with_annotations_via_pool() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    let rows: Vec<(i32,)> = sqlx::query_as("SELECT 1 UNION ALL SELECT 2")
+        .with_annotations(test_annotations())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+#[tokio::test]
+#[serial]
+async fn query_as_fetch_one_with_annotations_via_pool() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    let row: (i32,) = sqlx::query_as("SELECT 7")
+        .with_annotations(test_annotations())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.0, 7);
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+#[tokio::test]
+#[serial]
+async fn query_as_fetch_optional_with_annotations_via_pool() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    let row: Option<(i32,)> = sqlx::query_as("SELECT 1 WHERE 1 = 0")
+        .with_annotations(test_annotations())
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+    assert!(row.is_none());
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+#[tokio::test]
+#[serial]
+async fn query_as_fetch_one_with_annotations_records_error() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    let result: Result<(i32,), _> = sqlx::query_as("INVALID SQL")
+        .with_annotations(test_annotations())
+        .fetch_one(&pool)
+        .await;
+    assert!(result.is_err());
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+    assert_error_span(&spans[0]);
+}
+
+// --- query_scalar side -----------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn query_scalar_fetch_with_annotations_via_pool() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    let mut stream = sqlx::query_scalar::<_, i32>("SELECT 1 UNION ALL SELECT 2")
+        .with_annotations(test_annotations())
+        .fetch(&pool);
+    while stream.next().await.is_some() {}
+    drop(stream);
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+#[tokio::test]
+#[serial]
+async fn query_scalar_fetch_many_with_annotations_via_pool() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    #[allow(deprecated)]
+    let mut stream = sqlx::query_scalar::<_, i32>("SELECT 1 UNION ALL SELECT 2")
+        .with_annotations(test_annotations())
+        .fetch_many(&pool);
+    while stream.next().await.is_some() {}
+    drop(stream);
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+#[tokio::test]
+#[serial]
+async fn query_scalar_fetch_all_with_annotations_via_pool() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    let rows: Vec<i32> = sqlx::query_scalar("SELECT 1 UNION ALL SELECT 2")
+        .with_annotations(test_annotations())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![1, 2]);
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+#[tokio::test]
+#[serial]
+async fn query_scalar_fetch_one_with_annotations_via_pool() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    let value: i32 = sqlx::query_scalar("SELECT 42")
+        .with_annotations(test_annotations())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(value, 42);
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+#[tokio::test]
+#[serial]
+async fn query_scalar_fetch_optional_with_annotations_via_pool() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    let value: Option<i32> = sqlx::query_scalar("SELECT 1 WHERE 1 = 0")
+        .with_annotations(test_annotations())
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+    assert!(value.is_none());
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
 }

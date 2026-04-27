@@ -11,6 +11,7 @@ mod metrics;
 mod obfuscate;
 mod pool;
 mod pool_metrics;
+mod query_ext;
 mod runtime;
 mod transaction;
 
@@ -19,4 +20,5 @@ pub use attributes::QueryTextMode;
 pub use connection::PoolConnection;
 pub use database::Database;
 pub use pool::{Pool, PoolBuilder};
+pub use query_ext::{AnnotatedQuery, QueryAnnotateExt};
 pub use transaction::Transaction;

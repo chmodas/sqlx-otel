@@ -148,6 +148,34 @@ pool.with_operation("INSERT", "orders")
 
 Annotations work on `Pool`, `PoolConnection`, and `Transaction`. The wrapper borrows the underlying executor for a single operation and is then dropped.
 
+### Query-side annotations
+
+For locality, the same `with_annotations` / `with_operation` methods are also available on the query builder produced by `sqlx::query`, `sqlx::query_as`, and `sqlx::query_scalar`. Bring `QueryAnnotateExt` into scope and chain the annotation directly on the query – binds may appear before or after `with_annotations`:
+
+```rust
+use sqlx_otel::{QueryAnnotateExt, QueryAnnotations};
+
+sqlx::query("SELECT * FROM users WHERE id = ?")
+    .bind(42_i64)
+    .with_annotations(QueryAnnotations::new().operation("SELECT").collection("users"))
+    .execute(&pool)
+    .await?;
+
+// Shorthand and bind-after-annotate also work:
+sqlx::query("INSERT INTO orders (user_id) VALUES (?)")
+    .with_operation("INSERT", "orders")
+    .bind(7_i64)
+    .execute(&pool)
+    .await?;
+```
+
+#### Limitations
+
+- `Query::map` / `Query::try_map` returns [`sqlx::query::Map<'q, DB, F, A>`](https://docs.rs/sqlx/0.8/sqlx/query/struct.Map.html), which is **not yet** covered by the trait. Apply `with_annotations` *before* `map` / `try_map` if you need both. Support for `Map` is planned.
+- The compile-time validated macro forms expand to one of two public types and inherit support accordingly:
+    - `sqlx::query!("INSERT/UPDATE/DELETE …")` (no result columns) expands to `Query<'q, DB, _>` and **works today**.
+    - `sqlx::query!("SELECT …")`, `sqlx::query_as!()`, and `sqlx::query_scalar!()` expand to `Map<'q, DB, _, _>` and are **not yet** annotatable on the query side. For now, use the executor-side `pool.with_annotations(...)` form with these macros, or apply annotations to a hand-written `sqlx::query_as` builder.
+
 When annotations are provided the span name follows the [semantic convention hierarchy](https://opentelemetry.io/docs/specs/semconv/database/database-spans/#name):
 
 1. `db.query.summary` – the caller-supplied summary, e.g. `"users by tenant"`

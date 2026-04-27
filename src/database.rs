@@ -6,14 +6,14 @@
 /// (`Pool`, `PoolConnection`, `Transaction`) can resolve connection attributes once at
 /// pool construction and project `rows_affected` from the per-backend `QueryResult` types.
 ///
-/// **Not intended for downstream impls.** Implementing it for a custom backend would still
-/// require an upstream `sqlx::Database` impl, which is itself a non-trivial undertaking.
-/// The trait is left unsealed only for v0.1.x; expect it to be sealed in a future release.
+/// **The trait is sealed.** It is an internal generic-dispatch contract, not an extension
+/// point. Additional backends would require both an upstream `sqlx::Database` impl and a release
+/// of this crate.
 ///
 /// [`sqlx::Sqlite`]: https://docs.rs/sqlx/latest/sqlx/struct.Sqlite.html
 /// [`sqlx::Postgres`]: https://docs.rs/sqlx/latest/sqlx/struct.Postgres.html
 /// [`sqlx::MySql`]: https://docs.rs/sqlx/latest/sqlx/struct.MySql.html
-pub trait Database: sqlx::Database {
+pub trait Database: sqlx::Database + sealed::Sealed {
     /// The OpenTelemetry `db.system.name` value for this backend (e.g. `"postgresql"`,
     /// `"sqlite"`, `"mysql"`).
     const SYSTEM: &'static str;
@@ -32,6 +32,23 @@ pub trait Database: sqlx::Database {
     /// `rows_affected()` method. This trait method provides a uniform interface for the
     /// instrumentation layer.
     fn rows_affected(result: &<Self as sqlx::Database>::QueryResult) -> u64;
+}
+
+/// Sealing module for [`Database`]. The supertrait bound on `Database: sealed::Sealed`
+/// prevents downstream impls because only this crate can implement [`Sealed`](self::sealed::Sealed)
+/// for the backend types.
+mod sealed {
+    /// Marker trait that prevents external impls of [`Database`](super::Database).
+    pub trait Sealed {}
+
+    #[cfg(feature = "sqlite")]
+    impl Sealed for sqlx::Sqlite {}
+
+    #[cfg(feature = "postgres")]
+    impl Sealed for sqlx::Postgres {}
+
+    #[cfg(feature = "mysql")]
+    impl Sealed for sqlx::MySql {}
 }
 
 /// Extract `(host, port, namespace)` from a network-style backend's connect options by

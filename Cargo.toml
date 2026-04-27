@@ -37,6 +37,10 @@ mysql = ["sqlx/mysql"]
 runtime-tokio = ["dep:tokio"]
 runtime-async-std = ["dep:async-std"]
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dev-dependencies]
 opentelemetry_sdk = { version = "0.31", features = ["testing", "rt-tokio"] }
 proptest = "1"

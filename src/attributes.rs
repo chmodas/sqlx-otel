@@ -3,15 +3,26 @@ use opentelemetry_semantic_conventions::attribute;
 
 /// Controls whether and how `db.query.text` is captured on spans.
 ///
-/// # Automatic parameter capture
+/// Configured via [`PoolBuilder::with_query_text_mode`](crate::PoolBuilder::with_query_text_mode).
 ///
-/// `SQLx` uses parameterised queries (`$1`, `?`) by default, so `Full` mode is safe for
-/// most use cases. If you build SQL via `format!` with interpolated values, use
-/// `Obfuscated` or `Off` to avoid capturing sensitive data.
+/// # When to choose what
 ///
-/// Note that `db.query.parameter.<key>` capture is not supported automatically – `SQLx`'s
-/// `Execute` trait does not expose bind parameter values. Users who need per-parameter
-/// attributes can add them manually via the OpenTelemetry span context API.
+/// - **[`Full`](Self::Full)** (default) – appropriate when all SQL flows through `SQLx`
+///   bind parameters. The captured text contains placeholders (`$1`, `?`), not literal
+///   values, so user data does not leak into the span.
+/// - **[`Obfuscated`](Self::Obfuscated)** – appropriate when SQL is built via string
+///   interpolation (`format!`, query concatenation, dynamic identifiers) and may contain
+///   literal values. Structure is preserved; literals (string, numeric, hex, boolean, and
+///   `PostgreSQL` dollar-quoted) are replaced with `?`. Comments, whitespace, identifiers
+///   (quoted or otherwise), operators, and `NULL` are kept verbatim.
+/// - **[`Off`](Self::Off)** – appropriate when the query text is itself sensitive
+///   (proprietary schemas, query shapes that reveal business logic) or when query-text
+///   cardinality must be eliminated entirely.
+///
+/// `db.query.parameter.<key>` capture is **not supported** – `SQLx`'s `Execute` trait does
+/// not expose bind values, and reverse-engineering them from the encoded buffer would tie
+/// the wrapper to driver internals. Callers who need per-parameter attributes can add
+/// them manually via the active span using the OpenTelemetry API.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum QueryTextMode {
     /// Capture the parameterised query text as-is. This is the default because `SQLx`
@@ -19,8 +30,8 @@ pub enum QueryTextMode {
     /// query string.
     #[default]
     Full,
-    /// Replace literal values in the query text with placeholders. Useful when queries are
-    /// built via string interpolation rather than bind parameters.
+    /// Replace literal values in the query text with `?`. Useful when queries are built
+    /// via string interpolation rather than bind parameters.
     Obfuscated,
     /// Do not capture `db.query.text` at all.
     Off,
@@ -36,7 +47,7 @@ pub enum QueryTextMode {
 pub(crate) struct ConnectionAttributes {
     /// `db.system.name` – always present.
     pub system: &'static str,
-    /// `server.address` – the logical hostname. May be `None` for embedded databases.
+    /// `server.address` – the logical hostname (it may be `None` for embedded databases).
     pub host: Option<String>,
     /// `server.port`.
     pub port: Option<u16>,

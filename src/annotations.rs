@@ -45,23 +45,42 @@ macro_rules! impl_with_annotations_mut {
     };
 }
 
-/// Per-query annotation values that enrich OpenTelemetry spans with semantic convention
+/// Per-query annotation values that enrich OpenTelemetry spans with semantic-convention
 /// attributes the library cannot derive automatically (because it does not parse SQL).
 ///
 /// Use the builder methods to set whichever attributes apply to a given query, then pass
-/// the result to [`Pool::with_annotations`](crate::Pool::with_annotations),
-/// [`PoolConnection::with_annotations`](crate::PoolConnection::with_annotations), or
-/// [`Transaction::with_annotations`](crate::Transaction::with_annotations).
+/// the result through one of the equivalent annotation surfaces:
+///
+/// - **Executor-side** – [`Pool::with_annotations`](crate::Pool::with_annotations),
+///   [`PoolConnection::with_annotations`](crate::PoolConnection::with_annotations), or
+///   [`Transaction::with_annotations`](crate::Transaction::with_annotations). Returns a
+///   borrowed wrapper that is itself an `sqlx::Executor`.
+/// - **Query-side** – [`QueryAnnotateExt::with_annotations`](crate::QueryAnnotateExt) on
+///   the builder produced by `sqlx::query`, `sqlx::query_as`, `sqlx::query_scalar`, or
+///   their `_!` macro forms.
+///
+/// Both surfaces produce identical telemetry; pick whichever keeps the annotation closer to
+/// the thing it describes.
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```no_run
+/// # #[cfg(feature = "sqlite")]
+/// # async fn _doc() -> Result<(), sqlx::Error> {
+/// # use sqlx_otel::PoolBuilder;
+/// use sqlx::Executor as _;
+/// use sqlx_otel::QueryAnnotations;
+/// # let pool = PoolBuilder::from(sqlx::SqlitePool::connect(":memory:").await?).build();
+///
 /// pool.with_annotations(
-///         QueryAnnotations::new()
-///             .operation("SELECT")
-///             .collection("users"))
-///     .fetch_all("SELECT * FROM users")
-///     .await?;
+///     QueryAnnotations::new()
+///         .operation("SELECT")
+///         .collection("users"),
+/// )
+/// .fetch_all("SELECT * FROM users")
+/// .await?;
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct QueryAnnotations {

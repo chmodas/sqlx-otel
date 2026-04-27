@@ -9,6 +9,8 @@ Lightweight [SQLx](https://github.com/launchbadge/sqlx) wrapper that emits OpenT
 
 Uses the `opentelemetry` API directly – no `tracing` bridge indirection. Zero-cost when no tracer or meter provider is installed.
 
+> Full API documentation, including runnable examples for every public type, is on [docs.rs/sqlx-otel](https://docs.rs/sqlx-otel).
+
 ## Quick start
 
 ```rust
@@ -19,14 +21,14 @@ let raw = sqlx::PgPool::connect("postgres://localhost/mydb").await?;
 let pool = PoolBuilder::from(raw).build();
 
 // Use it exactly like a sqlx pool.
-let row = sqlx::query("SELECT 1").fetch_one( & pool).await?;
+let row = sqlx::query("SELECT 1").fetch_one(&pool).await?;
 
 // Transactions work with &mut tx.
 let mut tx = pool.begin().await?;
 sqlx::query("INSERT INTO users (name) VALUES ($1)")
-.bind("Alice")
-.execute( & mut tx)
-.await?;
+    .bind("Alice")
+    .execute(&mut tx)
+    .await?;
 tx.commit().await?;
 ```
 
@@ -47,7 +49,7 @@ sqlx-otel = { version = "0.1.0", features = ["postgres"] }
 Enable a runtime to get `db.client.connection.count` polling via a background task:
 
 ```toml
-sqlx-otel = { version = "0.0.0", features = ["postgres", "runtime-tokio"] }
+sqlx-otel = { version = "0.1.0", features = ["postgres", "runtime-tokio"] }
 # or "runtime-async-std"
 ```
 
@@ -62,7 +64,7 @@ Every `Executor` method (`execute`, `fetch`, `fetch_all`, `fetch_one`, `fetch_op
 | Attribute                   | Source                                          | Condition                   |
 |-----------------------------|-------------------------------------------------|-----------------------------|
 | `db.system.name`            | Backend (`"postgresql"`, `"sqlite"`, `"mysql"`) | Always                      |
-| `db.namespace`              | Database name, extracted from connect options   | Always                      |
+| `db.namespace`              | Database name, extracted from connect options   | When available              |
 | `server.address`            | Hostname, extracted from connect options        | When available              |
 | `server.port`               | Port, extracted from connect options            | When available              |
 | `network.peer.address`      | Resolved IP address                             | When set via builder        |

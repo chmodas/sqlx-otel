@@ -19,16 +19,31 @@ pub(crate) struct SharedState {
 
 /// Builder for constructing an instrumented [`Pool`] from a raw `sqlx::Pool`.
 ///
-/// The builder auto-extracts connection attributes (host, port, namespace) from the
-/// pool's connect options via the [`Database`] trait, then allows overriding any of them
-/// before calling [`build()`](Self::build).
+/// The builder auto-extracts connection attributes (host, port, database namespace) from
+/// the underlying connect options via the [`Database`] trait, then lets you override any of
+/// them before calling [`build`](Self::build). Settings on the wrapped `sqlx::Pool` itself
+/// (max connections, idle timeout, etc.) should be applied to the `sqlx::Pool` *before*
+/// passing it to the builder – `sqlx-otel` does not duplicate `SQLx`'s configuration
+/// surface.
 ///
 /// # Example
 ///
-/// ```ignore
-/// let pool = PoolBuilder::from(sqlx_pool)
+/// ```no_run
+/// # #[cfg(feature = "sqlite")]
+/// # async fn _doc() -> Result<(), sqlx::Error> {
+/// use sqlx_otel::{PoolBuilder, QueryTextMode};
+/// use std::time::Duration;
+///
+/// let raw = sqlx::SqlitePool::connect(":memory:").await?;
+/// let pool = PoolBuilder::from(raw)
 ///     .with_database("my_db")
+///     .with_query_text_mode(QueryTextMode::Obfuscated)
+///     .with_pool_name("my-service-db")
+///     .with_pool_metrics_interval(Duration::from_secs(5))
 ///     .build();
+/// # let _ = pool;
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug)]
 pub struct PoolBuilder<DB: sqlx::Database> {
@@ -106,12 +121,18 @@ impl<DB: Database> PoolBuilder<DB> {
         self
     }
 
-    /// Set the `db.client.connection.pool.name` attribute.
+    /// Set the `db.client.connection.pool.name` attribute and enable the
+    /// `db.client.connection.count` polling task.
     ///
-    /// When a runtime feature (e.g. `runtime-tokio`) is also enabled, a background task is
-    /// spawned that periodically records `db.client.connection.count` (idle/used). See
-    /// [`with_pool_metrics_interval`](Self::with_pool_metrics_interval) to configure the
-    /// polling frequency.
+    /// When a runtime feature (`runtime-tokio` or `runtime-async-std`) is also enabled, a
+    /// background task is spawned that periodically records `db.client.connection.count`
+    /// (idle / used). See [`with_pool_metrics_interval`](Self::with_pool_metrics_interval)
+    /// to configure the polling frequency. The task is cancelled when the [`Pool`] (and
+    /// every clone of it) is dropped.
+    ///
+    /// **Without a runtime feature, the name is recorded but no `connection.count` task is
+    /// spawned and the gauge is never reported.** All other operation- and pool-level
+    /// metrics still work in that configuration.
     #[must_use]
     pub fn with_pool_name(mut self, name: impl Into<String>) -> Self {
         self.pool_name = Some(name.into());
@@ -129,6 +150,12 @@ impl<DB: Database> PoolBuilder<DB> {
     }
 
     /// Consume the builder and produce an instrumented [`Pool`].
+    ///
+    /// At this point the static pool gauges (`db.client.connection.max`,
+    /// `db.client.connection.idle.max`, `db.client.connection.idle.min`) are recorded
+    /// once with the connection-level attributes – they do not change over the pool's
+    /// lifetime. The wait-time / use-time / timeout / pending-request instruments are
+    /// created here and updated inline on every `acquire()` and connection drop.
     #[must_use]
     pub fn build(self) -> Pool<DB> {
         let metrics_shutdown = self.spawn_pool_metrics_task();
@@ -245,14 +272,37 @@ impl<DB: Database> PoolBuilder<DB> {
 /// An instrumented wrapper around `sqlx::Pool` that emits OpenTelemetry spans and metrics
 /// for every database operation.
 ///
-/// Create one via [`PoolBuilder`]:
+/// Create one via [`PoolBuilder`]. The wrapper is a drop-in replacement for `sqlx::Pool`:
+/// `&Pool<DB>` implements [`sqlx::Executor`], so you can pass it straight into
+/// `sqlx::query(...)`, `sqlx::query_as(...)`, and friends. Connections acquired via
+/// [`acquire`](Self::acquire) and transactions started via [`begin`](Self::begin) inherit
+/// the same instrumentation and produce spans / metrics with identical connection-level
+/// attributes.
 ///
-/// ```ignore
-/// let pool: Pool<Postgres> = PoolBuilder::from(sqlx_pool).build();
+/// `Clone` is cheap – the inner `sqlx::Pool`, the connection-level attribute set, and the
+/// metric instruments are all `Arc`-shared. Cloning never copies state; cloned pools share
+/// the same underlying connection pool and metric stream.
+///
+/// # Example
+///
+/// ```no_run
+/// # #[cfg(feature = "sqlite")]
+/// # async fn _doc() -> Result<(), sqlx::Error> {
+/// use sqlx_otel::PoolBuilder;
+///
+/// let raw = sqlx::SqlitePool::connect(":memory:").await?;
+/// let pool = PoolBuilder::from(raw).build();
+///
+/// // Pass `&pool` anywhere a `sqlx::Executor` is expected.
+/// let row: (i64,) = sqlx::query_as("SELECT 1").fetch_one(&pool).await?;
+/// assert_eq!(row.0, 1);
+/// # Ok(())
+/// # }
 /// ```
 ///
-/// All connections acquired from this pool inherit its shared attributes and metric
-/// instruments.
+/// See also [`with_annotations`](Self::with_annotations) for per-query semantic-convention
+/// attributes, and [`crate::QueryAnnotateExt`] for attaching annotations on the query side
+/// instead of the executor side.
 #[derive(Debug)]
 pub struct Pool<DB: sqlx::Database> {
     pub(crate) inner: sqlx::Pool<DB>,
@@ -288,13 +338,16 @@ impl<DB: Database> Pool<DB> {
     /// Acquire a pooled connection instrumented for OpenTelemetry.
     ///
     /// Records `db.client.connection.wait_time` (time spent waiting for a connection),
-    /// tracks `db.client.connection.pending_requests`, and increments
-    /// `db.client.connection.timeouts` on `PoolTimedOut`.
+    /// tracks `db.client.connection.pending_requests` while the call is in flight, and
+    /// increments `db.client.connection.timeouts` on `sqlx::Error::PoolTimedOut`. The
+    /// returned [`PoolConnection`] records `db.client.connection.use_time` when dropped
+    /// and is itself an [`sqlx::Executor`] via `&mut conn`.
     ///
     /// # Errors
     ///
-    /// Returns `sqlx::Error` if a connection cannot be obtained from the pool (e.g.
-    /// timeout, pool closed).
+    /// Returns `sqlx::Error` if a connection cannot be obtained from the pool – typically
+    /// `PoolTimedOut` when the configured acquire timeout elapses, or `PoolClosed` after
+    /// [`close`](Self::close).
     pub async fn acquire(&self) -> Result<PoolConnection<DB>, sqlx::Error> {
         let attrs = self.state.attrs.base_key_values();
         self.pending_requests.add(1, &attrs);
@@ -318,9 +371,16 @@ impl<DB: Database> Pool<DB> {
 
     /// Begin a new transaction instrumented for OpenTelemetry.
     ///
+    /// The returned [`Transaction`] implements `sqlx::Executor` via `&mut tx` and emits
+    /// the same per-operation spans and metrics as the pool itself. Call
+    /// [`commit`](Transaction::commit) or [`rollback`](Transaction::rollback) to terminate
+    /// it; dropping the value without doing either rolls back implicitly (per `SQLx`'s
+    /// usual behaviour).
+    ///
     /// # Errors
     ///
-    /// Returns `sqlx::Error` if beginning the transaction fails.
+    /// Returns `sqlx::Error` if `BEGIN` fails – typically due to a connection problem or
+    /// because the underlying connection cannot start a new transaction.
     pub async fn begin(&self) -> Result<Transaction<'_, DB>, sqlx::Error> {
         self.inner.begin().await.map(|inner| Transaction {
             inner,
@@ -339,20 +399,33 @@ impl<DB: Database> Pool<DB> {
         self.inner.is_closed()
     }
 
-    /// Return an annotated executor that attaches per-query semantic convention attributes
-    /// to every span created by the next operation.
+    /// Return an annotated executor that attaches per-query semantic-convention attributes
+    /// (`db.operation.name`, `db.collection.name`, `db.query.summary`,
+    /// `db.stored_procedure.name`) to every span created by the next operation.
     ///
-    /// The returned wrapper borrows the pool and implements `sqlx::Executor` with the
-    /// same instrumentation, but with annotation values threaded through to span creation.
+    /// The returned wrapper borrows the pool and implements `sqlx::Executor`. Use the
+    /// query-side equivalent ([`crate::QueryAnnotateExt`]) when the annotation belongs
+    /// next to the query text rather than next to the executor.
     ///
     /// # Example
     ///
-    /// ```ignore
-    /// pool.with_annotations(QueryAnnotations::new()
+    /// ```no_run
+    /// # #[cfg(feature = "sqlite")]
+    /// # async fn _doc() -> Result<(), sqlx::Error> {
+    /// # use sqlx_otel::PoolBuilder;
+    /// use sqlx::Executor as _;
+    /// use sqlx_otel::QueryAnnotations;
+    /// # let pool = PoolBuilder::from(sqlx::SqlitePool::connect(":memory:").await?).build();
+    ///
+    /// pool.with_annotations(
+    ///     QueryAnnotations::new()
     ///         .operation("SELECT")
-    ///         .collection("users"))
-    ///     .fetch_all("SELECT * FROM users")
-    ///     .await?;
+    ///         .collection("users"),
+    /// )
+    /// .fetch_all("SELECT * FROM users")
+    /// .await?;
+    /// # Ok(())
+    /// # }
     /// ```
     #[must_use]
     pub fn with_annotations(&self, annotations: QueryAnnotations) -> Annotated<'_, Self> {

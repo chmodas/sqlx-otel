@@ -1,19 +1,38 @@
 //! Query-side annotation surface – mirror of the executor-side
 //! [`with_annotations`](crate::Pool::with_annotations) /
-//! [`with_operation`](crate::Pool::with_operation) methods, but attached to the query builder
-//! produced by [`sqlx::query`], [`sqlx::query_as`], and [`sqlx::query_scalar`].
+//! [`with_operation`](crate::Pool::with_operation) methods, but attached to the query
+//! builder produced by [`sqlx::query()`], [`sqlx::query_as()`], and
+//! [`sqlx::query_scalar()`].
 //!
-//! The motivation is locality: per-query OpenTelemetry attributes describe the query, so the
-//! caller often wants to colocate them with the query text rather than with the executor:
+//! # Choosing between executor-side and query-side
 //!
-//! ```ignore
+//! The two surfaces emit identical telemetry; pick whichever keeps the annotation closer to
+//! the thing it describes. As a rule of thumb:
+//!
+//! - **Query-side** is the default. Per-query attributes describe the *query*, and
+//!   colocating them with the query text keeps both readable.
+//! - **Executor-side** is for cases where one annotation set is reused across many queries
+//!   on the same executor (e.g. a request-scoped logical operation), or where the surface
+//!   is `prepare` / `describe` rather than `execute` / `fetch*`.
+//!
+//! ```no_run
+//! # #[cfg(feature = "sqlite")]
+//! # async fn _doc() -> Result<(), sqlx::Error> {
+//! # use sqlx_otel::PoolBuilder;
 //! use sqlx_otel::{QueryAnnotateExt, QueryAnnotations};
+//! # let pool = PoolBuilder::from(sqlx::SqlitePool::connect(":memory:").await?).build();
 //!
 //! sqlx::query("SELECT * FROM users WHERE id = ?")
 //!     .bind(42_i64)
-//!     .with_annotations(QueryAnnotations::new().operation("SELECT").collection("users"))
+//!     .with_annotations(
+//!         QueryAnnotations::new()
+//!             .operation("SELECT")
+//!             .collection("users"),
+//!     )
 //!     .execute(&pool)
 //!     .await?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! The wrapper [`AnnotatedQuery`] exposes the same `execute`/`fetch*` surface as the inner
@@ -23,13 +42,18 @@
 //! # Map and macro queries
 //!
 //! [`Query::map`](Query::map) / [`Query::try_map`](Query::try_map) return
-//! [`sqlx::query::Map<'q, DB, F, A>`](sqlx::query::Map), which is also covered by the trait.
-//! `with_annotations` and `with_operation` may be applied at any of the three positions on a
-//! hand-written `Query::map()` chain – before `bind`, between `bind` and `map`, or after
-//! `map`:
+//! [`sqlx::query::Map<'q, DB, F, A>`](sqlx::query::Map), which is also covered by the
+//! trait. `with_annotations` and `with_operation` may be applied at any of the three
+//! positions on a hand-written `Query::map()` chain – before `bind`, between `bind` and
+//! `map`, or after `map`:
 //!
-//! ```ignore
+//! ```no_run
+//! # #[cfg(feature = "sqlite")]
+//! # async fn _doc() -> Result<(), sqlx::Error> {
+//! # use sqlx_otel::PoolBuilder;
+//! use sqlx::Row as _;
 //! use sqlx_otel::QueryAnnotateExt;
+//! # let pool = PoolBuilder::from(sqlx::SqlitePool::connect(":memory:").await?).build();
 //!
 //! sqlx::query("SELECT id FROM users WHERE name = ?")
 //!     .bind("alice")
@@ -37,11 +61,13 @@
 //!     .with_operation("SELECT", "users")
 //!     .fetch_one(&pool)
 //!     .await?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! The compile-time validated macro forms (`sqlx::query!()`, `sqlx::query_as!()`,
-//! `sqlx::query_scalar!()`) expand to either `Query<'q, DB, _>` (for no-result-column shapes)
-//! or `Map<'q, DB, _, _>` (for any shape that decodes columns). Both are covered:
+//! `sqlx::query_scalar!()`) expand to either `Query<'q, DB, _>` (for no-result-column
+//! shapes) or `Map<'q, DB, _, _>` (for any shape that decodes columns). Both are covered:
 //!
 //! ```ignore
 //! sqlx::query_as!(User, "SELECT id, name FROM users WHERE id = ?", 42_i64)
@@ -52,6 +78,8 @@
 //!
 //! Macro queries can only carry annotations *after* the macro returns – the macro itself
 //! pre-applies `bind` and `try_map`, so positions 1 and 2 are not reachable by the user.
+//! The macro example above stays `ignore` because it requires either an offline `.sqlx/`
+//! cache or a live `DATABASE_URL`.
 
 use futures::stream::BoxStream;
 use sqlx::query::{Map, Query, QueryAs, QueryScalar};
@@ -68,20 +96,28 @@ mod sealed {
 }
 
 /// Extension trait that attaches OpenTelemetry per-query annotations to the function-form
-/// `SQLx` query builders ([`sqlx::query`], [`sqlx::query_as`], [`sqlx::query_scalar`]).
+/// `SQLx` query builders ([`sqlx::query()`], [`sqlx::query_as()`],
+/// [`sqlx::query_scalar()`]) and to the [`Map`](sqlx::query::Map) returned by
+/// `Query::map` / `Query::try_map`.
 ///
 /// The trait is sealed and cannot be implemented downstream.
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```no_run
+/// # #[cfg(feature = "sqlite")]
+/// # async fn _doc() -> Result<(), sqlx::Error> {
+/// # use sqlx_otel::PoolBuilder;
 /// use sqlx_otel::QueryAnnotateExt;
+/// # let pool = PoolBuilder::from(sqlx::SqlitePool::connect(":memory:").await?).build();
 ///
 /// sqlx::query("INSERT INTO orders (user_id) VALUES (?)")
 ///     .bind(42_i64)
 ///     .with_operation("INSERT", "orders")
 ///     .execute(&pool)
 ///     .await?;
+/// # Ok(())
+/// # }
 /// ```
 pub trait QueryAnnotateExt: sealed::Sealed + Sized {
     /// Wrap the query with the given per-query annotations.

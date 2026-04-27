@@ -169,12 +169,31 @@ sqlx::query("INSERT INTO orders (user_id) VALUES (?)")
     .await?;
 ```
 
-#### Limitations
+#### Map and macro queries
 
-- `Query::map` / `Query::try_map` returns [`sqlx::query::Map<'q, DB, F, A>`](https://docs.rs/sqlx/0.8/sqlx/query/struct.Map.html), which is **not yet** covered by the trait. Apply `with_annotations` *before* `map` / `try_map` if you need both. Support for `Map` is planned.
-- The compile-time validated macro forms expand to one of two public types and inherit support accordingly:
-    - `sqlx::query!("INSERT/UPDATE/DELETE …")` (no result columns) expands to `Query<'q, DB, _>` and **works today**.
-    - `sqlx::query!("SELECT …")`, `sqlx::query_as!()`, and `sqlx::query_scalar!()` expand to `Map<'q, DB, _, _>` and are **not yet** annotatable on the query side. For now, use the executor-side `pool.with_annotations(...)` form with these macros, or apply annotations to a hand-written `sqlx::query_as` builder.
+`Query::map` / `Query::try_map` return [`sqlx::query::Map<'q, DB, F, A>`](https://docs.rs/sqlx/0.8/sqlx/query/struct.Map.html), which is also supported by the trait. `with_annotations` and `with_operation` may be placed at any of three positions on a hand-written chain:
+
+```rust
+use sqlx_otel::QueryAnnotateExt;
+
+sqlx::query("SELECT id FROM users WHERE name = ?")
+    .bind("alice")
+    .map(|row: sqlx::sqlite::SqliteRow| row.get::<i64, _>("id"))
+    .with_operation("SELECT", "users")
+    .fetch_one(&pool)
+    .await?;
+```
+
+The compile-time validated macro forms (`sqlx::query!()`, `sqlx::query_as!()`, `sqlx::query_scalar!()`) expand to either `Query<'q, DB, _>` (no result columns) or `Map<'q, DB, _, _>` (any shape that decodes columns). Both are covered:
+
+```rust
+sqlx::query_as!(User, "SELECT id, name FROM users WHERE id = ?", 42_i64)
+    .with_operation("SELECT", "users")
+    .fetch_one(&pool)
+    .await?;
+```
+
+Macro queries can only carry annotations *after* the macro returns – the macro itself pre-applies `bind` and `try_map`, so the alternative positions are not reachable by the caller.
 
 When annotations are provided the span name follows the [semantic convention hierarchy](https://opentelemetry.io/docs/specs/semconv/database/database-spans/#name):
 

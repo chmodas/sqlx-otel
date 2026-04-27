@@ -20,26 +20,41 @@
 //! query and threads the annotations into span creation by wrapping the executor with the
 //! existing [`Annotated`](Annotated) / [`AnnotatedMut`](AnnotatedMut) executor wrappers.
 //!
-//! # Limitations
+//! # Map and macro queries
 //!
 //! [`Query::map`](Query::map) / [`Query::try_map`](Query::try_map) return
-//! [`sqlx::query::Map<'q, DB, F, A>`](sqlx::query::Map), which is **not yet** covered by the
-//! trait. Apply `with_annotations` *before* `map` / `try_map` if you need both. Support for
-//! `Map` is planned.
+//! [`sqlx::query::Map<'q, DB, F, A>`](sqlx::query::Map), which is also covered by the trait.
+//! `with_annotations` and `with_operation` may be applied at any of the three positions on a
+//! hand-written `Query::map()` chain – before `bind`, between `bind` and `map`, or after
+//! `map`:
+//!
+//! ```ignore
+//! use sqlx_otel::QueryAnnotateExt;
+//!
+//! sqlx::query("SELECT id FROM users WHERE name = ?")
+//!     .bind("alice")
+//!     .map(|row: sqlx::sqlite::SqliteRow| row.get::<i64, _>("id"))
+//!     .with_operation("SELECT", "users")
+//!     .fetch_one(&pool)
+//!     .await?;
+//! ```
 //!
 //! The compile-time validated macro forms (`sqlx::query!()`, `sqlx::query_as!()`,
-//! `sqlx::query_scalar!()`) expand to one of two public types and inherit support
-//! accordingly:
+//! `sqlx::query_scalar!()`) expand to either `Query<'q, DB, _>` (for no-result-column shapes)
+//! or `Map<'q, DB, _, _>` (for any shape that decodes columns). Both are covered:
 //!
-//! * `sqlx::query!("INSERT/UPDATE/DELETE ...")` (no result columns) expands to `Query<'q, DB,
-//!   _>` and **works today**.
-//! * `sqlx::query!("SELECT ...")`, `sqlx::query_as!()`, and `sqlx::query_scalar!()` expand to
-//!   `Map<'q, DB, _, _>` and are **not yet** annotatable on the query side. For now, use the
-//!   executor-side [`Pool::with_annotations`](crate::Pool::with_annotations) form with these
-//!   macros, or apply annotations to a hand-written `sqlx::query_as` builder.
+//! ```ignore
+//! sqlx::query_as!(User, "SELECT id, name FROM users WHERE id = ?", 42_i64)
+//!     .with_operation("SELECT", "users")
+//!     .fetch_one(&pool)
+//!     .await?;
+//! ```
+//!
+//! Macro queries can only carry annotations *after* the macro returns – the macro itself
+//! pre-applies `bind` and `try_map`, so positions 1 and 2 are not reachable by the user.
 
 use futures::stream::BoxStream;
-use sqlx::query::{Query, QueryAs, QueryScalar};
+use sqlx::query::{Map, Query, QueryAs, QueryScalar};
 
 use crate::annotations::{Annotated, AnnotatedMut, QueryAnnotations};
 use crate::database::Database;
@@ -114,6 +129,16 @@ impl<DB: sqlx::Database, O, A> QueryAnnotateExt for QueryAs<'_, DB, O, A> {
 
 impl<DB: sqlx::Database, O, A> sealed::Sealed for QueryScalar<'_, DB, O, A> {}
 impl<DB: sqlx::Database, O, A> QueryAnnotateExt for QueryScalar<'_, DB, O, A> {
+    fn with_annotations(self, annotations: QueryAnnotations) -> AnnotatedQuery<Self> {
+        AnnotatedQuery {
+            inner: self,
+            annotations,
+        }
+    }
+}
+
+impl<DB: sqlx::Database, F, A> sealed::Sealed for Map<'_, DB, F, A> {}
+impl<DB: sqlx::Database, F, A> QueryAnnotateExt for Map<'_, DB, F, A> {
     fn with_annotations(self, annotations: QueryAnnotations) -> AnnotatedQuery<Self> {
         AnnotatedQuery {
             inner: self,
@@ -394,8 +419,8 @@ where
     /// Execute multiple statements separated by `;` and return their results as a stream.
     ///
     /// `execute_many` is `#[deprecated]` in `SQLx` 0.8 but kept here for parity with the
-    /// existing executor-side surface. Only `Query` exposes this method – `QueryAs` and
-    /// `QueryScalar` have no `execute_many` upstream.
+    /// existing executor-side surface. Only `Query` exposes this method – `QueryAs`,
+    /// `QueryScalar`, and `Map` have no `execute_many` upstream.
     #[allow(deprecated)]
     pub async fn execute_many<'e, E>(
         self,
@@ -408,6 +433,37 @@ where
     {
         let wrapper = executor.into_annotated(self.annotations);
         self.inner.execute_many(wrapper).await
+    }
+
+    /// Map each row to another type. Mirrors [`sqlx::query::Query::map`] and carries the
+    /// existing annotations forward unchanged onto the resulting `AnnotatedQuery<Map<...>>`,
+    /// so `with_annotations` can be applied either before or after `.map()`.
+    #[allow(clippy::type_complexity)]
+    pub fn map<F, O>(
+        self,
+        f: F,
+    ) -> AnnotatedQuery<Map<'q, DB, impl FnMut(DB::Row) -> Result<O, sqlx::Error> + Send, A>>
+    where
+        F: FnMut(DB::Row) -> O + Send,
+        O: Unpin,
+    {
+        AnnotatedQuery {
+            inner: self.inner.map(f),
+            annotations: self.annotations,
+        }
+    }
+
+    /// Map each row to a `Result`. Mirrors [`sqlx::query::Query::try_map`] and carries the
+    /// existing annotations forward unchanged.
+    pub fn try_map<F, O>(self, f: F) -> AnnotatedQuery<Map<'q, DB, F, A>>
+    where
+        F: FnMut(DB::Row) -> Result<O, sqlx::Error> + Send,
+        O: Unpin,
+    {
+        AnnotatedQuery {
+            inner: self.inner.try_map(f),
+            annotations: self.annotations,
+        }
     }
 }
 
@@ -455,12 +511,61 @@ where
     impl_annotated_query_bind!();
 }
 
+// --- AnnotatedQuery<Map<'q, DB, F, A>> -------------------------------------
+
+impl<'q, DB, F, A, O> AnnotatedQuery<Map<'q, DB, F, A>>
+where
+    DB: Database,
+    F: FnMut(DB::Row) -> Result<O, sqlx::Error> + Send,
+    O: Send + Unpin,
+    A: 'q + Send + sqlx::IntoArguments<'q, DB>,
+{
+    impl_annotated_query_fetch_forwarders!(row = O, extra_bounds = (DB: 'e, F: 'e, O: 'e,));
+
+    /// Compose a further mapping on top of this annotated map. Mirrors
+    /// [`sqlx::query::Map::map`] (which itself composes via `f(row).and_then(&mut g)`) and
+    /// preserves the existing annotations on the wrapper.
+    #[allow(clippy::type_complexity)]
+    pub fn map<G, P>(
+        self,
+        g: G,
+    ) -> AnnotatedQuery<Map<'q, DB, impl FnMut(DB::Row) -> Result<P, sqlx::Error> + Send, A>>
+    where
+        G: FnMut(O) -> P + Send,
+        P: Unpin,
+    {
+        AnnotatedQuery {
+            inner: self.inner.map(g),
+            annotations: self.annotations,
+        }
+    }
+
+    /// Fallible variant of [`map`](Self::map). Mirrors [`sqlx::query::Map::try_map`] and
+    /// preserves the existing annotations on the wrapper.
+    #[allow(clippy::type_complexity)]
+    pub fn try_map<G, P>(
+        self,
+        g: G,
+    ) -> AnnotatedQuery<Map<'q, DB, impl FnMut(DB::Row) -> Result<P, sqlx::Error> + Send, A>>
+    where
+        G: FnMut(O) -> Result<P, sqlx::Error> + Send,
+        P: Unpin,
+    {
+        AnnotatedQuery {
+            inner: self.inner.try_map(g),
+            annotations: self.annotations,
+        }
+    }
+}
+
 #[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use sqlx::Execute as _;
     use sqlx::Sqlite;
 
     use super::*;
+
+    // --- query() / query_as() / query_scalar() --------------------
 
     #[test]
     fn with_annotations_replaces_previous() {
@@ -587,5 +692,89 @@ mod tests {
             .bind(7_i32);
         assert_eq!(q.inner.sql(), "SELECT ?1");
         assert_eq!(q.annotations.operation.as_deref(), Some("SELECT"));
+    }
+
+    // --- Map / Query::map / Query::try_map composition --------------------
+
+    #[test]
+    fn query_with_annotations_map_preserves_annotations() {
+        // Position 1: annotate before `.map()`. Annotations must survive the wrap.
+        let q = sqlx::query::<Sqlite>("SELECT 1")
+            .with_annotations(QueryAnnotations::new().operation("SELECT"))
+            .map(|_row: sqlx::sqlite::SqliteRow| 42_i64);
+        assert_eq!(q.annotations.operation.as_deref(), Some("SELECT"));
+    }
+
+    #[test]
+    fn query_bind_with_annotations_map_preserves_annotations() {
+        // Position 2: annotate between `.bind()` and `.map()`.
+        let q = sqlx::query::<Sqlite>("SELECT ?1")
+            .bind(1_i32)
+            .with_annotations(QueryAnnotations::new().operation("SELECT"))
+            .map(|_row: sqlx::sqlite::SqliteRow| 42_i64);
+        assert_eq!(q.annotations.operation.as_deref(), Some("SELECT"));
+    }
+
+    #[test]
+    fn query_map_with_annotations_replaces_previous() {
+        // Position 3 + last-call-wins on the new `Map` wrapper.
+        let q = sqlx::query::<Sqlite>("SELECT 1")
+            .map(|_row: sqlx::sqlite::SqliteRow| 42_i64)
+            .with_annotations(QueryAnnotations::new().operation("FIRST"))
+            .with_annotations(QueryAnnotations::new().operation("SECOND"));
+        assert_eq!(q.annotations.operation.as_deref(), Some("SECOND"));
+    }
+
+    #[test]
+    fn query_try_map_with_annotations_compose() {
+        // `try_map` stores `F` directly; sanity-check the non-opaque closure branch.
+        let q = sqlx::query::<Sqlite>("SELECT 1")
+            .try_map(|_row: sqlx::sqlite::SqliteRow| Ok::<_, sqlx::Error>(42_i64))
+            .with_operation("SELECT", "users");
+        assert_eq!(q.annotations.operation.as_deref(), Some("SELECT"));
+        assert_eq!(q.annotations.collection.as_deref(), Some("users"));
+    }
+
+    #[test]
+    fn annotated_query_try_map_preserves_annotations() {
+        // Exercise `AnnotatedQuery<Query>::try_map` (the wrapper's own method, not sqlx's).
+        // Position-1-then-fallible-mapper.
+        let q = sqlx::query::<Sqlite>("SELECT 1")
+            .with_annotations(QueryAnnotations::new().operation("SELECT"))
+            .try_map(|_row: sqlx::sqlite::SqliteRow| Ok::<_, sqlx::Error>(42_i64));
+        assert_eq!(q.annotations.operation.as_deref(), Some("SELECT"));
+    }
+
+    #[test]
+    fn map_compose_after_annotations() {
+        // Multi-map composition: annotations survive across two `.map()` calls.
+        let q = sqlx::query::<Sqlite>("SELECT 1")
+            .with_annotations(QueryAnnotations::new().operation("SELECT"))
+            .map(|_row: sqlx::sqlite::SqliteRow| 1_i64)
+            .map(|n| n + 1);
+        assert_eq!(q.annotations.operation.as_deref(), Some("SELECT"));
+    }
+
+    #[test]
+    fn map_then_with_operation_replaces_via_wrapper() {
+        // `with_operation` shorthand on the new `AnnotatedQuery<Map<...>>` wrapper.
+        let q = sqlx::query::<Sqlite>("SELECT 1")
+            .map(|_row: sqlx::sqlite::SqliteRow| 1_i64)
+            .with_annotations(QueryAnnotations::new().query_summary("legacy"))
+            .with_operation("SELECT", "users");
+        assert_eq!(q.annotations.operation.as_deref(), Some("SELECT"));
+        assert_eq!(q.annotations.collection.as_deref(), Some("users"));
+        assert!(q.annotations.query_summary.is_none());
+    }
+
+    #[test]
+    fn debug_impl_for_annotated_map_includes_annotations() {
+        // The manual `Debug` impl on the new `Map` wrapper still prints annotations.
+        let q = sqlx::query::<Sqlite>("SELECT 1")
+            .map(|_row: sqlx::sqlite::SqliteRow| 1_i64)
+            .with_annotations(QueryAnnotations::new().operation("DEBUG_MAP"));
+        let debug = format!("{q:?}");
+        assert!(debug.contains("AnnotatedQuery"));
+        assert!(debug.contains("DEBUG_MAP"));
     }
 }

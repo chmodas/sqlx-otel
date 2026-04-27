@@ -93,6 +93,21 @@ pub fn assert_common_span_attributes(span: &SpanData, system: &str) {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Shared fixtures
+// ---------------------------------------------------------------------------
+
+/// Row shape for the shared `macro_users` table used by the macro-form integration tests.
+///
+/// Generic over the primary-key type so each backend can pick the variant that matches its
+/// column type (sqlite `INTEGER` decodes to `i64`; postgres `INTEGER` and mysql `INT`
+/// decode to `i32`).
+#[derive(Debug, sqlx::FromRow)]
+pub struct MacroUser<Id> {
+    pub id: Id,
+    pub name: String,
+}
+
 /// Assert that a span has error status, an `error.type` attribute, and an exception event
 /// with `exception.type` and `exception.message`.
 pub fn assert_error_span(span: &SpanData) {

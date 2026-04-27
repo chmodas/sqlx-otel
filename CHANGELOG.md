@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - Query-side `with_annotations` / `with_operation` via the new `QueryAnnotateExt` trait on `sqlx::query`, `sqlx::query_as`, and `sqlx::query_scalar`, so per-query attributes can sit next to the query text. `bind` and `with_annotations` compose in either order ([#22](https://github.com/chmodas/sqlx-otel/pull/22)).
+- `Query::map` / `Query::try_map` chains and the `sqlx::query!()` / `query_as!()` / `query_scalar!()` macros now support `with_annotations` / `with_operation`. On hand-written chains the annotation may sit before `bind`, between `bind` and `map`, or after `map`; macro queries carry annotations after the macro returns ([#23](https://github.com/chmodas/sqlx-otel/pull/23)).
 
 ## [0.1.0] – 2026-04-26
 

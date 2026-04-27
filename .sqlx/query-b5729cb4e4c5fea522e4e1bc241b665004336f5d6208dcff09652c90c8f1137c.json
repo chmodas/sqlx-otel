@@ -1,0 +1,24 @@
+{
+  "db_name": "MySQL",
+  "query": "SELECT name FROM macro_users WHERE id = ?",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name",
+        "type_info": {
+          "type": "VarString",
+          "flags": "NOT_NULL | NO_DEFAULT_VALUE",
+          "max_size": 1020
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "b5729cb4e4c5fea522e4e1bc241b665004336f5d6208dcff09652c90c8f1137c"
+}

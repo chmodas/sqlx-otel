@@ -2528,3 +2528,602 @@ async fn query_scalar_fetch_optional_with_annotations_via_pool() {
     assert_eq!(spans.len(), 1);
     assert_annotated_span(&spans[0]);
 }
+
+// ===========================================================================
+// query-side annotations: Map (Query::map / Query::try_map)
+// ===========================================================================
+
+// --- Per-position end-to-end ----------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn query_map_position_1_via_pool() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    let value: i64 = sqlx::query("SELECT $1::int8")
+        .with_annotations(test_annotations())
+        .bind(7_i64)
+        .map(|row: sqlx::postgres::PgRow| row.get::<i64, _>(0))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(value, 7);
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+#[tokio::test]
+#[serial]
+async fn query_map_position_2_via_pool() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    let value: i64 = sqlx::query("SELECT $1::int8")
+        .bind(11_i64)
+        .with_annotations(test_annotations())
+        .map(|row: sqlx::postgres::PgRow| row.get::<i64, _>(0))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(value, 11);
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+#[tokio::test]
+#[serial]
+async fn query_map_position_3_via_pool() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    let value: i64 = sqlx::query("SELECT $1::int8")
+        .bind(13_i64)
+        .map(|row: sqlx::postgres::PgRow| row.get::<i64, _>(0))
+        .with_annotations(test_annotations())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(value, 13);
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+#[tokio::test]
+#[serial]
+async fn query_try_map_position_3_via_pool() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    let value: i64 = sqlx::query("SELECT $1::int8")
+        .bind(17_i64)
+        .try_map(|row: sqlx::postgres::PgRow| Ok(row.get::<i64, _>(0)))
+        .with_annotations(test_annotations())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(value, 17);
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+// --- Per-method on Map (so each forwarder body is hit) --------------------
+
+#[tokio::test]
+#[serial]
+async fn map_fetch_with_annotations_via_pool() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    let mut stream = sqlx::query("SELECT 1::int8 UNION ALL SELECT 2::int8")
+        .map(|row: sqlx::postgres::PgRow| row.get::<i64, _>(0))
+        .with_annotations(test_annotations())
+        .fetch(&pool);
+    while stream.next().await.is_some() {}
+    drop(stream);
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+    assert_eq!(
+        attr(&spans[0], "db.response.returned_rows"),
+        Some(opentelemetry::Value::I64(2))
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn map_fetch_many_with_annotations_via_pool() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    #[allow(deprecated)]
+    let mut stream = sqlx::query("SELECT 1::int8 UNION ALL SELECT 2::int8")
+        .map(|row: sqlx::postgres::PgRow| row.get::<i64, _>(0))
+        .with_annotations(test_annotations())
+        .fetch_many(&pool);
+    while stream.next().await.is_some() {}
+    drop(stream);
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+#[tokio::test]
+#[serial]
+async fn map_fetch_all_with_annotations_via_pool() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    let rows: Vec<i64> =
+        sqlx::query("SELECT 1::int8 UNION ALL SELECT 2::int8 UNION ALL SELECT 3::int8")
+            .map(|row: sqlx::postgres::PgRow| row.get::<i64, _>(0))
+            .with_annotations(test_annotations())
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows, vec![1, 2, 3]);
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+#[tokio::test]
+#[serial]
+async fn map_fetch_one_with_annotations_via_pool() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    let value: i64 = sqlx::query("SELECT 19::int8")
+        .map(|row: sqlx::postgres::PgRow| row.get::<i64, _>(0))
+        .with_annotations(test_annotations())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(value, 19);
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+#[tokio::test]
+#[serial]
+async fn map_fetch_optional_with_annotations_via_pool() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    let value: Option<i64> = sqlx::query("SELECT 1::int8 WHERE 1 = 0")
+        .map(|row: sqlx::postgres::PgRow| row.get::<i64, _>(0))
+        .with_annotations(test_annotations())
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+    assert!(value.is_none());
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+// --- Composition (multi-map; both branches of step 4) --------------------
+
+#[tokio::test]
+#[serial]
+async fn map_compose_after_annotations_via_pool() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    let value: i64 = sqlx::query("SELECT 5::int8")
+        .map(|row: sqlx::postgres::PgRow| row.get::<i64, _>(0))
+        .with_annotations(test_annotations())
+        .map(|n| n * 2)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(value, 10);
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+#[tokio::test]
+#[serial]
+async fn map_try_map_compose_after_annotations_via_pool() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    let value: i64 = sqlx::query("SELECT 6::int8")
+        .map(|row: sqlx::postgres::PgRow| row.get::<i64, _>(0))
+        .with_annotations(test_annotations())
+        .try_map(|n: i64| Ok::<_, sqlx::Error>(n + 100))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(value, 106);
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+// --- Other executor receivers (smoke) -------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn query_map_with_annotations_via_connection() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    let mut conn = pool.acquire().await.unwrap();
+    let value: i64 = sqlx::query("SELECT 23::int8")
+        .map(|row: sqlx::postgres::PgRow| row.get::<i64, _>(0))
+        .with_annotations(test_annotations())
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(value, 23);
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+#[tokio::test]
+#[serial]
+async fn query_map_with_annotations_via_transaction() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    let mut tx: Transaction<'_, Postgres> = pool.begin().await.unwrap();
+    let value: i64 = sqlx::query("SELECT 29::int8")
+        .map(|row: sqlx::postgres::PgRow| row.get::<i64, _>(0))
+        .with_annotations(test_annotations())
+        .fetch_one(&mut tx)
+        .await
+        .unwrap();
+    assert_eq!(value, 29);
+    tx.commit().await.unwrap();
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+// --- Error paths ----------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn query_map_with_annotations_records_error() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    let result: Result<i64, _> = sqlx::query("INVALID SQL")
+        .map(|row: sqlx::postgres::PgRow| row.get::<i64, _>(0))
+        .with_annotations(test_annotations())
+        .fetch_one(&pool)
+        .await;
+    assert!(result.is_err());
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+    assert_error_span(&spans[0]);
+}
+
+#[tokio::test]
+#[serial]
+async fn query_try_map_with_annotations_propagates_mapper_error() {
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    // The mapper error fires *after* the database round-trip succeeds – the executor
+    // sees the row arrive and completes the fetch successfully, then the mapper surfaces
+    // the error to the caller. The span therefore stays at success at the database
+    // layer; the contract verified here is that the user-visible Err propagates through
+    // the wrapper and that the annotations were attached to the (successful) span.
+    let result: Result<i64, _> = sqlx::query("SELECT 1::int8")
+        .try_map(|_row: sqlx::postgres::PgRow| {
+            Err::<i64, _>(sqlx::Error::Decode(
+                "intentional decode failure".to_string().into(),
+            ))
+        })
+        .with_annotations(test_annotations())
+        .fetch_one(&pool)
+        .await;
+    assert!(result.is_err());
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+// ===========================================================================
+// query-side annotations: compile-time-validated macros (`sqlx::query!()` etc.)
+// ===========================================================================
+
+const POSTGRES_MACRO_SCHEMA: &str =
+    "CREATE TABLE IF NOT EXISTS macro_users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)";
+
+#[tokio::test]
+#[serial]
+async fn query_macro_execute_with_annotations_via_pool() {
+    let _setup_tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+    sqlx::query(POSTGRES_MACRO_SCHEMA)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM macro_users WHERE id = 101")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let tel = common::TestTelemetry::install();
+    let result = sqlx::query!(
+        "INSERT INTO macro_users (id, name) VALUES ($1, $2)",
+        101_i32,
+        "alice"
+    )
+    .with_annotations(test_annotations())
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(result.rows_affected(), 1);
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+#[tokio::test]
+#[serial]
+async fn query_macro_fetch_one_with_annotations_via_pool() {
+    let _setup_tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+    sqlx::query(POSTGRES_MACRO_SCHEMA)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO macro_users (id, name) VALUES (102, 'bob') ON CONFLICT (id) DO NOTHING",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let tel = common::TestTelemetry::install();
+    let row = sqlx::query!("SELECT id, name FROM macro_users WHERE id = $1", 102_i32)
+        .with_annotations(test_annotations())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.id, 102);
+    assert_eq!(row.name, "bob");
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+#[tokio::test]
+#[serial]
+async fn query_macro_fetch_all_with_annotations_via_pool() {
+    let _setup_tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+    sqlx::query(POSTGRES_MACRO_SCHEMA)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO macro_users (id, name) VALUES (103, 'carol'), (104, 'dave'), (105, 'eve') ON CONFLICT (id) DO NOTHING",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let tel = common::TestTelemetry::install();
+    let rows = sqlx::query!(
+        "SELECT id, name FROM macro_users WHERE id BETWEEN $1 AND $2",
+        103_i32,
+        105_i32
+    )
+    .with_operation("SELECT", "users")
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 3);
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+#[tokio::test]
+#[serial]
+async fn query_macro_fetch_optional_with_annotations_via_pool() {
+    let _setup_tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+    sqlx::query(POSTGRES_MACRO_SCHEMA)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let tel = common::TestTelemetry::install();
+    let row = sqlx::query!("SELECT id, name FROM macro_users WHERE id = $1", 99999_i32)
+        .with_annotations(test_annotations())
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+    assert!(row.is_none());
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+type MacroUser = common::MacroUser<i32>;
+
+#[tokio::test]
+#[serial]
+async fn query_as_macro_fetch_one_with_annotations_via_pool() {
+    let _setup_tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+    sqlx::query(POSTGRES_MACRO_SCHEMA)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO macro_users (id, name) VALUES (106, 'frank') ON CONFLICT (id) DO NOTHING",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let tel = common::TestTelemetry::install();
+    let user = sqlx::query_as!(
+        MacroUser,
+        "SELECT id, name FROM macro_users WHERE id = $1",
+        106_i32
+    )
+    .with_annotations(test_annotations())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(user.id, 106);
+    assert_eq!(user.name, "frank");
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+#[tokio::test]
+#[serial]
+async fn query_as_macro_fetch_all_with_annotations_via_pool() {
+    let _setup_tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+    sqlx::query(POSTGRES_MACRO_SCHEMA)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO macro_users (id, name) VALUES (107, 'grace'), (108, 'henry') ON CONFLICT (id) DO NOTHING")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let tel = common::TestTelemetry::install();
+    let users = sqlx::query_as!(
+        MacroUser,
+        "SELECT id, name FROM macro_users WHERE id BETWEEN $1 AND $2",
+        107_i32,
+        108_i32
+    )
+    .with_annotations(test_annotations())
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(users.len(), 2);
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+#[tokio::test]
+#[serial]
+async fn query_as_macro_fetch_optional_with_annotations_via_pool() {
+    let _setup_tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+    sqlx::query(POSTGRES_MACRO_SCHEMA)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let tel = common::TestTelemetry::install();
+    let user = sqlx::query_as!(
+        MacroUser,
+        "SELECT id, name FROM macro_users WHERE id = $1",
+        99999_i32
+    )
+    .with_annotations(test_annotations())
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    assert!(user.is_none());
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+#[tokio::test]
+#[serial]
+async fn query_scalar_macro_fetch_one_with_annotations_via_pool() {
+    let _setup_tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+    sqlx::query(POSTGRES_MACRO_SCHEMA)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO macro_users (id, name) VALUES (109, 'irene') ON CONFLICT (id) DO NOTHING",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let tel = common::TestTelemetry::install();
+    let name: String = sqlx::query_scalar!("SELECT name FROM macro_users WHERE id = $1", 109_i32)
+        .with_annotations(test_annotations())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(name, "irene");
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}
+
+#[tokio::test]
+#[serial]
+async fn query_scalar_macro_fetch_all_with_annotations_via_pool() {
+    let _setup_tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+    sqlx::query(POSTGRES_MACRO_SCHEMA)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO macro_users (id, name) VALUES (110, 'jack'), (111, 'kate') ON CONFLICT (id) DO NOTHING")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let tel = common::TestTelemetry::install();
+    let ids: Vec<i32> = sqlx::query_scalar!(
+        "SELECT id FROM macro_users WHERE id BETWEEN $1 AND $2 ORDER BY id",
+        110_i32,
+        111_i32
+    )
+    .with_annotations(test_annotations())
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(ids, vec![110, 111]);
+
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_annotated_span(&spans[0]);
+}

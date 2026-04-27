@@ -152,17 +152,16 @@ async fn execute_creates_span_via_transaction() {
 #[tokio::test]
 #[serial]
 async fn execute_records_affected_rows() {
-    let _setup_tel = common::TestTelemetry::install();
+    let tel = common::TestTelemetry::install();
     let pool = test_pool().await;
 
     sqlx::query("CREATE TABLE affected_test (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
         .execute(&pool)
         .await
         .unwrap();
+    tel.reset();
 
     // --- Bulk insert via VALUES list ---
-    let tel = common::TestTelemetry::install();
-
     sqlx::query(
         "INSERT INTO affected_test (id, name) VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')",
     )
@@ -177,10 +176,9 @@ async fn execute_records_affected_rows() {
         Some(opentelemetry::Value::I64(3)),
         "inserting 3 rows in one statement should affect 3 rows"
     );
+    tel.reset();
 
     // --- Upsert (INSERT OR REPLACE) ---
-    let tel = common::TestTelemetry::install();
-
     sqlx::query("INSERT OR REPLACE INTO affected_test (id, name) VALUES (1, 'alice_updated')")
         .execute(&pool)
         .await
@@ -193,10 +191,9 @@ async fn execute_records_affected_rows() {
         Some(opentelemetry::Value::I64(1)),
         "upsert should affect 1 row"
     );
+    tel.reset();
 
     // --- Update multiple rows ---
-    let tel = common::TestTelemetry::install();
-
     sqlx::query("UPDATE affected_test SET name = name || '_updated' WHERE id IN (2, 3)")
         .execute(&pool)
         .await
@@ -209,10 +206,9 @@ async fn execute_records_affected_rows() {
         Some(opentelemetry::Value::I64(2)),
         "updating two rows should affect 2 rows"
     );
+    tel.reset();
 
     // --- Delete multiple rows ---
-    let tel = common::TestTelemetry::install();
-
     sqlx::query("DELETE FROM affected_test WHERE id IN (1, 2, 3)")
         .execute(&pool)
         .await
@@ -225,10 +221,9 @@ async fn execute_records_affected_rows() {
         Some(opentelemetry::Value::I64(3)),
         "deleting three rows should affect 3 rows"
     );
+    tel.reset();
 
     // --- Delete with no matching rows ---
-    let tel = common::TestTelemetry::install();
-
     sqlx::query("DELETE FROM affected_test WHERE id = 999")
         .execute(&pool)
         .await
@@ -2095,8 +2090,7 @@ async fn query_fetch_optional_with_annotations_via_pool() {
         .await
         .unwrap();
 
-    let _setup_tel = tel; // discard CREATE span
-    let tel = common::TestTelemetry::install();
+    tel.reset();
 
     let row = sqlx::query("SELECT id FROM qfo_pool WHERE id = 1")
         .with_annotations(test_annotations())
@@ -2764,14 +2758,14 @@ const SQLITE_MACRO_SCHEMA: &str =
 #[tokio::test]
 #[serial]
 async fn query_macro_execute_with_annotations_via_pool() {
-    let _setup_tel = common::TestTelemetry::install();
+    let tel = common::TestTelemetry::install();
     let pool = test_pool().await;
     sqlx::query(SQLITE_MACRO_SCHEMA)
         .execute(&pool)
         .await
         .unwrap();
 
-    let tel = common::TestTelemetry::install();
+    tel.reset();
     let result = sqlx::query!(
         "INSERT INTO macro_users (id, name) VALUES (?1, ?2)",
         1_i64,
@@ -2791,7 +2785,7 @@ async fn query_macro_execute_with_annotations_via_pool() {
 #[tokio::test]
 #[serial]
 async fn query_macro_fetch_one_with_annotations_via_pool() {
-    let _setup_tel = common::TestTelemetry::install();
+    let tel = common::TestTelemetry::install();
     let pool = test_pool().await;
     sqlx::query(SQLITE_MACRO_SCHEMA)
         .execute(&pool)
@@ -2802,7 +2796,7 @@ async fn query_macro_fetch_one_with_annotations_via_pool() {
         .await
         .unwrap();
 
-    let tel = common::TestTelemetry::install();
+    tel.reset();
     let row = sqlx::query!("SELECT id, name FROM macro_users WHERE id = ?1", 2_i64)
         .with_annotations(test_annotations())
         .fetch_one(&pool)
@@ -2819,7 +2813,7 @@ async fn query_macro_fetch_one_with_annotations_via_pool() {
 #[tokio::test]
 #[serial]
 async fn query_macro_fetch_all_with_annotations_via_pool() {
-    let _setup_tel = common::TestTelemetry::install();
+    let tel = common::TestTelemetry::install();
     let pool = test_pool().await;
     sqlx::query(SQLITE_MACRO_SCHEMA)
         .execute(&pool)
@@ -2830,7 +2824,7 @@ async fn query_macro_fetch_all_with_annotations_via_pool() {
         .await
         .unwrap();
 
-    let tel = common::TestTelemetry::install();
+    tel.reset();
     let rows = sqlx::query!(
         "SELECT id, name FROM macro_users WHERE id BETWEEN ?1 AND ?2",
         3_i64,
@@ -2850,14 +2844,14 @@ async fn query_macro_fetch_all_with_annotations_via_pool() {
 #[tokio::test]
 #[serial]
 async fn query_macro_fetch_optional_with_annotations_via_pool() {
-    let _setup_tel = common::TestTelemetry::install();
+    let tel = common::TestTelemetry::install();
     let pool = test_pool().await;
     sqlx::query(SQLITE_MACRO_SCHEMA)
         .execute(&pool)
         .await
         .unwrap();
 
-    let tel = common::TestTelemetry::install();
+    tel.reset();
     let row = sqlx::query!("SELECT id, name FROM macro_users WHERE id = ?1", 9999_i64)
         .with_annotations(test_annotations())
         .fetch_optional(&pool)
@@ -2875,7 +2869,7 @@ type MacroUser = common::MacroUser<i64>;
 #[tokio::test]
 #[serial]
 async fn query_as_macro_fetch_one_with_annotations_via_pool() {
-    let _setup_tel = common::TestTelemetry::install();
+    let tel = common::TestTelemetry::install();
     let pool = test_pool().await;
     sqlx::query(SQLITE_MACRO_SCHEMA)
         .execute(&pool)
@@ -2886,7 +2880,7 @@ async fn query_as_macro_fetch_one_with_annotations_via_pool() {
         .await
         .unwrap();
 
-    let tel = common::TestTelemetry::install();
+    tel.reset();
     let user = sqlx::query_as!(
         MacroUser,
         "SELECT id, name FROM macro_users WHERE id = ?1",
@@ -2907,7 +2901,7 @@ async fn query_as_macro_fetch_one_with_annotations_via_pool() {
 #[tokio::test]
 #[serial]
 async fn query_as_macro_fetch_all_with_annotations_via_pool() {
-    let _setup_tel = common::TestTelemetry::install();
+    let tel = common::TestTelemetry::install();
     let pool = test_pool().await;
     sqlx::query(SQLITE_MACRO_SCHEMA)
         .execute(&pool)
@@ -2918,7 +2912,7 @@ async fn query_as_macro_fetch_all_with_annotations_via_pool() {
         .await
         .unwrap();
 
-    let tel = common::TestTelemetry::install();
+    tel.reset();
     let users = sqlx::query_as!(
         MacroUser,
         "SELECT id, name FROM macro_users WHERE id BETWEEN ?1 AND ?2",
@@ -2939,14 +2933,14 @@ async fn query_as_macro_fetch_all_with_annotations_via_pool() {
 #[tokio::test]
 #[serial]
 async fn query_as_macro_fetch_optional_with_annotations_via_pool() {
-    let _setup_tel = common::TestTelemetry::install();
+    let tel = common::TestTelemetry::install();
     let pool = test_pool().await;
     sqlx::query(SQLITE_MACRO_SCHEMA)
         .execute(&pool)
         .await
         .unwrap();
 
-    let tel = common::TestTelemetry::install();
+    tel.reset();
     let user = sqlx::query_as!(
         MacroUser,
         "SELECT id, name FROM macro_users WHERE id = ?1",
@@ -2966,7 +2960,7 @@ async fn query_as_macro_fetch_optional_with_annotations_via_pool() {
 #[tokio::test]
 #[serial]
 async fn query_scalar_macro_fetch_one_with_annotations_via_pool() {
-    let _setup_tel = common::TestTelemetry::install();
+    let tel = common::TestTelemetry::install();
     let pool = test_pool().await;
     sqlx::query(SQLITE_MACRO_SCHEMA)
         .execute(&pool)
@@ -2977,7 +2971,7 @@ async fn query_scalar_macro_fetch_one_with_annotations_via_pool() {
         .await
         .unwrap();
 
-    let tel = common::TestTelemetry::install();
+    tel.reset();
     let name: String = sqlx::query_scalar!("SELECT name FROM macro_users WHERE id = ?1", 9_i64)
         .with_annotations(test_annotations())
         .fetch_one(&pool)
@@ -2993,7 +2987,7 @@ async fn query_scalar_macro_fetch_one_with_annotations_via_pool() {
 #[tokio::test]
 #[serial]
 async fn query_scalar_macro_fetch_all_with_annotations_via_pool() {
-    let _setup_tel = common::TestTelemetry::install();
+    let tel = common::TestTelemetry::install();
     let pool = test_pool().await;
     sqlx::query(SQLITE_MACRO_SCHEMA)
         .execute(&pool)
@@ -3004,7 +2998,7 @@ async fn query_scalar_macro_fetch_all_with_annotations_via_pool() {
         .await
         .unwrap();
 
-    let tel = common::TestTelemetry::install();
+    tel.reset();
     let ids: Vec<i64> = sqlx::query_scalar!(
         "SELECT id FROM macro_users WHERE id BETWEEN ?1 AND ?2 ORDER BY id",
         10_i64,
@@ -3019,4 +3013,97 @@ async fn query_scalar_macro_fetch_all_with_annotations_via_pool() {
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
     assert_annotated_span(&spans[0]);
+}
+
+// ===========================================================================
+// Trace context propagation
+//
+// These tests pin the executor's behaviour around the ambient OpenTelemetry context:
+// when a caller has an active span in scope, the query span the executor creates
+// becomes its child (same `trace_id`, `parent_span_id` equal to the caller's span id).
+// The propagation logic lives in `start_span` (`src/executor.rs`), which builds spans
+// via `tracer.span_builder(...).start(&tracer)`. `start` adopts whatever
+// `Context::current()` carries at call time, so this is what we verify here.
+//
+// ===========================================================================
+
+#[tokio::test]
+#[serial]
+async fn query_span_inherits_parent_context_unary() {
+    use opentelemetry::trace::{Span as _, TraceContextExt, Tracer, TracerProvider};
+
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    let provider = opentelemetry::global::tracer_provider();
+    let tracer = provider.tracer("test-outer");
+    let outer_span = tracer.start("outer");
+    let outer_ctx = outer_span.span_context().clone();
+    let cx = opentelemetry::Context::current_with_span(outer_span);
+
+    {
+        let _guard = cx.clone().attach();
+        (&pool).execute("SELECT 1").await.unwrap();
+    }
+    drop(cx);
+
+    let mut spans = tel.spans();
+    spans.sort_by_key(|s| s.start_time);
+    assert_eq!(spans.len(), 2, "outer + query span");
+
+    let query_span = spans
+        .iter()
+        .find(|s| s.name == SYSTEM)
+        .expect("query span (named after system) should be present");
+    assert_eq!(
+        query_span.span_context.trace_id(),
+        outer_ctx.trace_id(),
+        "query span trace_id should match the outer context's trace_id",
+    );
+    assert_eq!(
+        query_span.parent_span_id,
+        outer_ctx.span_id(),
+        "query span parent_span_id should equal the outer span's span_id",
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn query_span_inherits_parent_context_streaming() {
+    use opentelemetry::trace::{Span as _, TraceContextExt, Tracer, TracerProvider};
+
+    let tel = common::TestTelemetry::install();
+    let pool = test_pool().await;
+
+    let provider = opentelemetry::global::tracer_provider();
+    let tracer = provider.tracer("test-outer");
+    let outer_span = tracer.start("outer");
+    let outer_ctx = outer_span.span_context().clone();
+    let cx = opentelemetry::Context::current_with_span(outer_span);
+
+    {
+        let _guard = cx.clone().attach();
+        let mut stream = (&pool).fetch("SELECT 1");
+        while stream.next().await.is_some() {}
+    }
+    drop(cx);
+
+    let mut spans = tel.spans();
+    spans.sort_by_key(|s| s.start_time);
+    assert_eq!(spans.len(), 2, "outer + query span");
+
+    let query_span = spans
+        .iter()
+        .find(|s| s.name == SYSTEM)
+        .expect("query span (named after system) should be present");
+    assert_eq!(
+        query_span.span_context.trace_id(),
+        outer_ctx.trace_id(),
+        "stream query span trace_id should match the outer context's trace_id",
+    );
+    assert_eq!(
+        query_span.parent_span_id,
+        outer_ctx.span_id(),
+        "stream query span parent_span_id should equal the outer span's span_id",
+    );
 }

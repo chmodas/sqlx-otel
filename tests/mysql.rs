@@ -229,7 +229,7 @@ async fn execute_records_error() {
 #[tokio::test]
 #[serial]
 async fn execute_records_affected_rows() {
-    let _setup_tel = common::TestTelemetry::install();
+    let tel = common::TestTelemetry::install();
     let pool = test_pool().await;
 
     sqlx::query(
@@ -243,9 +243,9 @@ async fn execute_records_affected_rows() {
         .await
         .unwrap();
 
-    // --- Bulk insert ---
-    let tel = common::TestTelemetry::install();
+    tel.reset();
 
+    // --- Bulk insert ---
     sqlx::query(
         "INSERT INTO affected_test (id, name) VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')",
     )
@@ -260,10 +260,9 @@ async fn execute_records_affected_rows() {
         Some(opentelemetry::Value::I64(3)),
         "inserting 3 rows in one statement should affect 3 rows"
     );
+    tel.reset();
 
     // --- Upsert (INSERT ON DUPLICATE KEY UPDATE) ---
-    let tel = common::TestTelemetry::install();
-
     sqlx::query(
         "INSERT INTO affected_test (id, name) VALUES (1, 'alice_updated') \
          ON DUPLICATE KEY UPDATE name = VALUES(name)",
@@ -281,10 +280,9 @@ async fn execute_records_affected_rows() {
         Some(opentelemetry::Value::I64(2)),
         "MySQL upsert reports 2 affected rows (match + update)"
     );
+    tel.reset();
 
     // --- Update multiple rows ---
-    let tel = common::TestTelemetry::install();
-
     sqlx::query("UPDATE affected_test SET name = CONCAT(name, '_updated') WHERE id IN (2, 3)")
         .execute(&pool)
         .await
@@ -297,10 +295,9 @@ async fn execute_records_affected_rows() {
         Some(opentelemetry::Value::I64(2)),
         "updating two rows should affect 2 rows"
     );
+    tel.reset();
 
     // --- Delete multiple rows ---
-    let tel = common::TestTelemetry::install();
-
     sqlx::query("DELETE FROM affected_test WHERE id IN (1, 2, 3)")
         .execute(&pool)
         .await
@@ -313,10 +310,9 @@ async fn execute_records_affected_rows() {
         Some(opentelemetry::Value::I64(3)),
         "deleting three rows should affect 3 rows"
     );
+    tel.reset();
 
     // --- Delete with no matching rows ---
-    let tel = common::TestTelemetry::install();
-
     sqlx::query("DELETE FROM affected_test WHERE id = 999")
         .execute(&pool)
         .await
@@ -1170,7 +1166,7 @@ async fn fetch_optional_records_one_row() {
 #[tokio::test]
 #[serial]
 async fn fetch_optional_records_zero_rows() {
-    let _setup_tel = common::TestTelemetry::install();
+    let tel = common::TestTelemetry::install();
     let pool = test_pool().await;
 
     sqlx::query("CREATE TABLE IF NOT EXISTS empty_table (id INT AUTO_INCREMENT PRIMARY KEY)")
@@ -1182,7 +1178,7 @@ async fn fetch_optional_records_zero_rows() {
         .await
         .unwrap();
 
-    let tel = common::TestTelemetry::install();
+    tel.reset();
     let result = (&pool)
         .fetch_optional("SELECT id FROM empty_table")
         .await
@@ -1721,7 +1717,7 @@ async fn connection_attributes_populated() {
 #[tokio::test]
 #[serial]
 async fn sqlstate_recorded_on_constraint_violation() {
-    let _setup_tel = common::TestTelemetry::install();
+    let tel = common::TestTelemetry::install();
     let pool = test_pool().await;
 
     // Create a table with a unique constraint.
@@ -1738,8 +1734,8 @@ async fn sqlstate_recorded_on_constraint_violation() {
         .await
         .unwrap();
 
-    // Re-install telemetry to capture only the violating query.
-    let tel = common::TestTelemetry::install();
+    // Drop the setup spans so the assertion below sees only the violating query.
+    tel.reset();
 
     // Insert a duplicate – should trigger SQLSTATE 23000 (integrity constraint violation).
     let result = sqlx::query("INSERT INTO unique_test (id) VALUES (1)")
@@ -2191,7 +2187,7 @@ async fn query_fetch_one_with_annotations_via_pool() {
 #[tokio::test]
 #[serial]
 async fn query_fetch_optional_with_annotations_via_pool() {
-    let _setup_tel = common::TestTelemetry::install();
+    let tel = common::TestTelemetry::install();
     let pool = test_pool().await;
 
     sqlx::query("CREATE TABLE IF NOT EXISTS qfo_pool (id INT PRIMARY KEY)")
@@ -2199,7 +2195,7 @@ async fn query_fetch_optional_with_annotations_via_pool() {
         .await
         .unwrap();
 
-    let tel = common::TestTelemetry::install();
+    tel.reset();
 
     let row = sqlx::query("SELECT id FROM qfo_pool WHERE id = 1")
         .with_annotations(test_annotations())
@@ -2864,7 +2860,7 @@ const MYSQL_MACRO_SCHEMA: &str =
 #[tokio::test]
 #[serial]
 async fn query_macro_execute_with_annotations_via_pool() {
-    let _setup_tel = common::TestTelemetry::install();
+    let tel = common::TestTelemetry::install();
     let pool = test_pool().await;
     sqlx::query(MYSQL_MACRO_SCHEMA)
         .execute(&pool)
@@ -2875,7 +2871,7 @@ async fn query_macro_execute_with_annotations_via_pool() {
         .await
         .unwrap();
 
-    let tel = common::TestTelemetry::install();
+    tel.reset();
     let result = sqlx::query!(
         "INSERT INTO macro_users (id, name) VALUES (?, ?)",
         201_i32,
@@ -2895,7 +2891,7 @@ async fn query_macro_execute_with_annotations_via_pool() {
 #[tokio::test]
 #[serial]
 async fn query_macro_fetch_one_with_annotations_via_pool() {
-    let _setup_tel = common::TestTelemetry::install();
+    let tel = common::TestTelemetry::install();
     let pool = test_pool().await;
     sqlx::query(MYSQL_MACRO_SCHEMA)
         .execute(&pool)
@@ -2906,7 +2902,7 @@ async fn query_macro_fetch_one_with_annotations_via_pool() {
         .await
         .unwrap();
 
-    let tel = common::TestTelemetry::install();
+    tel.reset();
     let row = sqlx::query!("SELECT id, name FROM macro_users WHERE id = ?", 202_i32)
         .with_annotations(test_annotations())
         .fetch_one(&pool)
@@ -2923,7 +2919,7 @@ async fn query_macro_fetch_one_with_annotations_via_pool() {
 #[tokio::test]
 #[serial]
 async fn query_macro_fetch_all_with_annotations_via_pool() {
-    let _setup_tel = common::TestTelemetry::install();
+    let tel = common::TestTelemetry::install();
     let pool = test_pool().await;
     sqlx::query(MYSQL_MACRO_SCHEMA)
         .execute(&pool)
@@ -2936,7 +2932,7 @@ async fn query_macro_fetch_all_with_annotations_via_pool() {
     .await
     .unwrap();
 
-    let tel = common::TestTelemetry::install();
+    tel.reset();
     let rows = sqlx::query!(
         "SELECT id, name FROM macro_users WHERE id BETWEEN ? AND ?",
         203_i32,
@@ -2956,14 +2952,14 @@ async fn query_macro_fetch_all_with_annotations_via_pool() {
 #[tokio::test]
 #[serial]
 async fn query_macro_fetch_optional_with_annotations_via_pool() {
-    let _setup_tel = common::TestTelemetry::install();
+    let tel = common::TestTelemetry::install();
     let pool = test_pool().await;
     sqlx::query(MYSQL_MACRO_SCHEMA)
         .execute(&pool)
         .await
         .unwrap();
 
-    let tel = common::TestTelemetry::install();
+    tel.reset();
     let row = sqlx::query!("SELECT id, name FROM macro_users WHERE id = ?", 99999_i32)
         .with_annotations(test_annotations())
         .fetch_optional(&pool)
@@ -2981,7 +2977,7 @@ type MacroUser = common::MacroUser<i32>;
 #[tokio::test]
 #[serial]
 async fn query_as_macro_fetch_one_with_annotations_via_pool() {
-    let _setup_tel = common::TestTelemetry::install();
+    let tel = common::TestTelemetry::install();
     let pool = test_pool().await;
     sqlx::query(MYSQL_MACRO_SCHEMA)
         .execute(&pool)
@@ -2992,7 +2988,7 @@ async fn query_as_macro_fetch_one_with_annotations_via_pool() {
         .await
         .unwrap();
 
-    let tel = common::TestTelemetry::install();
+    tel.reset();
     let user = sqlx::query_as!(
         MacroUser,
         "SELECT id, name FROM macro_users WHERE id = ?",
@@ -3013,7 +3009,7 @@ async fn query_as_macro_fetch_one_with_annotations_via_pool() {
 #[tokio::test]
 #[serial]
 async fn query_as_macro_fetch_all_with_annotations_via_pool() {
-    let _setup_tel = common::TestTelemetry::install();
+    let tel = common::TestTelemetry::install();
     let pool = test_pool().await;
     sqlx::query(MYSQL_MACRO_SCHEMA)
         .execute(&pool)
@@ -3024,7 +3020,7 @@ async fn query_as_macro_fetch_all_with_annotations_via_pool() {
         .await
         .unwrap();
 
-    let tel = common::TestTelemetry::install();
+    tel.reset();
     let users = sqlx::query_as!(
         MacroUser,
         "SELECT id, name FROM macro_users WHERE id BETWEEN ? AND ?",
@@ -3045,14 +3041,14 @@ async fn query_as_macro_fetch_all_with_annotations_via_pool() {
 #[tokio::test]
 #[serial]
 async fn query_as_macro_fetch_optional_with_annotations_via_pool() {
-    let _setup_tel = common::TestTelemetry::install();
+    let tel = common::TestTelemetry::install();
     let pool = test_pool().await;
     sqlx::query(MYSQL_MACRO_SCHEMA)
         .execute(&pool)
         .await
         .unwrap();
 
-    let tel = common::TestTelemetry::install();
+    tel.reset();
     let user = sqlx::query_as!(
         MacroUser,
         "SELECT id, name FROM macro_users WHERE id = ?",
@@ -3072,7 +3068,7 @@ async fn query_as_macro_fetch_optional_with_annotations_via_pool() {
 #[tokio::test]
 #[serial]
 async fn query_scalar_macro_fetch_one_with_annotations_via_pool() {
-    let _setup_tel = common::TestTelemetry::install();
+    let tel = common::TestTelemetry::install();
     let pool = test_pool().await;
     sqlx::query(MYSQL_MACRO_SCHEMA)
         .execute(&pool)
@@ -3083,7 +3079,7 @@ async fn query_scalar_macro_fetch_one_with_annotations_via_pool() {
         .await
         .unwrap();
 
-    let tel = common::TestTelemetry::install();
+    tel.reset();
     let name: String = sqlx::query_scalar!("SELECT name FROM macro_users WHERE id = ?", 209_i32)
         .with_annotations(test_annotations())
         .fetch_one(&pool)
@@ -3099,7 +3095,7 @@ async fn query_scalar_macro_fetch_one_with_annotations_via_pool() {
 #[tokio::test]
 #[serial]
 async fn query_scalar_macro_fetch_all_with_annotations_via_pool() {
-    let _setup_tel = common::TestTelemetry::install();
+    let tel = common::TestTelemetry::install();
     let pool = test_pool().await;
     sqlx::query(MYSQL_MACRO_SCHEMA)
         .execute(&pool)
@@ -3110,7 +3106,7 @@ async fn query_scalar_macro_fetch_all_with_annotations_via_pool() {
         .await
         .unwrap();
 
-    let tel = common::TestTelemetry::install();
+    tel.reset();
     let ids: Vec<i32> = sqlx::query_scalar!(
         "SELECT id FROM macro_users WHERE id BETWEEN ? AND ? ORDER BY id",
         210_i32,

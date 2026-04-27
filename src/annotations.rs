@@ -307,4 +307,104 @@ mod tests {
         assert!(debug.contains("AnnotatedMut"));
         assert!(debug.contains("users"));
     }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// Calling a setter twice in succession leaves the field equal to the second
+        /// value: each setter is unconditional and overwrites whatever was there.
+        #[test]
+        fn operation_last_write_wins(a in ".{0,64}", b in ".{0,64}") {
+            let ann = QueryAnnotations::new().operation(a).operation(b.clone());
+            prop_assert_eq!(ann.operation.as_deref(), Some(b.as_str()));
+        }
+
+        #[test]
+        fn collection_last_write_wins(a in ".{0,64}", b in ".{0,64}") {
+            let ann = QueryAnnotations::new().collection(a).collection(b.clone());
+            prop_assert_eq!(ann.collection.as_deref(), Some(b.as_str()));
+        }
+
+        #[test]
+        fn query_summary_last_write_wins(a in ".{0,64}", b in ".{0,64}") {
+            let ann = QueryAnnotations::new().query_summary(a).query_summary(b.clone());
+            prop_assert_eq!(ann.query_summary.as_deref(), Some(b.as_str()));
+        }
+
+        #[test]
+        fn stored_procedure_last_write_wins(a in ".{0,64}", b in ".{0,64}") {
+            let ann = QueryAnnotations::new().stored_procedure(a).stored_procedure(b.clone());
+            prop_assert_eq!(ann.stored_procedure.as_deref(), Some(b.as_str()));
+        }
+
+        /// Setting one field never alters any of the others. Complements the
+        /// example-based `setter_permutations` test by stressing arbitrary unicode.
+        #[test]
+        fn operation_does_not_affect_other_fields(s in ".{0,64}") {
+            let ann = QueryAnnotations::new().operation(s);
+            prop_assert!(ann.collection.is_none());
+            prop_assert!(ann.query_summary.is_none());
+            prop_assert!(ann.stored_procedure.is_none());
+        }
+
+        #[test]
+        fn collection_does_not_affect_other_fields(s in ".{0,64}") {
+            let ann = QueryAnnotations::new().collection(s);
+            prop_assert!(ann.operation.is_none());
+            prop_assert!(ann.query_summary.is_none());
+            prop_assert!(ann.stored_procedure.is_none());
+        }
+
+        #[test]
+        fn query_summary_does_not_affect_other_fields(s in ".{0,64}") {
+            let ann = QueryAnnotations::new().query_summary(s);
+            prop_assert!(ann.operation.is_none());
+            prop_assert!(ann.collection.is_none());
+            prop_assert!(ann.stored_procedure.is_none());
+        }
+
+        #[test]
+        fn stored_procedure_does_not_affect_other_fields(s in ".{0,64}") {
+            let ann = QueryAnnotations::new().stored_procedure(s);
+            prop_assert!(ann.operation.is_none());
+            prop_assert!(ann.collection.is_none());
+            prop_assert!(ann.query_summary.is_none());
+        }
+
+        /// All four setters accept arbitrary unicode without panicking, including null
+        /// bytes, surrogate-adjacent code points, and zero-length input.
+        #[test]
+        fn no_panic_setting_all_fields(
+            op in any::<String>(),
+            coll in any::<String>(),
+            summary in any::<String>(),
+            sp in any::<String>(),
+        ) {
+            let _ann = QueryAnnotations::new()
+                .operation(op)
+                .collection(coll)
+                .query_summary(summary)
+                .stored_procedure(sp);
+        }
+
+        /// `Clone` produces a value structurally equal to the original. Combined with
+        /// the `String`-backed fields, this means cloning is a deep copy.
+        #[test]
+        fn clone_equals_original(
+            op in proptest::option::of(".{0,64}"),
+            coll in proptest::option::of(".{0,64}"),
+            summary in proptest::option::of(".{0,64}"),
+            sp in proptest::option::of(".{0,64}"),
+        ) {
+            let mut ann = QueryAnnotations::new();
+            if let Some(s) = op { ann = ann.operation(s); }
+            if let Some(s) = coll { ann = ann.collection(s); }
+            if let Some(s) = summary { ann = ann.query_summary(s); }
+            if let Some(s) = sp { ann = ann.stored_procedure(s); }
+            let cloned = ann.clone();
+            prop_assert_eq!(ann, cloned);
+        }
+    }
 }

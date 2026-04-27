@@ -59,6 +59,28 @@ fn gauge_any_value(
     }
 }
 
+/// Poll a closure until it returns `Some` or the deadline elapses.
+///
+/// Used to wait for background-task-driven metrics to arrive without depending on a
+/// fixed sleep duration. The 10ms inter-poll cadence picks up state changes promptly
+/// while keeping the busy-wait cost bounded; the caller-provided timeout sets the
+/// upper bound that defines a flake threshold rather than a hard expectation.
+async fn poll_for<F, T>(timeout: Duration, mut f: F) -> Option<T>
+where
+    F: FnMut() -> Option<T>,
+{
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(v) = f() {
+            return Some(v);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 // ===========================================================================
 // Static pool configuration gauges (no runtime needed)
 // ===========================================================================
@@ -314,9 +336,14 @@ mod tokio_runtime {
             .build();
 
         let conn = pool.acquire().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let metrics = tel.metrics();
+        let metrics = poll_for(Duration::from_secs(2), || {
+            let snapshot = tel.metrics();
+            find_metric(&snapshot, "db.client.connection.count")?;
+            Some(snapshot)
+        })
+        .await
+        .expect("db.client.connection.count metric should be reported within 2s");
 
         let idle = gauge_value(
             &metrics,
@@ -358,6 +385,9 @@ mod tokio_runtime {
             .with_pool_metrics_interval(Duration::from_millis(50))
             .build();
 
+        // Asserting absence-after-wait: polling cannot replace this sleep, since the
+        // expected outcome is that no metric ever arrives. The 100ms window is two task
+        // intervals – long enough for a regression that *did* emit metrics to be caught.
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let metrics = tel.metrics();
@@ -381,6 +411,9 @@ mod tokio_runtime {
             .build();
 
         drop(pool);
+        // Asserting absence-after-drop: the sleep is the deliberate window during which a
+        // still-running task would emit a recording. Polling cannot replace it because
+        // the expected outcome is silence.
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
@@ -404,9 +437,14 @@ mod async_std_runtime {
             .build();
 
         let conn = pool.acquire().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let metrics = tel.metrics();
+        let metrics = poll_for(Duration::from_secs(2), || {
+            let snapshot = tel.metrics();
+            find_metric(&snapshot, "db.client.connection.count")?;
+            Some(snapshot)
+        })
+        .await
+        .expect("db.client.connection.count metric should be reported within 2s");
 
         let idle = gauge_value(
             &metrics,

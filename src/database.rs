@@ -1,10 +1,18 @@
-/// Per-backend contract providing the database system name and a method to extract
-/// connection-level attributes from the backend's connect options.
+/// Per-backend contract providing the database system name, connect-attribute extraction,
+/// and `rows_affected` projection.
 ///
-/// Each supported `SQLx` backend (Postgres, Sqlite, Mysql) implements this trait behind its
-/// corresponding feature flag. The trait is intentionally minimal – it exists solely to
-/// let the generic wrapper types resolve connection attributes once at pool construction
-/// time.
+/// Implemented by this crate for [`sqlx::Sqlite`], [`sqlx::Postgres`], and [`sqlx::MySql`]
+/// behind their respective feature flags. The trait exists so the generic wrapper types
+/// (`Pool`, `PoolConnection`, `Transaction`) can resolve connection attributes once at
+/// pool construction and project `rows_affected` from the per-backend `QueryResult` types.
+///
+/// **Not intended for downstream impls.** Implementing it for a custom backend would still
+/// require an upstream `sqlx::Database` impl, which is itself a non-trivial undertaking.
+/// The trait is left unsealed only for v0.1.x; expect it to be sealed in a future release.
+///
+/// [`sqlx::Sqlite`]: https://docs.rs/sqlx/latest/sqlx/struct.Sqlite.html
+/// [`sqlx::Postgres`]: https://docs.rs/sqlx/latest/sqlx/struct.Postgres.html
+/// [`sqlx::MySql`]: https://docs.rs/sqlx/latest/sqlx/struct.MySql.html
 pub trait Database: sqlx::Database {
     /// The OpenTelemetry `db.system.name` value for this backend (e.g. `"postgresql"`,
     /// `"sqlite"`, `"mysql"`).
@@ -46,6 +54,7 @@ fn url_based_connection_attributes<O: sqlx::ConnectOptions>(
 }
 
 #[cfg(feature = "sqlite")]
+#[cfg_attr(docsrs, doc(cfg(feature = "sqlite")))]
 impl Database for sqlx::Sqlite {
     const SYSTEM: &'static str = "sqlite";
 
@@ -66,6 +75,7 @@ impl Database for sqlx::Sqlite {
 }
 
 #[cfg(feature = "postgres")]
+#[cfg_attr(docsrs, doc(cfg(feature = "postgres")))]
 impl Database for sqlx::Postgres {
     const SYSTEM: &'static str = "postgresql";
 
@@ -81,6 +91,7 @@ impl Database for sqlx::Postgres {
 }
 
 #[cfg(feature = "mysql")]
+#[cfg_attr(docsrs, doc(cfg(feature = "mysql")))]
 impl Database for sqlx::MySql {
     const SYSTEM: &'static str = "mysql";
 

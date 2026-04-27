@@ -94,16 +94,24 @@ impl ConnectionAttributes {
 /// 2. `"{db.operation.name} {db.collection.name}"` when both are provided.
 /// 3. `"{db.operation.name}"` when only the operation is known.
 /// 4. `"{db.system.name}"` as the final fallback.
+///
+/// Empty-string inputs are treated as if absent: `Some("")` falls through to the next
+/// branch in the hierarchy. This avoids emitting empty span names – which several
+/// `OpenTelemetry` backends render as `<unnamed>` or treat as malformed – when a caller
+/// passes a vacuous annotation value.
 pub(crate) fn span_name(
     system: &str,
     operation: Option<&str>,
     collection: Option<&str>,
     summary: Option<&str>,
 ) -> String {
-    if let Some(s) = summary {
+    fn nonempty(o: Option<&str>) -> Option<&str> {
+        o.filter(|s| !s.is_empty())
+    }
+    if let Some(s) = nonempty(summary) {
         return s.to_owned();
     }
-    match (operation, collection) {
+    match (nonempty(operation), nonempty(collection)) {
         (Some(op), Some(coll)) => format!("{op} {coll}"),
         (Some(op), None) => op.to_owned(),
         _ => system.to_owned(),
@@ -161,6 +169,38 @@ mod tests {
         );
     }
 
+    /// Regression: `span_name("a", Some(""), None, None)` previously returned `""`. The
+    /// minimal failing input was discovered by `span_name_is_non_empty` and shrunk by
+    /// proptest. Pinning it here so a future change cannot reintroduce the empty span
+    /// name.
+    #[test]
+    fn span_name_empty_operation_falls_through_to_system() {
+        assert_eq!(span_name("sqlite", Some(""), None, None), "sqlite");
+    }
+
+    /// Empty `summary` does not win over the rest of the hierarchy: it is treated as
+    /// missing so the `(op, coll)` synthesis still fires.
+    #[test]
+    fn span_name_empty_summary_falls_through() {
+        assert_eq!(
+            span_name("sqlite", Some("SELECT"), Some("users"), Some("")),
+            "SELECT users"
+        );
+    }
+
+    /// Empty `op` and empty `coll` together fall through to the bare-system branch.
+    #[test]
+    fn span_name_empty_op_and_coll_falls_through_to_system() {
+        assert_eq!(span_name("sqlite", Some(""), Some(""), None), "sqlite");
+    }
+
+    /// Empty `op` with non-empty `coll` still falls through, because the hierarchy
+    /// requires an operation before a collection contributes.
+    #[test]
+    fn span_name_empty_op_with_coll_falls_through_to_system() {
+        assert_eq!(span_name("sqlite", Some(""), Some("users"), None), "sqlite");
+    }
+
     #[test]
     fn base_key_values_all_fields() {
         let attrs = ConnectionAttributes {
@@ -196,5 +236,117 @@ mod tests {
         let kvs = attrs.base_key_values();
         assert_eq!(kvs.len(), 1);
         assert_eq!(kvs[0].key.as_str(), "db.system.name");
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// `span_name` is total: every combination of `(system, op, coll, summary)`
+        /// yields a non-empty `String` provided `system` itself is non-empty. Empty
+        /// optional values (`Some("")`) fall through to the next branch in the
+        /// hierarchy, so the bare-system fallback always produces non-empty output.
+        #[test]
+        fn span_name_is_non_empty(
+            system in "[a-z]{1,16}",
+            op in proptest::option::of(".{0,64}"),
+            coll in proptest::option::of(".{0,64}"),
+            summary in proptest::option::of(".{0,64}"),
+        ) {
+            let name = span_name(&system, op.as_deref(), coll.as_deref(), summary.as_deref());
+            prop_assert!(!name.is_empty());
+        }
+
+        /// When `summary` is `Some(s)` with `s` non-empty, the output equals `s`
+        /// exactly: the summary branch wins unconditionally over the `(op, coll)`
+        /// synthesis. Empty summaries fall through and are covered by the dedicated
+        /// example test.
+        #[test]
+        fn span_name_summary_wins(
+            system in ".{0,16}",
+            op in proptest::option::of(".{0,64}"),
+            coll in proptest::option::of(".{0,64}"),
+            summary in ".{1,64}",
+        ) {
+            let name = span_name(&system, op.as_deref(), coll.as_deref(), Some(summary.as_str()));
+            prop_assert_eq!(name, summary);
+        }
+
+        /// When `summary` is `None` and both `op` and `coll` are `Some` with non-empty
+        /// values, the output is `"{op} {coll}"` exactly. Empty op/coll combinations
+        /// fall through and are covered by dedicated example tests.
+        #[test]
+        fn span_name_op_coll_synthesis(
+            system in ".{0,16}",
+            op in ".{1,64}",
+            coll in ".{1,64}",
+        ) {
+            let name = span_name(&system, Some(&op), Some(&coll), None);
+            prop_assert_eq!(name, format!("{op} {coll}"));
+        }
+
+        /// When all of `op`, `coll`, and `summary` are `None`, the output equals
+        /// `system` exactly.
+        #[test]
+        fn span_name_bare_system_fallback(system in ".{0,16}") {
+            let name = span_name(&system, None, None, None);
+            prop_assert_eq!(name, system);
+        }
+
+        /// Setting only `coll` without `op` falls through to the bare-system branch:
+        /// the spec hierarchy requires an operation before a collection contributes
+        /// to the span name.
+        #[test]
+        fn span_name_collection_alone_is_ignored(
+            system in ".{0,16}",
+            coll in ".{0,64}",
+        ) {
+            let name = span_name(&system, None, Some(&coll), None);
+            prop_assert_eq!(name, system);
+        }
+
+        /// `span_name` does not panic on any combination of arbitrary unicode, including
+        /// null bytes, multi-byte sequences, and combining characters.
+        #[test]
+        fn span_name_no_panic(
+            system in any::<String>(),
+            op in proptest::option::of(any::<String>()),
+            coll in proptest::option::of(any::<String>()),
+            summary in proptest::option::of(any::<String>()),
+        ) {
+            let _ = span_name(&system, op.as_deref(), coll.as_deref(), summary.as_deref());
+        }
+
+        /// `base_key_values` emits `1 + n` entries where `n` is the count of populated
+        /// optional fields. `db.system.name` is always present, the others appear iff
+        /// their corresponding field is `Some`.
+        #[test]
+        fn base_key_values_length_matches_populated_fields(
+            host in proptest::option::of("[a-z]{1,16}"),
+            port in proptest::option::of(any::<u16>()),
+            namespace in proptest::option::of("[a-z]{1,16}"),
+            network_peer_address in proptest::option::of("[0-9.:]{1,32}"),
+            network_peer_port in proptest::option::of(any::<u16>()),
+        ) {
+            let attrs = ConnectionAttributes {
+                system: "sqlite",
+                host: host.clone(),
+                port,
+                namespace: namespace.clone(),
+                network_peer_address: network_peer_address.clone(),
+                network_peer_port,
+                query_text_mode: QueryTextMode::Off,
+            };
+            let kvs = attrs.base_key_values();
+            let expected = 1
+                + usize::from(host.is_some())
+                + usize::from(port.is_some())
+                + usize::from(namespace.is_some())
+                + usize::from(network_peer_address.is_some())
+                + usize::from(network_peer_port.is_some());
+            prop_assert_eq!(kvs.len(), expected);
+            prop_assert_eq!(kvs[0].key.as_str(), "db.system.name");
+        }
     }
 }

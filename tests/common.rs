@@ -51,6 +51,20 @@ impl TestTelemetry {
             .get_finished_metrics()
             .unwrap_or_default()
     }
+
+    /// Drain the in-memory exporters so the next call to [`spans`](Self::spans) or
+    /// [`metrics`](Self::metrics) sees a fresh window.
+    ///
+    /// Use this between sections of a single test that want to assert on a bounded set of
+    /// spans/metrics, instead of re-installing the global telemetry providers (which is
+    /// racy: a fresh `install()` mid-test replaces the global tracer/meter providers and
+    /// silently changes which exporter receives subsequent operations).
+    pub fn reset(&self) {
+        let _ = self.tracer_provider.force_flush();
+        let _ = self.meter_provider.force_flush();
+        self.span_exporter.reset();
+        self.metric_exporter.reset();
+    }
 }
 
 impl Drop for TestTelemetry {
@@ -75,6 +89,10 @@ pub fn attr(span: &SpanData, key: &str) -> Option<opentelemetry::Value> {
 /// Assert that a span carries the common attributes every instrumented operation must have.
 ///
 /// `system` is the expected `db.system.name` value (e.g. `"sqlite"`, `"postgresql"`).
+///
+/// `db.namespace` and `db.query.text` are checked for non-empty string content rather
+/// than mere presence, so a regression that emits empty strings or non-string values is
+/// caught at the helper level.
 pub fn assert_common_span_attributes(span: &SpanData, system: &str) {
     assert_eq!(span.span_kind, SpanKind::Client);
     assert_eq!(
@@ -86,10 +104,15 @@ pub fn assert_common_span_attributes(span: &SpanData, system: &str) {
         Some(opentelemetry::Value::String(system.to_owned().into())),
         "db.system.name missing or wrong"
     );
-    assert!(attr(span, "db.namespace").is_some(), "db.namespace missing");
+    let namespace = attr(span, "db.namespace");
     assert!(
-        attr(span, "db.query.text").is_some(),
-        "db.query.text missing"
+        matches!(&namespace, Some(opentelemetry::Value::String(s)) if !s.as_str().is_empty()),
+        "db.namespace should be a non-empty string, got {namespace:?}",
+    );
+    let query_text = attr(span, "db.query.text");
+    assert!(
+        matches!(&query_text, Some(opentelemetry::Value::String(s)) if !s.as_str().is_empty()),
+        "db.query.text should be a non-empty string, got {query_text:?}",
     );
 }
 
@@ -110,31 +133,41 @@ pub struct MacroUser<Id> {
 
 /// Assert that a span has error status, an `error.type` attribute, and an exception event
 /// with `exception.type` and `exception.message`.
+///
+/// All three attribute values are required to be non-empty strings, so a regression that
+/// emits empty exception metadata is caught here rather than slipping past the suite.
 pub fn assert_error_span(span: &SpanData) {
     assert!(
         matches!(&span.status, Status::Error { .. }),
         "span status should be Error, got {:?}",
         span.status
     );
+    let error_type = attr(span, "error.type");
     assert!(
-        attr(span, "error.type").is_some(),
-        "error.type attribute missing"
+        matches!(&error_type, Some(opentelemetry::Value::String(s)) if !s.as_str().is_empty()),
+        "error.type should be a non-empty string, got {error_type:?}",
     );
-    let exception_event = span.events.iter().find(|e| e.name == "exception");
-    assert!(exception_event.is_some(), "exception event missing");
-    let event = exception_event.unwrap();
+    let event = span
+        .events
+        .iter()
+        .find(|e| e.name == "exception")
+        .expect("exception event missing");
+    let exception_type = event
+        .attributes
+        .iter()
+        .find(|kv| kv.key.as_str() == "exception.type")
+        .map(|kv| kv.value.clone());
     assert!(
-        event
-            .attributes
-            .iter()
-            .any(|kv| kv.key.as_str() == "exception.type"),
-        "exception.type attribute missing from event"
+        matches!(&exception_type, Some(opentelemetry::Value::String(s)) if !s.as_str().is_empty()),
+        "exception.type should be a non-empty string, got {exception_type:?}",
     );
+    let exception_message = event
+        .attributes
+        .iter()
+        .find(|kv| kv.key.as_str() == "exception.message")
+        .map(|kv| kv.value.clone());
     assert!(
-        event
-            .attributes
-            .iter()
-            .any(|kv| kv.key.as_str() == "exception.message"),
-        "exception.message attribute missing from event"
+        matches!(&exception_message, Some(opentelemetry::Value::String(s)) if !s.as_str().is_empty()),
+        "exception.message should be a non-empty string, got {exception_message:?}",
     );
 }

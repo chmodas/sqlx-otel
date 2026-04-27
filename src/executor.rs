@@ -880,4 +880,164 @@ mod tests {
             }
         }
     }
+
+    use proptest::prelude::*;
+
+    /// Build a `ConnectionAttributes` from explicit option fields. Used by the proptest
+    /// strategies below so that each generated case exercises an arbitrary subset of the
+    /// optional connection-level fields.
+    fn make_connection_attributes(
+        host: Option<String>,
+        port: Option<u16>,
+        namespace: Option<String>,
+        network_peer_address: Option<String>,
+        network_peer_port: Option<u16>,
+        query_text_mode: QueryTextMode,
+    ) -> ConnectionAttributes {
+        ConnectionAttributes {
+            system: "postgresql",
+            host,
+            port,
+            namespace,
+            network_peer_address,
+            network_peer_port,
+            query_text_mode,
+        }
+    }
+
+    /// Strategy for the three `QueryTextMode` variants.
+    fn any_query_text_mode() -> impl Strategy<Value = QueryTextMode> {
+        prop_oneof![
+            Just(QueryTextMode::Full),
+            Just(QueryTextMode::Obfuscated),
+            Just(QueryTextMode::Off),
+        ]
+    }
+
+    /// Strategy for an arbitrary `QueryAnnotations` whose four fields are independently
+    /// `None` or `Some(s)` for a bounded-length string `s`.
+    fn any_annotations() -> impl Strategy<Value = QueryAnnotations> {
+        (
+            proptest::option::of(".{0,32}"),
+            proptest::option::of(".{0,32}"),
+            proptest::option::of(".{0,32}"),
+            proptest::option::of(".{0,32}"),
+        )
+            .prop_map(|(op, coll, summary, sp)| {
+                let mut ann = QueryAnnotations::new();
+                if let Some(s) = op {
+                    ann = ann.operation(s);
+                }
+                if let Some(s) = coll {
+                    ann = ann.collection(s);
+                }
+                if let Some(s) = summary {
+                    ann = ann.query_summary(s);
+                }
+                if let Some(s) = sp {
+                    ann = ann.stored_procedure(s);
+                }
+                ann
+            })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// Membership invariant: the keys emitted by `build_attributes` are exactly the
+        /// union of the base connection keys, the four annotation keys (each iff its
+        /// field is `Some`), and `db.query.text` (iff `sql.is_some()` and the mode is
+        /// not `Off`).
+        #[test]
+        fn build_attributes_membership_invariant(
+            host in proptest::option::of("[a-z]{1,16}"),
+            port in proptest::option::of(any::<u16>()),
+            namespace in proptest::option::of("[a-z]{1,16}"),
+            network_peer_address in proptest::option::of("[0-9.:]{1,32}"),
+            network_peer_port in proptest::option::of(any::<u16>()),
+            mode in any_query_text_mode(),
+            sql in proptest::option::of(".{0,64}"),
+            ann in any_annotations(),
+        ) {
+            let attrs = make_connection_attributes(
+                host.clone(), port, namespace.clone(),
+                network_peer_address.clone(), network_peer_port, mode,
+            );
+            let kv = build_attributes(&attrs, sql.as_deref(), Some(&ann));
+            let keys: Vec<&str> = kv.iter().map(|k| k.key.as_str()).collect();
+
+            // `db.system.name` is always present.
+            prop_assert!(keys.contains(&"db.system.name"));
+
+            // Optional connection keys appear iff their field is `Some`.
+            prop_assert_eq!(keys.contains(&"server.address"), host.is_some());
+            prop_assert_eq!(keys.contains(&"server.port"), port.is_some());
+            prop_assert_eq!(keys.contains(&"db.namespace"), namespace.is_some());
+            prop_assert_eq!(keys.contains(&"network.peer.address"), network_peer_address.is_some());
+            prop_assert_eq!(keys.contains(&"network.peer.port"), network_peer_port.is_some());
+
+            // Annotation keys appear iff their field is `Some`.
+            prop_assert_eq!(keys.contains(&"db.operation.name"), ann.operation.is_some());
+            prop_assert_eq!(keys.contains(&"db.collection.name"), ann.collection.is_some());
+            prop_assert_eq!(keys.contains(&"db.query.summary"), ann.query_summary.is_some());
+            prop_assert_eq!(keys.contains(&"db.stored_procedure.name"), ann.stored_procedure.is_some());
+
+            // `db.query.text` is emitted iff sql is provided and mode is not Off.
+            let expect_query_text = sql.is_some() && mode != QueryTextMode::Off;
+            prop_assert_eq!(keys.contains(&"db.query.text"), expect_query_text);
+        }
+
+        /// No key appears more than once in the emitted attribute list. Duplicate keys
+        /// would cause downstream OTel exporters to emit conflicting tag values.
+        #[test]
+        fn build_attributes_has_no_duplicate_keys(
+            host in proptest::option::of("[a-z]{1,16}"),
+            port in proptest::option::of(any::<u16>()),
+            namespace in proptest::option::of("[a-z]{1,16}"),
+            mode in any_query_text_mode(),
+            sql in proptest::option::of(".{0,64}"),
+            ann in any_annotations(),
+        ) {
+            let attrs = make_connection_attributes(host, port, namespace, None, None, mode);
+            let kv = build_attributes(&attrs, sql.as_deref(), Some(&ann));
+            let mut seen = std::collections::HashSet::new();
+            for k in &kv {
+                prop_assert!(
+                    seen.insert(k.key.as_str().to_owned()),
+                    "duplicate key in build_attributes output: {}",
+                    k.key.as_str(),
+                );
+            }
+        }
+
+        /// `build_attributes` does not panic on arbitrary unicode SQL across all three
+        /// query-text modes, including the obfuscated path that delegates into
+        /// `obfuscate::obfuscate`.
+        #[test]
+        fn build_attributes_no_panic_arbitrary_sql(
+            sql in proptest::option::of(any::<String>()),
+            mode in any_query_text_mode(),
+            ann in any_annotations(),
+        ) {
+            let attrs = make_connection_attributes(None, None, None, None, None, mode);
+            let _ = build_attributes(&attrs, sql.as_deref(), Some(&ann));
+        }
+
+        /// When `annotations` is `None`, no annotation keys appear in the output
+        /// regardless of any other input – the `if let Some(ann)` guard short-circuits
+        /// the entire annotation-emission block.
+        #[test]
+        fn build_attributes_no_annotations_emits_no_annotation_keys(
+            mode in any_query_text_mode(),
+            sql in proptest::option::of(".{0,64}"),
+        ) {
+            let attrs = make_connection_attributes(None, None, None, None, None, mode);
+            let kv = build_attributes(&attrs, sql.as_deref(), None);
+            let keys: Vec<&str> = kv.iter().map(|k| k.key.as_str()).collect();
+            prop_assert!(!keys.contains(&"db.operation.name"));
+            prop_assert!(!keys.contains(&"db.collection.name"));
+            prop_assert!(!keys.contains(&"db.query.summary"));
+            prop_assert!(!keys.contains(&"db.stored_procedure.name"));
+        }
+    }
 }

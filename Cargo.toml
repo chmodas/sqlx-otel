@@ -42,10 +42,14 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dev-dependencies]
-ctor = "0.4"
+ctor = "0.10"
 opentelemetry_sdk = { version = "0.31", features = ["testing", "rt-tokio"] }
 proptest = "1"
 serial_test = "3"
 sqlx = { version = "0.8", features = ["macros", "sqlite", "postgres", "mysql", "runtime-tokio"] }
 testcontainers = "0.27"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[[example]]
+name = "sqlite"
+required-features = ["sqlite", "runtime-tokio"]

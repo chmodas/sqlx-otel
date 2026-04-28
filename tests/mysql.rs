@@ -5,21 +5,15 @@ mod common;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use common::{
-    assert_annotated_span, assert_common_span_attributes, assert_error_span, attr, test_annotations,
-};
-use opentelemetry::trace::SpanKind;
+use common::{assert_error_span, attr, test_annotations};
 use serial_test::serial;
 use sqlx::Executor as _;
 use sqlx::MySql;
-use sqlx::Row as _;
-use sqlx_otel::{Pool, PoolBuilder, QueryAnnotateExt, Transaction};
+use sqlx_otel::{Pool, PoolBuilder, QueryAnnotateExt};
 use testcontainers::core::IntoContainerPort;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio::sync::OnceCell;
-
-const SYSTEM: &str = "mysql";
 
 /// Backend row type used by parameterised map test macros (see `tests/sqlite.rs`).
 type Row = sqlx::mysql::MySqlRow;
@@ -102,102 +96,7 @@ async fn execute_records_error() {
 #[tokio::test]
 #[serial]
 async fn execute_records_affected_rows() {
-    let tel = common::TestTelemetry::install();
-    let pool = test_pool().await;
-
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS affected_test (id INT PRIMARY KEY, name VARCHAR(255) NOT NULL)",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::query("DELETE FROM affected_test")
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    tel.reset();
-
-    // --- Bulk insert ---
-    sqlx::query(
-        "INSERT INTO affected_test (id, name) VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
-    assert_eq!(
-        attr(&spans[0], "db.response.affected_rows"),
-        Some(opentelemetry::Value::I64(3)),
-        "inserting 3 rows in one statement should affect 3 rows"
-    );
-    tel.reset();
-
-    // --- Upsert (INSERT ON DUPLICATE KEY UPDATE) ---
-    sqlx::query(
-        "INSERT INTO affected_test (id, name) VALUES (1, 'alice_updated') \
-         ON DUPLICATE KEY UPDATE name = VALUES(name)",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
-    // MySQL reports 2 for ON DUPLICATE KEY UPDATE – it counts the matched row plus the
-    // updated row.
-    assert_eq!(
-        attr(&spans[0], "db.response.affected_rows"),
-        Some(opentelemetry::Value::I64(2)),
-        "MySQL upsert reports 2 affected rows (match + update)"
-    );
-    tel.reset();
-
-    // --- Update multiple rows ---
-    sqlx::query("UPDATE affected_test SET name = CONCAT(name, '_updated') WHERE id IN (2, 3)")
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
-    assert_eq!(
-        attr(&spans[0], "db.response.affected_rows"),
-        Some(opentelemetry::Value::I64(2)),
-        "updating two rows should affect 2 rows"
-    );
-    tel.reset();
-
-    // --- Delete multiple rows ---
-    sqlx::query("DELETE FROM affected_test WHERE id IN (1, 2, 3)")
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
-    assert_eq!(
-        attr(&spans[0], "db.response.affected_rows"),
-        Some(opentelemetry::Value::I64(3)),
-        "deleting three rows should affect 3 rows"
-    );
-    tel.reset();
-
-    // --- Delete with no matching rows ---
-    sqlx::query("DELETE FROM affected_test WHERE id = 999")
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
-    assert_eq!(
-        attr(&spans[0], "db.response.affected_rows"),
-        Some(opentelemetry::Value::I64(0)),
-        "deleting non-existent rows should affect 0 rows"
-    );
+    test_execute_records_affected_rows!(test_pool().await, common::MYSQL_DIALECT);
 }
 
 // ===========================================================================
@@ -365,32 +264,7 @@ async fn fetch_optional_records_one_row() {
 #[tokio::test]
 #[serial]
 async fn fetch_optional_records_zero_rows() {
-    let tel = common::TestTelemetry::install();
-    let pool = test_pool().await;
-
-    sqlx::query("CREATE TABLE IF NOT EXISTS empty_table (id INT AUTO_INCREMENT PRIMARY KEY)")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM empty_table")
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    tel.reset();
-    let result = (&pool)
-        .fetch_optional("SELECT id FROM empty_table")
-        .await
-        .unwrap();
-    assert!(result.is_none());
-
-    let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
-    assert_common_span_attributes(&spans[0], SYSTEM);
-    assert_eq!(
-        attr(&spans[0], "db.response.returned_rows"),
-        Some(opentelemetry::Value::I64(0))
-    );
+    test_fetch_optional_records_zero_rows!(test_pool().await, common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -573,42 +447,7 @@ async fn sqlstate_recorded_on_constraint_violation() {
 #[tokio::test]
 #[serial]
 async fn operation_duration_metric_is_recorded() {
-    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
-
-    let tel = common::TestTelemetry::install();
-    let pool = test_pool().await;
-
-    let _row = (&pool).fetch_one("SELECT 1").await.unwrap();
-
-    let resource_metrics = tel.metrics();
-    assert!(!resource_metrics.is_empty(), "should have metric data");
-
-    let mut found_duration = false;
-    for rm in &resource_metrics {
-        for sm in rm.scope_metrics() {
-            for metric in sm.metrics() {
-                if metric.name() == "db.client.operation.duration" {
-                    found_duration = true;
-                    assert_eq!(metric.unit(), "s");
-                    if let AggregatedMetrics::F64(MetricData::Histogram(hist)) = metric.data() {
-                        let dp: Vec<_> = hist.data_points().collect();
-                        assert!(!dp.is_empty(), "histogram should have data points");
-                        assert!(dp[0].count() > 0, "data point count should be > 0");
-                        let has_system = dp[0]
-                            .attributes()
-                            .any(|kv| kv.key.as_str() == "db.system.name");
-                        assert!(has_system, "metric should have db.system.name attribute");
-                    } else {
-                        panic!("db.client.operation.duration should be an f64 histogram");
-                    }
-                }
-            }
-        }
-    }
-    assert!(
-        found_duration,
-        "db.client.operation.duration metric not found"
-    );
+    test_operation_duration_metric_is_recorded!(test_pool().await, common::MYSQL_DIALECT);
 }
 
 // ===========================================================================
@@ -618,19 +457,7 @@ async fn operation_duration_metric_is_recorded() {
 #[tokio::test]
 #[serial]
 async fn transaction_rollback() {
-    let tel = common::TestTelemetry::install();
-    let pool = test_pool().await;
-
-    let mut tx: Transaction<'_, MySql> = pool.begin().await.unwrap();
-    sqlx::query("CREATE TABLE IF NOT EXISTS rollback_test (id INT AUTO_INCREMENT PRIMARY KEY)")
-        .execute(&mut tx)
-        .await
-        .unwrap();
-    tx.rollback().await.unwrap();
-
-    let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
-    assert_common_span_attributes(&spans[0], SYSTEM);
+    test_transaction_rollback!(test_pool().await, common::MYSQL_DIALECT);
 }
 
 // ===========================================================================
@@ -674,12 +501,7 @@ async fn builder_with_network_peer_port() {
 #[tokio::test]
 #[serial]
 async fn pool_close_and_is_closed() {
-    let _tel = common::TestTelemetry::install();
-    let pool = test_pool().await;
-
-    assert!(!pool.is_closed());
-    pool.close().await;
-    assert!(pool.is_closed());
+    test_pool_close_and_is_closed!(test_pool().await, common::MYSQL_DIALECT);
 }
 
 // ===========================================================================
@@ -689,50 +511,13 @@ async fn pool_close_and_is_closed() {
 #[tokio::test]
 #[serial]
 async fn query_text_mode_off_suppresses_sql() {
-    let shared = shared_container().await;
-    let raw = sqlx::MySqlPool::connect(&shared.url).await.unwrap();
-    let pool = PoolBuilder::from(raw)
-        .with_query_text_mode(sqlx_otel::QueryTextMode::Off)
-        .build();
-
-    let tel = common::TestTelemetry::install();
-    let _row = (&pool).fetch_optional("SELECT 1").await.unwrap();
-
-    let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
-    assert_eq!(spans[0].span_kind, SpanKind::Client);
-    assert_eq!(
-        attr(&spans[0], "db.system.name"),
-        Some(opentelemetry::Value::String(SYSTEM.to_owned().into()))
-    );
-    assert!(attr(&spans[0], "db.namespace").is_some());
-    assert!(
-        attr(&spans[0], "db.query.text").is_none(),
-        "db.query.text should not be present when QueryTextMode::Off"
-    );
+    test_query_text_mode_off_suppresses_sql!(raw_pool().await, common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
 #[serial]
 async fn query_text_mode_obfuscated_replaces_literals() {
-    let shared = shared_container().await;
-    let raw = sqlx::MySqlPool::connect(&shared.url).await.unwrap();
-    let pool = PoolBuilder::from(raw)
-        .with_query_text_mode(sqlx_otel::QueryTextMode::Obfuscated)
-        .build();
-
-    let tel = common::TestTelemetry::install();
-    let _row = (&pool)
-        .fetch_optional("SELECT 1, 'alice', 3.14")
-        .await
-        .unwrap();
-
-    let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
-    assert_eq!(
-        attr(&spans[0], "db.query.text"),
-        Some(opentelemetry::Value::String("SELECT ?, ?, ?".into()))
-    );
+    test_query_text_mode_obfuscated_replaces_literals!(raw_pool().await, common::MYSQL_DIALECT);
 }
 
 // ===========================================================================
@@ -758,19 +543,7 @@ async fn query_summary_drives_span_name() {
 #[tokio::test]
 #[serial]
 async fn query_execute_with_annotations_via_pool() {
-    let tel = common::TestTelemetry::install();
-    let pool = test_pool().await;
-
-    sqlx::query("CREATE TABLE IF NOT EXISTS qe_pool (id INT AUTO_INCREMENT PRIMARY KEY)")
-        .with_annotations(test_annotations())
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
-    assert!(attr(&spans[0], "db.response.affected_rows").is_some());
+    test_query_execute_with_annotations_via_pool!(test_pool().await, common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -806,126 +579,37 @@ async fn query_fetch_one_with_annotations_via_pool() {
 #[tokio::test]
 #[serial]
 async fn query_fetch_optional_with_annotations_via_pool() {
-    let tel = common::TestTelemetry::install();
-    let pool = test_pool().await;
-
-    sqlx::query("CREATE TABLE IF NOT EXISTS qfo_pool (id INT PRIMARY KEY)")
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    tel.reset();
-
-    let row = sqlx::query("SELECT id FROM qfo_pool WHERE id = 1")
-        .with_annotations(test_annotations())
-        .fetch_optional(&pool)
-        .await
-        .unwrap();
-    assert!(row.is_none());
-
-    let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
-    assert_eq!(
-        attr(&spans[0], "db.response.returned_rows"),
-        Some(opentelemetry::Value::I64(0))
-    );
+    test_query_fetch_optional_with_annotations_via_pool!(test_pool().await, common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
 #[serial]
 async fn query_bind_first_then_annotations_via_pool() {
-    let tel = common::TestTelemetry::install();
-    let pool = test_pool().await;
-
-    let row = sqlx::query("SELECT CAST(? + ? AS SIGNED) AS sum")
-        .bind(2_i32)
-        .bind(3_i32)
-        .with_annotations(test_annotations())
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    let sum: i64 = row.try_get("sum").unwrap();
-    assert_eq!(sum, 5);
-
-    let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
+    test_query_bind_first_then_annotations_via_pool!(test_pool().await, common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
 #[serial]
 async fn query_annotations_first_then_bind_via_pool() {
-    let tel = common::TestTelemetry::install();
-    let pool = test_pool().await;
-
-    let row = sqlx::query("SELECT CAST(? + ? AS SIGNED) AS sum")
-        .with_annotations(test_annotations())
-        .bind(10_i32)
-        .bind(20_i32)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    let sum: i64 = row.try_get("sum").unwrap();
-    assert_eq!(sum, 30);
-
-    let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
+    test_query_annotations_first_then_bind_via_pool!(test_pool().await, common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
 #[serial]
 async fn query_with_operation_shorthand_via_pool() {
-    let tel = common::TestTelemetry::install();
-    let pool = test_pool().await;
-
-    sqlx::query("CREATE TABLE IF NOT EXISTS qop_pool (id INT AUTO_INCREMENT PRIMARY KEY)")
-        .with_operation("SELECT", "users")
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
+    test_query_with_operation_shorthand_via_pool!(test_pool().await, common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
 #[serial]
 async fn query_execute_with_annotations_via_connection() {
-    let tel = common::TestTelemetry::install();
-    let pool = test_pool().await;
-
-    let mut conn = pool.acquire().await.unwrap();
-    sqlx::query("CREATE TABLE IF NOT EXISTS qe_conn (id INT AUTO_INCREMENT PRIMARY KEY)")
-        .with_annotations(test_annotations())
-        .execute(&mut conn)
-        .await
-        .unwrap();
-
-    let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
+    test_query_execute_with_annotations_via_connection!(test_pool().await, common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
 #[serial]
 async fn query_execute_with_annotations_via_transaction() {
-    let tel = common::TestTelemetry::install();
-    let pool = test_pool().await;
-
-    let mut tx: Transaction<'_, MySql> = pool.begin().await.unwrap();
-    sqlx::query("CREATE TABLE IF NOT EXISTS qe_tx (id INT AUTO_INCREMENT PRIMARY KEY)")
-        .with_annotations(test_annotations())
-        .execute(&mut tx)
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
-
-    let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
+    test_query_execute_with_annotations_via_transaction!(test_pool().await, common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -1166,9 +850,7 @@ async fn query_macro_execute_with_annotations_via_pool() {
     .unwrap();
     assert_eq!(result.rows_affected(), 1);
 
-    let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
+    common::assert_one_annotated_span(&tel, &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -1194,9 +876,7 @@ async fn query_macro_fetch_one_with_annotations_via_pool() {
     assert_eq!(row.id, 202);
     assert_eq!(row.name, "bob");
 
-    let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
+    common::assert_one_annotated_span(&tel, &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -1227,9 +907,7 @@ async fn query_macro_fetch_all_with_annotations_via_pool() {
     .unwrap();
     assert_eq!(rows.len(), 3);
 
-    let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
+    common::assert_one_annotated_span(&tel, &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -1250,9 +928,7 @@ async fn query_macro_fetch_optional_with_annotations_via_pool() {
         .unwrap();
     assert!(row.is_none());
 
-    let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
+    common::assert_one_annotated_span(&tel, &common::MYSQL_DIALECT);
 }
 
 type MacroUser = common::MacroUser<i32>;
@@ -1284,9 +960,7 @@ async fn query_as_macro_fetch_one_with_annotations_via_pool() {
     assert_eq!(user.id, 206);
     assert_eq!(user.name, "frank");
 
-    let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
+    common::assert_one_annotated_span(&tel, &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -1316,9 +990,7 @@ async fn query_as_macro_fetch_all_with_annotations_via_pool() {
     .unwrap();
     assert_eq!(users.len(), 2);
 
-    let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
+    common::assert_one_annotated_span(&tel, &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -1343,9 +1015,7 @@ async fn query_as_macro_fetch_optional_with_annotations_via_pool() {
     .unwrap();
     assert!(user.is_none());
 
-    let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
+    common::assert_one_annotated_span(&tel, &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -1370,9 +1040,7 @@ async fn query_scalar_macro_fetch_one_with_annotations_via_pool() {
         .unwrap();
     assert_eq!(name, "irene");
 
-    let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
+    common::assert_one_annotated_span(&tel, &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -1401,7 +1069,5 @@ async fn query_scalar_macro_fetch_all_with_annotations_via_pool() {
     .unwrap();
     assert_eq!(ids, vec![210, 211]);
 
-    let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
+    common::assert_one_annotated_span(&tel, &common::MYSQL_DIALECT);
 }

@@ -5,7 +5,9 @@ mod common;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use common::{assert_common_span_attributes, assert_error_span, attr};
+use common::{
+    assert_annotated_span, assert_common_span_attributes, assert_error_span, attr, test_annotations,
+};
 use futures::StreamExt;
 use opentelemetry::trace::SpanKind;
 use serial_test::serial;
@@ -62,31 +64,6 @@ async fn test_pool() -> Pool<MySql> {
     PoolBuilder::from(raw).build()
 }
 
-/// Standard annotations used across annotation assertions.
-fn test_annotations() -> QueryAnnotations {
-    QueryAnnotations::new()
-        .operation("SELECT")
-        .collection("users")
-}
-
-/// Assert that the span carries the standard annotation attributes.
-fn assert_annotated_span(span: &opentelemetry_sdk::trace::SpanData) {
-    assert_eq!(span.span_kind, SpanKind::Client);
-    assert_eq!(span.name, "SELECT users");
-    assert_eq!(
-        attr(span, "db.system.name"),
-        Some(opentelemetry::Value::String(SYSTEM.to_owned().into())),
-    );
-    assert_eq!(
-        attr(span, "db.operation.name"),
-        Some(opentelemetry::Value::String("SELECT".into())),
-    );
-    assert_eq!(
-        attr(span, "db.collection.name"),
-        Some(opentelemetry::Value::String("users".into())),
-    );
-}
-
 // ===========================================================================
 // execute
 // ===========================================================================
@@ -94,33 +71,7 @@ fn assert_annotated_span(span: &opentelemetry_sdk::trace::SpanData) {
 #[tokio::test]
 #[serial]
 async fn execute_creates_span_via_pool() {
-    let tel = common::TestTelemetry::install();
-    let pool = test_pool().await;
-
-    sqlx::query("CREATE TABLE IF NOT EXISTS exec_pool (id INT AUTO_INCREMENT PRIMARY KEY)")
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
-    assert_common_span_attributes(&spans[0], SYSTEM);
-    assert!(attr(&spans[0], "db.response.returned_rows").is_none());
-    assert!(attr(&spans[0], "db.response.affected_rows").is_some());
-
-    // With annotations
-    pool.with_annotations(test_annotations())
-        .execute("CREATE TABLE IF NOT EXISTS exec_pool (id INT AUTO_INCREMENT PRIMARY KEY)")
-        .await
-        .unwrap();
-    assert_annotated_span(tel.spans().last().unwrap());
-
-    // With shorthand
-    pool.with_operation("SELECT", "users")
-        .execute("CREATE TABLE IF NOT EXISTS exec_pool3 (id INT AUTO_INCREMENT PRIMARY KEY)")
-        .await
-        .unwrap();
-    assert_annotated_span(tel.spans().last().unwrap());
+    test_execute_creates_span_via_pool!(test_pool().await, common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -146,14 +97,14 @@ async fn execute_creates_span_via_connection() {
         .execute("CREATE TABLE IF NOT EXISTS exec_conn (id INT AUTO_INCREMENT PRIMARY KEY)")
         .await
         .unwrap();
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 
     // With shorthand
     conn.with_operation("SELECT", "users")
         .execute("CREATE TABLE IF NOT EXISTS exec_conn3 (id INT AUTO_INCREMENT PRIMARY KEY)")
         .await
         .unwrap();
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -186,7 +137,7 @@ async fn execute_creates_span_via_transaction() {
     assert_common_span_attributes(&spans[0], SYSTEM);
     assert!(attr(&spans[0], "db.response.returned_rows").is_none());
     assert!(attr(&spans[0], "db.response.affected_rows").is_some());
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -212,7 +163,7 @@ async fn execute_records_error() {
     assert!(result.is_err());
     let spans = tel.spans();
     let last = spans.last().unwrap();
-    assert_annotated_span(last);
+    assert_annotated_span(last, &common::MYSQL_DIALECT);
     assert_error_span(last);
 
     // With shorthand (error path)
@@ -222,7 +173,7 @@ async fn execute_records_error() {
         .await;
     assert!(result.is_err());
     let last = tel.spans().last().unwrap().clone();
-    assert_annotated_span(&last);
+    assert_annotated_span(&last, &common::MYSQL_DIALECT);
     assert_error_span(&last);
 }
 
@@ -355,7 +306,7 @@ async fn execute_many_via_pool() {
         .execute_many("SELECT 1; SELECT 2");
     while stream.next().await.is_some() {}
     drop(stream);
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 
     // With shorthand
     let mut stream = pool
@@ -363,7 +314,7 @@ async fn execute_many_via_pool() {
         .execute_many("SELECT 1; SELECT 2");
     while stream.next().await.is_some() {}
     drop(stream);
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -391,7 +342,7 @@ async fn execute_many_via_connection() {
         .execute_many("SELECT 1; SELECT 2");
     while stream.next().await.is_some() {}
     drop(stream);
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 
     // With shorthand
     let mut stream = conn
@@ -399,7 +350,7 @@ async fn execute_many_via_connection() {
         .execute_many("SELECT 1; SELECT 2");
     while stream.next().await.is_some() {}
     drop(stream);
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -436,7 +387,7 @@ async fn execute_many_via_transaction() {
         attr(&spans[0], "db.response.returned_rows"),
         Some(opentelemetry::Value::I64(0))
     );
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -468,7 +419,7 @@ async fn execute_many_records_error() {
     drop(stream);
     let spans = tel.spans();
     let last = spans.last().unwrap();
-    assert_annotated_span(last);
+    assert_annotated_span(last, &common::MYSQL_DIALECT);
     assert_error_span(last);
 
     // With shorthand (error path)
@@ -479,7 +430,7 @@ async fn execute_many_records_error() {
     assert!(result.is_some_and(|r| r.is_err()));
     drop(stream);
     let last = tel.spans().last().unwrap().clone();
-    assert_annotated_span(&last);
+    assert_annotated_span(&last, &common::MYSQL_DIALECT);
     assert_error_span(&last);
 }
 
@@ -515,7 +466,7 @@ async fn fetch_via_pool() {
         .fetch("SELECT 1 UNION ALL SELECT 2");
     while stream.next().await.is_some() {}
     drop(stream);
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 
     // With shorthand
     let mut stream = pool
@@ -523,7 +474,7 @@ async fn fetch_via_pool() {
         .fetch("SELECT 1 UNION ALL SELECT 2");
     while stream.next().await.is_some() {}
     drop(stream);
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -551,7 +502,7 @@ async fn fetch_via_connection() {
         .fetch("SELECT 1 UNION ALL SELECT 2");
     while stream.next().await.is_some() {}
     drop(stream);
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 
     // With shorthand
     let mut stream = conn
@@ -559,7 +510,7 @@ async fn fetch_via_connection() {
         .fetch("SELECT 1 UNION ALL SELECT 2");
     while stream.next().await.is_some() {}
     drop(stream);
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -596,7 +547,7 @@ async fn fetch_via_transaction() {
         attr(&spans[0], "db.response.returned_rows"),
         Some(opentelemetry::Value::I64(2))
     );
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -648,7 +599,7 @@ async fn fetch_stream_records_error() {
     drop(stream);
     let spans = tel.spans();
     let last = spans.last().unwrap();
-    assert_annotated_span(last);
+    assert_annotated_span(last, &common::MYSQL_DIALECT);
     assert_error_span(last);
 
     // With shorthand (error path)
@@ -657,7 +608,7 @@ async fn fetch_stream_records_error() {
     assert!(result.is_some_and(|r| r.is_err()));
     drop(stream);
     let last = tel.spans().last().unwrap().clone();
-    assert_annotated_span(&last);
+    assert_annotated_span(&last, &common::MYSQL_DIALECT);
     assert_error_span(&last);
 }
 
@@ -695,7 +646,7 @@ async fn fetch_many_via_pool() {
         .fetch_many("SELECT 1 UNION ALL SELECT 2");
     while stream.next().await.is_some() {}
     drop(stream);
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 
     // With shorthand
     let mut stream = pool
@@ -703,7 +654,7 @@ async fn fetch_many_via_pool() {
         .fetch_many("SELECT 1 UNION ALL SELECT 2");
     while stream.next().await.is_some() {}
     drop(stream);
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -731,7 +682,7 @@ async fn fetch_many_via_connection() {
         .fetch_many("SELECT 1 UNION ALL SELECT 2");
     while stream.next().await.is_some() {}
     drop(stream);
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 
     // With shorthand
     let mut stream = conn
@@ -739,7 +690,7 @@ async fn fetch_many_via_connection() {
         .fetch_many("SELECT 1 UNION ALL SELECT 2");
     while stream.next().await.is_some() {}
     drop(stream);
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -776,7 +727,7 @@ async fn fetch_many_via_transaction() {
         attr(&spans[0], "db.response.returned_rows"),
         Some(opentelemetry::Value::I64(2))
     );
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -828,7 +779,7 @@ async fn fetch_many_records_error() {
     drop(stream);
     let spans = tel.spans();
     let last = spans.last().unwrap();
-    assert_annotated_span(last);
+    assert_annotated_span(last, &common::MYSQL_DIALECT);
     assert_error_span(last);
 
     // With shorthand (error path)
@@ -839,7 +790,7 @@ async fn fetch_many_records_error() {
     assert!(result.is_some_and(|r| r.is_err()));
     drop(stream);
     let last = tel.spans().last().unwrap().clone();
-    assert_annotated_span(&last);
+    assert_annotated_span(&last, &common::MYSQL_DIALECT);
     assert_error_span(&last);
 }
 
@@ -872,14 +823,14 @@ async fn fetch_all_via_pool() {
         .fetch_all("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3")
         .await
         .unwrap();
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 
     // With shorthand
     pool.with_operation("SELECT", "users")
         .fetch_all("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3")
         .await
         .unwrap();
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -908,14 +859,14 @@ async fn fetch_all_via_connection() {
         .fetch_all("SELECT 1 UNION ALL SELECT 2")
         .await
         .unwrap();
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 
     // With shorthand
     conn.with_operation("SELECT", "users")
         .fetch_all("SELECT 1 UNION ALL SELECT 2")
         .await
         .unwrap();
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -951,7 +902,7 @@ async fn fetch_all_via_transaction() {
         attr(&spans[0], "db.response.returned_rows"),
         Some(opentelemetry::Value::I64(2))
     );
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -977,7 +928,7 @@ async fn fetch_all_records_error() {
     assert!(result.is_err());
     let spans = tel.spans();
     let last = spans.last().unwrap();
-    assert_annotated_span(last);
+    assert_annotated_span(last, &common::MYSQL_DIALECT);
     assert_error_span(last);
 
     // With shorthand (error path)
@@ -987,7 +938,7 @@ async fn fetch_all_records_error() {
         .await;
     assert!(result.is_err());
     let last = tel.spans().last().unwrap().clone();
-    assert_annotated_span(&last);
+    assert_annotated_span(&last, &common::MYSQL_DIALECT);
     assert_error_span(&last);
 }
 
@@ -1016,14 +967,14 @@ async fn fetch_one_via_pool() {
         .fetch_one("SELECT 1")
         .await
         .unwrap();
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 
     // With shorthand
     pool.with_operation("SELECT", "users")
         .fetch_one("SELECT 1")
         .await
         .unwrap();
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -1048,14 +999,14 @@ async fn fetch_one_via_connection() {
         .fetch_one("SELECT 1")
         .await
         .unwrap();
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 
     // With shorthand
     conn.with_operation("SELECT", "users")
         .fetch_one("SELECT 1")
         .await
         .unwrap();
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -1087,7 +1038,7 @@ async fn fetch_one_via_transaction() {
         attr(&spans[0], "db.response.returned_rows"),
         Some(opentelemetry::Value::I64(1))
     );
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -1113,7 +1064,7 @@ async fn fetch_one_records_error() {
     assert!(result.is_err());
     let spans = tel.spans();
     let last = spans.last().unwrap();
-    assert_annotated_span(last);
+    assert_annotated_span(last, &common::MYSQL_DIALECT);
     assert_error_span(last);
 
     // With shorthand (error path)
@@ -1123,7 +1074,7 @@ async fn fetch_one_records_error() {
         .await;
     assert!(result.is_err());
     let last = tel.spans().last().unwrap().clone();
-    assert_annotated_span(&last);
+    assert_annotated_span(&last, &common::MYSQL_DIALECT);
     assert_error_span(&last);
 }
 
@@ -1153,14 +1104,14 @@ async fn fetch_optional_records_one_row() {
         .fetch_optional("SELECT 1")
         .await
         .unwrap();
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 
     // With shorthand
     pool.with_operation("SELECT", "users")
         .fetch_optional("SELECT 1")
         .await
         .unwrap();
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -1217,14 +1168,14 @@ async fn fetch_optional_via_connection() {
         .fetch_optional("SELECT 42")
         .await
         .unwrap();
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 
     // With shorthand
     conn.with_operation("SELECT", "users")
         .fetch_optional("SELECT 42")
         .await
         .unwrap();
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -1257,7 +1208,7 @@ async fn fetch_optional_via_transaction() {
         attr(&spans[0], "db.response.returned_rows"),
         Some(opentelemetry::Value::I64(1))
     );
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -1283,7 +1234,7 @@ async fn fetch_optional_records_error() {
     assert!(result.is_err());
     let spans = tel.spans();
     let last = spans.last().unwrap();
-    assert_annotated_span(last);
+    assert_annotated_span(last, &common::MYSQL_DIALECT);
     assert_error_span(last);
 
     // With shorthand (error path)
@@ -1293,7 +1244,7 @@ async fn fetch_optional_records_error() {
         .await;
     assert!(result.is_err());
     let last = tel.spans().last().unwrap().clone();
-    assert_annotated_span(&last);
+    assert_annotated_span(&last, &common::MYSQL_DIALECT);
     assert_error_span(&last);
 }
 
@@ -1319,14 +1270,14 @@ async fn prepare_via_pool() {
         .prepare("SELECT 1")
         .await
         .unwrap();
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 
     // With shorthand
     pool.with_operation("SELECT", "users")
         .prepare("SELECT 1")
         .await
         .unwrap();
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -1348,14 +1299,14 @@ async fn prepare_via_connection() {
         .prepare("SELECT 1")
         .await
         .unwrap();
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 
     // With shorthand
     conn.with_operation("SELECT", "users")
         .prepare("SELECT 1")
         .await
         .unwrap();
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -1384,7 +1335,7 @@ async fn prepare_via_transaction() {
     assert_eq!(spans.len(), 3);
     assert_common_span_attributes(&spans[0], SYSTEM);
     assert!(attr(&spans[0], "db.response.returned_rows").is_none());
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -1411,7 +1362,7 @@ async fn prepare_records_error() {
     assert!(result.is_err());
     let spans = tel.spans();
     let last = spans.last().unwrap();
-    assert_annotated_span(last);
+    assert_annotated_span(last, &common::MYSQL_DIALECT);
     assert_error_span(last);
 
     // With shorthand (error path)
@@ -1421,7 +1372,7 @@ async fn prepare_records_error() {
         .await;
     assert!(result.is_err());
     let last = tel.spans().last().unwrap().clone();
-    assert_annotated_span(&last);
+    assert_annotated_span(&last, &common::MYSQL_DIALECT);
     assert_error_span(&last);
 }
 
@@ -1447,14 +1398,14 @@ async fn prepare_with_via_pool() {
         .prepare_with("SELECT ?", &[])
         .await
         .unwrap();
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 
     // With shorthand
     pool.with_operation("SELECT", "users")
         .prepare_with("SELECT ?", &[])
         .await
         .unwrap();
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -1476,14 +1427,14 @@ async fn prepare_with_via_connection() {
         .prepare_with("SELECT ?", &[])
         .await
         .unwrap();
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 
     // With shorthand
     conn.with_operation("SELECT", "users")
         .prepare_with("SELECT ?", &[])
         .await
         .unwrap();
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -1512,7 +1463,7 @@ async fn prepare_with_via_transaction() {
     assert_eq!(spans.len(), 3);
     assert_common_span_attributes(&spans[0], SYSTEM);
     assert!(attr(&spans[0], "db.response.returned_rows").is_none());
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -1539,7 +1490,7 @@ async fn prepare_with_records_error() {
     assert!(result.is_err());
     let spans = tel.spans();
     let last = spans.last().unwrap();
-    assert_annotated_span(last);
+    assert_annotated_span(last, &common::MYSQL_DIALECT);
     assert_error_span(last);
 
     // With shorthand (error path)
@@ -1549,7 +1500,7 @@ async fn prepare_with_records_error() {
         .await;
     assert!(result.is_err());
     let last = tel.spans().last().unwrap().clone();
-    assert_annotated_span(&last);
+    assert_annotated_span(&last, &common::MYSQL_DIALECT);
     assert_error_span(&last);
 }
 
@@ -1575,14 +1526,14 @@ async fn describe_via_pool() {
         .describe("SELECT 1")
         .await
         .unwrap();
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 
     // With shorthand
     pool.with_operation("SELECT", "users")
         .describe("SELECT 1")
         .await
         .unwrap();
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -1604,14 +1555,14 @@ async fn describe_via_connection() {
         .describe("SELECT 1")
         .await
         .unwrap();
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 
     // With shorthand
     conn.with_operation("SELECT", "users")
         .describe("SELECT 1")
         .await
         .unwrap();
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -1640,7 +1591,7 @@ async fn describe_via_transaction() {
     assert_eq!(spans.len(), 3);
     assert_common_span_attributes(&spans[0], SYSTEM);
     assert!(attr(&spans[0], "db.response.returned_rows").is_none());
-    assert_annotated_span(tel.spans().last().unwrap());
+    assert_annotated_span(tel.spans().last().unwrap(), &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -1667,7 +1618,7 @@ async fn describe_records_error() {
     assert!(result.is_err());
     let spans = tel.spans();
     let last = spans.last().unwrap();
-    assert_annotated_span(last);
+    assert_annotated_span(last, &common::MYSQL_DIALECT);
     assert_error_span(last);
 
     // With shorthand (error path)
@@ -1677,7 +1628,7 @@ async fn describe_records_error() {
         .await;
     assert!(result.is_err());
     let last = tel.spans().last().unwrap().clone();
-    assert_annotated_span(&last);
+    assert_annotated_span(&last, &common::MYSQL_DIALECT);
     assert_error_span(&last);
 }
 
@@ -2079,7 +2030,7 @@ async fn query_execute_with_annotations_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
     assert!(attr(&spans[0], "db.response.affected_rows").is_some());
 }
 
@@ -2099,7 +2050,7 @@ async fn query_execute_many_with_annotations_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -2116,7 +2067,7 @@ async fn query_fetch_with_annotations_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
     assert_eq!(
         attr(&spans[0], "db.response.returned_rows"),
         Some(opentelemetry::Value::I64(2))
@@ -2138,7 +2089,7 @@ async fn query_fetch_many_with_annotations_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -2156,7 +2107,7 @@ async fn query_fetch_all_with_annotations_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
     assert_eq!(
         attr(&spans[0], "db.response.returned_rows"),
         Some(opentelemetry::Value::I64(3))
@@ -2177,7 +2128,7 @@ async fn query_fetch_one_with_annotations_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
     assert_eq!(
         attr(&spans[0], "db.response.returned_rows"),
         Some(opentelemetry::Value::I64(1))
@@ -2206,7 +2157,7 @@ async fn query_fetch_optional_with_annotations_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
     assert_eq!(
         attr(&spans[0], "db.response.returned_rows"),
         Some(opentelemetry::Value::I64(0))
@@ -2231,7 +2182,7 @@ async fn query_bind_first_then_annotations_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -2252,7 +2203,7 @@ async fn query_annotations_first_then_bind_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -2269,7 +2220,7 @@ async fn query_with_operation_shorthand_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -2287,7 +2238,7 @@ async fn query_execute_with_annotations_via_connection() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -2306,7 +2257,7 @@ async fn query_execute_with_annotations_via_transaction() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -2323,7 +2274,7 @@ async fn query_execute_with_annotations_records_error() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
     assert_error_span(&spans[0]);
 }
 
@@ -2343,7 +2294,7 @@ async fn query_as_fetch_with_annotations_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -2361,7 +2312,7 @@ async fn query_as_fetch_many_with_annotations_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -2379,7 +2330,7 @@ async fn query_as_fetch_all_with_annotations_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -2397,7 +2348,7 @@ async fn query_as_fetch_one_with_annotations_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -2415,7 +2366,7 @@ async fn query_as_fetch_optional_with_annotations_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -2432,7 +2383,7 @@ async fn query_as_fetch_one_with_annotations_records_error() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
     assert_error_span(&spans[0]);
 }
 
@@ -2452,7 +2403,7 @@ async fn query_scalar_fetch_with_annotations_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -2470,7 +2421,7 @@ async fn query_scalar_fetch_many_with_annotations_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -2488,7 +2439,7 @@ async fn query_scalar_fetch_all_with_annotations_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -2506,7 +2457,7 @@ async fn query_scalar_fetch_one_with_annotations_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -2524,7 +2475,7 @@ async fn query_scalar_fetch_optional_with_annotations_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 // ===========================================================================
@@ -2554,7 +2505,7 @@ async fn query_map_position_1_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -2574,7 +2525,7 @@ async fn query_map_position_2_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -2594,7 +2545,7 @@ async fn query_map_position_3_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -2614,7 +2565,7 @@ async fn query_try_map_position_3_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 // --- Per-method on Map (so each forwarder body is hit) --------------------
@@ -2634,7 +2585,7 @@ async fn map_fetch_with_annotations_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
     assert_eq!(
         attr(&spans[0], "db.response.returned_rows"),
         Some(opentelemetry::Value::I64(2))
@@ -2657,7 +2608,7 @@ async fn map_fetch_many_with_annotations_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -2676,7 +2627,7 @@ async fn map_fetch_all_with_annotations_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -2695,7 +2646,7 @@ async fn map_fetch_one_with_annotations_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -2714,7 +2665,7 @@ async fn map_fetch_optional_with_annotations_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 // --- Composition (multi-map; both branches of step 4) --------------------
@@ -2736,7 +2687,7 @@ async fn map_compose_after_annotations_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -2756,7 +2707,7 @@ async fn map_try_map_compose_after_annotations_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 // --- Other executor receivers (smoke) -------------------------------------
@@ -2778,7 +2729,7 @@ async fn query_map_with_annotations_via_connection() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -2799,7 +2750,7 @@ async fn query_map_with_annotations_via_transaction() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 // --- Error paths ----------------------------------------------------------
@@ -2819,7 +2770,7 @@ async fn query_map_with_annotations_records_error() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
     assert_error_span(&spans[0]);
 }
 
@@ -2847,7 +2798,7 @@ async fn query_try_map_with_annotations_propagates_mapper_error() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 // ===========================================================================
@@ -2885,7 +2836,7 @@ async fn query_macro_execute_with_annotations_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -2913,7 +2864,7 @@ async fn query_macro_fetch_one_with_annotations_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -2946,7 +2897,7 @@ async fn query_macro_fetch_all_with_annotations_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -2969,7 +2920,7 @@ async fn query_macro_fetch_optional_with_annotations_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 type MacroUser = common::MacroUser<i32>;
@@ -3003,7 +2954,7 @@ async fn query_as_macro_fetch_one_with_annotations_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -3035,7 +2986,7 @@ async fn query_as_macro_fetch_all_with_annotations_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -3062,7 +3013,7 @@ async fn query_as_macro_fetch_optional_with_annotations_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -3089,7 +3040,7 @@ async fn query_scalar_macro_fetch_one_with_annotations_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }
 
 #[tokio::test]
@@ -3120,5 +3071,5 @@ async fn query_scalar_macro_fetch_all_with_annotations_via_pool() {
 
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
-    assert_annotated_span(&spans[0]);
+    assert_annotated_span(&spans[0], &common::MYSQL_DIALECT);
 }

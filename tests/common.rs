@@ -207,24 +207,61 @@ pub struct Dialect {
     /// Column definition for a non-null text column: e.g. `"TEXT NOT NULL"` for sqlite
     /// and postgres, `"VARCHAR(255) NOT NULL"` for mysql.
     pub text_column: &'static str,
+    /// Full SQL for an upsert that updates `affected_test`'s row id=1 to a new name.
+    /// Each backend's syntax differs (`INSERT OR REPLACE` / `ON CONFLICT … DO UPDATE` /
+    /// `ON DUPLICATE KEY UPDATE`).
+    pub upsert_sql: &'static str,
+    /// Expected `db.response.affected_rows` for the upsert above. Sqlite and postgres
+    /// report `1`; mysql reports `2` (it counts match + update).
+    pub upsert_affected_rows: i64,
+    /// Full SQL for an UPDATE that mutates two rows by appending `_updated` to `name`
+    /// using the dialect's string-concat operator (`||` for sqlite/postgres, `CONCAT(...)`
+    /// for mysql).
+    pub string_concat_update_sql: &'static str,
+    /// Full SQL of the form `SELECT (?1 + ?2) AS sum`, accepting two `i32` binds and
+    /// returning an `i64` named `sum`. Each backend uses its own placeholder syntax and
+    /// (for postgres / mysql) explicit casts so the result fits in `i64` uniformly.
+    pub bind_two_sum_sql: &'static str,
+    /// Full SQL of the form `SELECT <placeholder>` for `prepare_with` calls that supply
+    /// no concrete binds. Each backend uses its own placeholder syntax (`?` for sqlite
+    /// and mysql, `$1` for postgres).
+    pub prepare_with_select_sql: &'static str,
 }
 
 pub const SQLITE_DIALECT: Dialect = Dialect {
     system: "sqlite",
     id_pk_column: "INTEGER PRIMARY KEY",
     text_column: "TEXT NOT NULL",
+    upsert_sql: "INSERT OR REPLACE INTO affected_test (id, name) VALUES (1, 'alice_updated')",
+    upsert_affected_rows: 1,
+    string_concat_update_sql: "UPDATE affected_test SET name = name || '_updated' WHERE id IN (2, 3)",
+    bind_two_sum_sql: "SELECT ?1 + ?2 AS sum",
+    prepare_with_select_sql: "SELECT ?",
 };
 
 pub const POSTGRES_DIALECT: Dialect = Dialect {
     system: "postgresql",
     id_pk_column: "INT PRIMARY KEY",
     text_column: "TEXT NOT NULL",
+    upsert_sql: "INSERT INTO affected_test (id, name) VALUES (1, 'alice_updated') \
+                 ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
+    upsert_affected_rows: 1,
+    string_concat_update_sql: "UPDATE affected_test SET name = name || '_updated' WHERE id IN (2, 3)",
+    bind_two_sum_sql: "SELECT ($1::bigint + $2::bigint) AS sum",
+    prepare_with_select_sql: "SELECT $1",
 };
 
 pub const MYSQL_DIALECT: Dialect = Dialect {
     system: "mysql",
     id_pk_column: "INT PRIMARY KEY",
     text_column: "VARCHAR(255) NOT NULL",
+    upsert_sql: "INSERT INTO affected_test (id, name) VALUES (1, 'alice_updated') \
+                 ON DUPLICATE KEY UPDATE name = VALUES(name)",
+    // MySQL counts ON DUPLICATE KEY UPDATE as match (1) + update (1) = 2.
+    upsert_affected_rows: 2,
+    string_concat_update_sql: "UPDATE affected_test SET name = CONCAT(name, '_updated') WHERE id IN (2, 3)",
+    bind_two_sum_sql: "SELECT CAST(? + ? AS SIGNED) AS sum",
+    prepare_with_select_sql: "SELECT ?",
 };
 
 /// `DROP TABLE IF EXISTS` then `CREATE TABLE` at the supplied pool. Used at the top of
@@ -1590,7 +1627,10 @@ macro_rules! test_prepare_with_via_pool {
         let tel = $crate::common::TestTelemetry::install();
         let pool = $pool_factory;
 
-        let _stmt = (&pool).prepare_with("SELECT ?", &[]).await.unwrap();
+        let _stmt = (&pool)
+            .prepare_with($dialect.prepare_with_select_sql, &[])
+            .await
+            .unwrap();
 
         let spans = tel.spans();
         assert_eq!(spans.len(), 1);
@@ -1598,13 +1638,13 @@ macro_rules! test_prepare_with_via_pool {
         assert!($crate::common::attr(&spans[0], "db.response.returned_rows").is_none());
 
         pool.with_annotations($crate::common::test_annotations())
-            .prepare_with("SELECT ?", &[])
+            .prepare_with($dialect.prepare_with_select_sql, &[])
             .await
             .unwrap();
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
 
         pool.with_operation("SELECT", "users")
-            .prepare_with("SELECT ?", &[])
+            .prepare_with($dialect.prepare_with_select_sql, &[])
             .await
             .unwrap();
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
@@ -1620,7 +1660,10 @@ macro_rules! test_prepare_with_via_connection {
         let pool = $pool_factory;
 
         let mut conn = pool.acquire().await.unwrap();
-        let _stmt = (&mut conn).prepare_with("SELECT ?", &[]).await.unwrap();
+        let _stmt = (&mut conn)
+            .prepare_with($dialect.prepare_with_select_sql, &[])
+            .await
+            .unwrap();
 
         let spans = tel.spans();
         assert_eq!(spans.len(), 1);
@@ -1628,13 +1671,13 @@ macro_rules! test_prepare_with_via_connection {
         assert!($crate::common::attr(&spans[0], "db.response.returned_rows").is_none());
 
         conn.with_annotations($crate::common::test_annotations())
-            .prepare_with("SELECT ?", &[])
+            .prepare_with($dialect.prepare_with_select_sql, &[])
             .await
             .unwrap();
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
 
         conn.with_operation("SELECT", "users")
-            .prepare_with("SELECT ?", &[])
+            .prepare_with($dialect.prepare_with_select_sql, &[])
             .await
             .unwrap();
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
@@ -1650,15 +1693,18 @@ macro_rules! test_prepare_with_via_transaction {
         let pool = $pool_factory;
 
         let mut tx = pool.begin().await.unwrap();
-        let _stmt = (&mut tx).prepare_with("SELECT ?", &[]).await.unwrap();
+        let _stmt = (&mut tx)
+            .prepare_with($dialect.prepare_with_select_sql, &[])
+            .await
+            .unwrap();
 
         tx.with_annotations($crate::common::test_annotations())
-            .prepare_with("SELECT ?", &[])
+            .prepare_with($dialect.prepare_with_select_sql, &[])
             .await
             .unwrap();
 
         tx.with_operation("SELECT", "users")
-            .prepare_with("SELECT ?", &[])
+            .prepare_with($dialect.prepare_with_select_sql, &[])
             .await
             .unwrap();
 
@@ -2868,6 +2914,346 @@ macro_rules! test_query_text_mode_off_suppresses_sql {
         assert!(
             $crate::common::attr(&spans[0], "db.query.text").is_none(),
             "db.query.text should not be present when QueryTextMode::Off"
+        );
+    }};
+}
+
+// ---------------------------------------------------------------------------
+// Dialect-portable test bodies
+// ---------------------------------------------------------------------------
+
+/// `execute` records the correct `db.response.affected_rows` for a sequence of
+/// INSERT / upsert / UPDATE / DELETE statements. Uses the dialect's `upsert_sql`,
+/// `upsert_affected_rows`, and `string_concat_update_sql` to handle backend-specific
+/// upsert syntax and string-concat operators.
+#[macro_export]
+macro_rules! test_execute_records_affected_rows {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+        $crate::fresh_table!(
+            &pool,
+            "affected_test",
+            &format!("id {}, name {}", $dialect.id_pk_column, $dialect.text_column)
+        );
+        tel.reset();
+
+        // --- Bulk insert via VALUES list ---
+        (&pool)
+            .execute(
+                "INSERT INTO affected_test (id, name) VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')",
+            )
+            .await
+            .unwrap();
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.response.affected_rows"),
+            Some(opentelemetry::Value::I64(3)),
+            "inserting 3 rows should affect 3 rows"
+        );
+        tel.reset();
+
+        // --- Upsert (dialect-specific) ---
+        (&pool).execute($dialect.upsert_sql).await.unwrap();
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.response.affected_rows"),
+            Some(opentelemetry::Value::I64($dialect.upsert_affected_rows)),
+            "upsert affected_rows differs per backend"
+        );
+        tel.reset();
+
+        // --- Update multiple rows (dialect-specific concat) ---
+        (&pool)
+            .execute($dialect.string_concat_update_sql)
+            .await
+            .unwrap();
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.response.affected_rows"),
+            Some(opentelemetry::Value::I64(2)),
+            "updating two rows should affect 2 rows"
+        );
+        tel.reset();
+
+        // --- Delete multiple rows ---
+        (&pool)
+            .execute("DELETE FROM affected_test WHERE id IN (1, 2, 3)")
+            .await
+            .unwrap();
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.response.affected_rows"),
+            Some(opentelemetry::Value::I64(3)),
+            "deleting three rows should affect 3 rows"
+        );
+        tel.reset();
+
+        // --- Delete with no matching rows ---
+        (&pool)
+            .execute("DELETE FROM affected_test WHERE id = 999")
+            .await
+            .unwrap();
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.response.affected_rows"),
+            Some(opentelemetry::Value::I64(0)),
+            "deleting non-existent rows should affect 0 rows"
+        );
+    }};
+}
+
+/// Transaction rollback emits a single CREATE TABLE span and discards the table.
+/// Uses `fresh_table!` so the test is repeatable against the shared postgres / mysql
+/// containers.
+#[macro_export]
+macro_rules! test_transaction_rollback {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let pool = $pool_factory;
+        // Pre-clean any leftover table before installing telemetry, so the rollback test
+        // sees only its own span.
+        let drop_sql = "DROP TABLE IF EXISTS rollback_test";
+        (&pool).execute(drop_sql).await.unwrap();
+
+        let tel = $crate::common::TestTelemetry::install();
+
+        let mut tx = pool.begin().await.unwrap();
+        let create_sql = format!("CREATE TABLE rollback_test (id {})", $dialect.id_pk_column);
+        (&mut tx).execute(create_sql.as_str()).await.unwrap();
+        tx.rollback().await.unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+    }};
+}
+
+/// `QueryTextMode::Obfuscated` rewrites string and numeric literals in `db.query.text`.
+/// The query under test is dialect-neutral (`SELECT 1, 'alice', 3.14`), so the only
+/// dialect input is the raw pool factory used to build a custom-configured pool.
+#[macro_export]
+macro_rules! test_query_text_mode_obfuscated_replaces_literals {
+    ($raw_pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let _ = $dialect;
+        let raw = $raw_pool_factory;
+        let pool = sqlx_otel::PoolBuilder::from(raw)
+            .with_query_text_mode(sqlx_otel::QueryTextMode::Obfuscated)
+            .build();
+
+        let tel = $crate::common::TestTelemetry::install();
+        let _row = (&pool)
+            .fetch_optional("SELECT 1, 'alice', 3.14")
+            .await
+            .unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.query.text"),
+            Some(opentelemetry::Value::String("SELECT ?, ?, ?".into()))
+        );
+    }};
+}
+
+/// `fetch_optional` against an empty table returns `None` and records `returned_rows = 0`.
+/// Uses `fresh_table!` to set up a guaranteed-empty table.
+#[macro_export]
+macro_rules! test_fetch_optional_records_zero_rows {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+        $crate::fresh_table!(
+            &pool,
+            "empty_table",
+            &format!("id {}", $dialect.id_pk_column)
+        );
+        tel.reset();
+
+        let result = (&pool)
+            .fetch_optional("SELECT id FROM empty_table")
+            .await
+            .unwrap();
+        assert!(result.is_none());
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.response.returned_rows"),
+            Some(opentelemetry::Value::I64(0))
+        );
+    }};
+}
+
+/// `sqlx::query(...).bind(...).bind(...).with_annotations(...).fetch_one(&pool)` with a
+/// dialect-specific SELECT that adds two bound `i32` arguments and returns an `i64`.
+#[macro_export]
+macro_rules! test_query_bind_first_then_annotations_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Row as _;
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let row = sqlx::query($dialect.bind_two_sum_sql)
+            .bind(2_i32)
+            .bind(3_i32)
+            .with_annotations($crate::common::test_annotations())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let sum: i64 = row.try_get("sum").unwrap();
+        assert_eq!(sum, 5);
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+    }};
+}
+
+/// Same as `test_query_bind_first_then_annotations_via_pool` but with `with_annotations`
+/// applied before the binds.
+#[macro_export]
+macro_rules! test_query_annotations_first_then_bind_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Row as _;
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let row = sqlx::query($dialect.bind_two_sum_sql)
+            .with_annotations($crate::common::test_annotations())
+            .bind(10_i32)
+            .bind(20_i32)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let sum: i64 = row.try_get("sum").unwrap();
+        assert_eq!(sum, 30);
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+    }};
+}
+
+/// Annotated `execute` against the wrapped pool. Uses `SELECT 1` so the test is
+/// portable; the executor records `affected_rows` regardless of statement kind.
+#[macro_export]
+macro_rules! test_query_execute_with_annotations_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        sqlx::query("SELECT 1")
+            .with_annotations($crate::common::test_annotations())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+        assert!($crate::common::attr(&spans[0], "db.response.affected_rows").is_some());
+    }};
+}
+
+/// Annotated `execute` against `&mut PoolConnection<DB>`.
+#[macro_export]
+macro_rules! test_query_execute_with_annotations_via_connection {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let mut conn = pool.acquire().await.unwrap();
+        sqlx::query("SELECT 1")
+            .with_annotations($crate::common::test_annotations())
+            .execute(&mut conn)
+            .await
+            .unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+    }};
+}
+
+/// Annotated `execute` against `&mut Transaction<'_, DB>`.
+#[macro_export]
+macro_rules! test_query_execute_with_annotations_via_transaction {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SELECT 1")
+            .with_annotations($crate::common::test_annotations())
+            .execute(&mut tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+    }};
+}
+
+/// `with_operation` shorthand attaching the same annotations as the manual
+/// `with_annotations(test_annotations())` call.
+#[macro_export]
+macro_rules! test_query_with_operation_shorthand_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        sqlx::query("SELECT 1")
+            .with_operation("SELECT", "users")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+    }};
+}
+
+/// Annotated `fetch_optional` returning `None`. Uses `SELECT 1 WHERE 1 = 0` to express
+/// the empty-row case without dialect-specific table setup.
+#[macro_export]
+macro_rules! test_query_fetch_optional_with_annotations_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let row = sqlx::query("SELECT 1 WHERE 1 = 0")
+            .with_annotations($crate::common::test_annotations())
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+        assert!(row.is_none());
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.response.returned_rows"),
+            Some(opentelemetry::Value::I64(0))
         );
     }};
 }

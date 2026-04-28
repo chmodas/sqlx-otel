@@ -28,7 +28,7 @@ The wrapper talks to the [`opentelemetry`](https://docs.rs/opentelemetry) API di
 
 ```toml
 [dependencies]
-sqlx-otel = { version = "0.1.0", features = ["postgres", "runtime-tokio"] }
+sqlx-otel = { version = "0.2.0", features = ["postgres", "runtime-tokio"] }
 ```
 
 ```rust

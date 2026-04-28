@@ -7,23 +7,42 @@
 
 Lightweight [SQLx](https://github.com/launchbadge/sqlx) wrapper that emits OpenTelemetry-native spans and metrics following the [database client semantic conventions](https://opentelemetry.io/docs/specs/semconv/database/).
 
-Uses the `opentelemetry` API directly – no `tracing` bridge indirection. Zero-cost when no tracer or meter provider is installed.
+The wrapper talks to the [`opentelemetry`](https://docs.rs/opentelemetry) API directly – there is no `tracing` bridge in the path. That means a smaller dependency tree, attributes set per the spec rather than translated through a second model, and zero cost when no `TracerProvider` or `MeterProvider` is installed.
 
 > Full API documentation, including runnable examples for every public type, is on [docs.rs/sqlx-otel](https://docs.rs/sqlx-otel).
 
+## Highlights
+
+- **Spans on every operation.** Every `sqlx::Executor` method emits a `SpanKind::Client` span carrying `db.system.name`, `db.namespace`, `server.address`/`port`, `db.query.text`, returned/affected row counts, and SQLSTATE / `error.type` on failure.
+- **Operation and pool metrics.** Histograms for query duration and rows returned; histograms, counters, and gauges for pool waits, hold times, timeouts, and connection state.
+- **Caller-supplied annotations.** The library does not parse SQL. Per-query attributes (`db.operation.name`, `db.collection.name`, `db.query.summary`) come from a small annotation API.
+- **Three backends, one API.** Postgres, SQLite, and MySQL behind feature flags; the wrapper API is identical across all three.
+- **Drop-in.** `&Pool<DB>` implements `sqlx::Executor`, so existing call sites keep working unchanged.
+
 ## Quick start
+
+| Feature flag                            | Purpose                                                                  |
+|-----------------------------------------|--------------------------------------------------------------------------|
+| `sqlite` / `postgres` / `mysql`         | Per-backend support – enable at least one.                               |
+| `runtime-tokio` / `runtime-async-std`   | Background polling for `db.client.connection.count`. Optional.           |
+
+```toml
+[dependencies]
+sqlx-otel = { version = "0.1.0", features = ["postgres", "runtime-tokio"] }
+```
 
 ```rust
 use sqlx_otel::PoolBuilder;
 
-// Wrap an existing sqlx pool.
+// Wrap an existing sqlx pool. Connection-level attributes (host, port, namespace)
+// are auto-extracted from the underlying connect options.
 let raw = sqlx::PgPool::connect("postgres://localhost/mydb").await?;
 let pool = PoolBuilder::from(raw).build();
 
 // Use it exactly like a sqlx pool.
-let row = sqlx::query("SELECT 1").fetch_one(&pool).await?;
+let row: (i64,) = sqlx::query_as("SELECT 1").fetch_one(&pool).await?;
 
-// Transactions work with &mut tx.
+// Transactions work via `&mut tx`.
 let mut tx = pool.begin().await?;
 sqlx::query("INSERT INTO users (name) VALUES ($1)")
     .bind("Alice")
@@ -32,34 +51,91 @@ sqlx::query("INSERT INTO users (name) VALUES ($1)")
 tx.commit().await?;
 ```
 
-Every operation through the pool automatically emits an OpenTelemetry span and records metrics. No code changes are required beyond wrapping the pool.
+The wrapper itself is a no-op until your application installs an OpenTelemetry `TracerProvider` and/or `MeterProvider`. Setting that up is the application's responsibility – pair this crate with the [`opentelemetry_sdk`](https://docs.rs/opentelemetry_sdk) (or any other compliant SDK) and your chosen exporter.
 
-## Feature flags
+> **Annotations matter.** Without the per-query annotation API ([below](#per-query-annotations)), spans carry `db.system.name` and `db.query.text` but no `db.operation.name` or `db.collection.name` – the most useful filtering attributes. Plan to annotate your queries.
 
-### Backends
+For a complete runnable end-to-end example – pool wrap, in-memory SDK, queries, and printed telemetry – see [`examples/sqlite.rs`](examples/sqlite.rs):
 
-```toml
-[dependencies]
-sqlx-otel = { version = "0.1.0", features = ["postgres"] }
-# or "sqlite", "mysql"
+```bash
+cargo run --example sqlite --features sqlite,runtime-tokio
 ```
 
-### Runtime (optional)
+## Configuration
 
-Enable a runtime to get `db.client.connection.count` polling via a background task:
+`PoolBuilder` overrides the auto-extracted attributes and tunes capture behaviour:
 
-```toml
-sqlx-otel = { version = "0.1.0", features = ["postgres", "runtime-tokio"] }
-# or "runtime-async-std"
+```rust
+use sqlx_otel::{PoolBuilder, QueryTextMode};
+use std::time::Duration;
+
+let pool = PoolBuilder::from(raw_pool)
+    .with_database("mydb")                  // override db.namespace
+    .with_host("db.example.com")            // override server.address
+    .with_port(5432)                        // override server.port
+    .with_network_peer_address("10.0.0.5")  // network.peer.address (not auto-extracted)
+    .with_network_peer_port(5432)           // network.peer.port    (not auto-extracted)
+    .with_query_text_mode(QueryTextMode::Off)
+    .with_pool_name("my-service-db")        // required for connection pool gauges
+    .with_pool_metrics_interval(Duration::from_secs(5))
+    .build();
 ```
 
-All other metrics work without a runtime feature.
+`with_pool_name` is the switch that activates `db.client.connection.count` polling – the gauge is silent until both a pool name and a runtime feature are present.
 
-## What you get out of the box
+## Per-query annotations
 
-### Spans
+Because the library does not parse SQL, per-query attributes are the caller's responsibility:
 
-Every `Executor` method (`execute`, `fetch`, `fetch_all`, `fetch_one`, `fetch_optional`, `fetch_many`, `execute_many`, `prepare`, `prepare_with`, `describe`) creates a `SpanKind::Client` span with:
+```rust
+use sqlx_otel::{QueryAnnotateExt, QueryAnnotations};
+
+sqlx::query("SELECT * FROM users WHERE id = ?")
+    .bind(42_i64)
+    .with_annotations(QueryAnnotations::new().operation("SELECT").collection("users"))
+    .execute(&pool)
+    .await?;
+
+// Shorthand for the common operation/collection pair:
+sqlx::query("INSERT INTO orders (user_id) VALUES (?)")
+    .with_operation("INSERT", "orders")
+    .bind(7_i64)
+    .execute(&pool)
+    .await?;
+```
+
+The same `with_annotations` / `with_operation` methods are available on:
+
+- The query builders returned by `sqlx::query`, `sqlx::query_as`, and `sqlx::query_scalar` (via the `QueryAnnotateExt` trait).
+- The `Map` returned by `query::map` / `query::try_map`, and the compile-time-validated macro forms (`sqlx::query!()`, `sqlx::query_as!()`, `sqlx::query_scalar!()`) – which expand to either `Query` or `Map`.
+- `Pool`, `PoolConnection`, and `Transaction` directly, via `pool.with_annotations(…).fetch_all(…)`.
+
+When annotations are set, the span name follows the [semantic-convention hierarchy](https://opentelemetry.io/docs/specs/semconv/database/database-spans/#name): `db.query.summary` → `"{operation} {collection}"` → `"{operation}"` → `"{db.system.name}"`.
+
+| Attribute                  | Builder method        |
+|----------------------------|-----------------------|
+| `db.operation.name`        | `.operation()`        |
+| `db.collection.name`       | `.collection()`       |
+| `db.query.summary`         | `.query_summary()`    |
+| `db.stored_procedure.name` | `.stored_procedure()` |
+
+See [`QueryAnnotations`](https://docs.rs/sqlx-otel/latest/sqlx_otel/struct.QueryAnnotations.html) and [`QueryAnnotateExt`](https://docs.rs/sqlx-otel/latest/sqlx_otel/trait.QueryAnnotateExt.html) on docs.rs for the full surface and worked examples.
+
+## Query text modes
+
+| Mode             | Behaviour                                                                                          |
+|------------------|----------------------------------------------------------------------------------------------------|
+| `Full` (default) | Capture the parameterised query as-is. Safe because SQLx uses bind parameters.                     |
+| `Obfuscated`     | Replace literal values (string, numeric, hex, boolean, dollar-quoted) with `?` in `db.query.text`. |
+| `Off`            | Do not capture `db.query.text`.                                                                    |
+
+`Obfuscated` is useful when SQL is constructed via string interpolation rather than bind parameters – the structure of the query is preserved while sensitive literal values are redacted. Comments, identifiers (quoted or otherwise), operators, and `NULL` are kept verbatim.
+
+## Reference
+
+### Span attributes
+
+Set on every `Executor` method (`execute`, `fetch`, `fetch_all`, `fetch_one`, `fetch_optional`, `fetch_many`, `execute_many`, `prepare`, `prepare_with`, `describe`):
 
 | Attribute                   | Source                                          | Condition                   |
 |-----------------------------|-------------------------------------------------|-----------------------------|
@@ -105,123 +181,23 @@ These carry the connection-level attributes (`db.system.name`, `db.namespace`, `
 | `db.client.connection.idle.max`           | Gauge           |      | Maximum idle connections (equals `max` in SQLx)       |
 | `db.client.connection.idle.min`           | Gauge           |      | Configured minimum connections                        |
 
-The first four are recorded inline on every `acquire()` / connection drop – no sampling gaps. `connection.count` is polled by a background task and requires a runtime feature (`runtime-tokio` or `runtime-async-std`). The remaining three are static gauges recorded once at pool construction.
+The first four are recorded inline on every `acquire()` / connection drop – no sampling gaps. `db.client.connection.count` is polled by a background task and requires both a runtime feature (`runtime-tokio` or `runtime-async-std`) and a pool name set via `PoolBuilder::with_pool_name`. The remaining three are static gauges recorded once at pool construction.
 
-## Configuration
+## Backend support
 
-`PoolBuilder` supports overriding auto-extracted attributes and controlling query text capture:
+| Backend    | `db.namespace`     | `server.address` / `server.port` | Notes                              |
+|------------|--------------------|----------------------------------|------------------------------------|
+| `postgres` | Database name      | Yes (from connect URL)           | –                                  |
+| `mysql`    | Database name      | Yes (from connect URL)           | –                                  |
+| `sqlite`   | File path or `:memory:` URI | n/a                     | No host/port; file or in-memory.   |
 
-```rust
-use sqlx_otel::{PoolBuilder, QueryTextMode};
-use std::time::Duration;
+`db.response.returned_rows`, `db.response.affected_rows`, `db.response.status_code`, and `error.type` are recorded uniformly across all three backends.
 
-let pool = PoolBuilder::from(raw_pool)
-    .with_database("mydb")
-    .with_host("db.example.com")
-    .with_port(5432)
-    .with_network_peer_address("10.0.0.5")
-    .with_network_peer_port(5432)
-    .with_query_text_mode(QueryTextMode::Off)
-    .with_pool_name("my-service-db")
-    .with_pool_metrics_interval(Duration::from_secs(5))
-    .build();
-```
+## Compatibility
 
-## Per-query annotations
-
-The library does not parse SQL. Per-query attributes like the operation name and target table are the caller's responsibility via the annotation API:
-
-```rust
-use sqlx_otel::QueryAnnotations;
-
-// Full builder – set whichever fields apply.
-pool.with_annotations(
-        QueryAnnotations::new()
-            .operation("SELECT")
-            .collection("users"))
-    .fetch_all("SELECT * FROM users WHERE active = true")
-    .await?;
-
-// Shorthand for the common two-attribute case.
-pool.with_operation("INSERT", "orders")
-    .execute("INSERT INTO orders (id) VALUES ($1)")
-    .await?;
-```
-
-Annotations work on `Pool`, `PoolConnection`, and `Transaction`. The wrapper borrows the underlying executor for a single operation and is then dropped.
-
-### Query-side annotations
-
-For locality, the same `with_annotations` / `with_operation` methods are also available on the query builder produced by `sqlx::query`, `sqlx::query_as`, and `sqlx::query_scalar`. Bring `QueryAnnotateExt` into scope and chain the annotation directly on the query – binds may appear before or after `with_annotations`:
-
-```rust
-use sqlx_otel::{QueryAnnotateExt, QueryAnnotations};
-
-sqlx::query("SELECT * FROM users WHERE id = ?")
-    .bind(42_i64)
-    .with_annotations(QueryAnnotations::new().operation("SELECT").collection("users"))
-    .execute(&pool)
-    .await?;
-
-// Shorthand and bind-after-annotate also work:
-sqlx::query("INSERT INTO orders (user_id) VALUES (?)")
-    .with_operation("INSERT", "orders")
-    .bind(7_i64)
-    .execute(&pool)
-    .await?;
-```
-
-#### Map and macro queries
-
-`Query::map` / `Query::try_map` return [`sqlx::query::Map<'q, DB, F, A>`](https://docs.rs/sqlx/0.8/sqlx/query/struct.Map.html), which is also supported by the trait. `with_annotations` and `with_operation` may be placed at any of three positions on a hand-written chain:
-
-```rust
-use sqlx_otel::QueryAnnotateExt;
-
-sqlx::query("SELECT id FROM users WHERE name = ?")
-    .bind("alice")
-    .map(|row: sqlx::sqlite::SqliteRow| row.get::<i64, _>("id"))
-    .with_operation("SELECT", "users")
-    .fetch_one(&pool)
-    .await?;
-```
-
-The compile-time validated macro forms (`sqlx::query!()`, `sqlx::query_as!()`, `sqlx::query_scalar!()`) expand to either `Query<'q, DB, _>` (no result columns) or `Map<'q, DB, _, _>` (any shape that decodes columns). Both are covered:
-
-```rust
-sqlx::query_as!(User, "SELECT id, name FROM users WHERE id = ?", 42_i64)
-    .with_operation("SELECT", "users")
-    .fetch_one(&pool)
-    .await?;
-```
-
-Macro queries can only carry annotations *after* the macro returns – the macro itself pre-applies `bind` and `try_map`, so the alternative positions are not reachable by the caller.
-
-When annotations are provided the span name follows the [semantic convention hierarchy](https://opentelemetry.io/docs/specs/semconv/database/database-spans/#name):
-
-1. `db.query.summary` – the caller-supplied summary, e.g. `"users by tenant"`
-2. `"{db.operation.name} {db.collection.name}"` – e.g. `"SELECT users"`
-3. `"{db.operation.name}"` – e.g. `"INSERT"`
-4. `"{db.system.name}"` – fallback when no annotations are set
-
-`db.query.summary` wins unconditionally when set – this is the spec's escape hatch for callers who cannot guarantee a low-cardinality `db.operation.name` (dynamic SQL, complex pipelines).
-
-| Attribute                   | Builder method      |
-|-----------------------------|---------------------|
-| `db.operation.name`         | `.operation()`      |
-| `db.collection.name`        | `.collection()`     |
-| `db.query.summary`          | `.query_summary()`  |
-| `db.stored_procedure.name`  | `.stored_procedure()` |
-
-### Query text modes
-
-| Mode             | Behaviour                                                                                          |
-|------------------|----------------------------------------------------------------------------------------------------|
-| `Full` (default) | Capture the parameterised query as-is. Safe because SQLx uses bind parameters.                     |
-| `Obfuscated`     | Replace literal values (string, numeric, hex, boolean, dollar-quoted) with `?` in `db.query.text`. |
-| `Off`            | Do not capture `db.query.text`.                                                                    |
-
-`Obfuscated` is useful when SQL is constructed via string interpolation rather than bind parameters – the structure of the query is preserved while sensitive literal values are redacted. Comments, identifiers (quoted or otherwise), operators, and `NULL` are kept verbatim.
+- **MSRV:** Rust **1.85.0**.
+- **SQLx:** `0.8.x`.
+- **OpenTelemetry:** `0.31.x`.
 
 ## License
 

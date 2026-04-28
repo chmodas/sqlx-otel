@@ -26,6 +26,12 @@ struct SharedContainer {
 
 static CONTAINER: OnceLock<OnceCell<SharedContainer>> = OnceLock::new();
 
+/// Container ID captured at start-time for use by the [`drop_container`] destructor.
+/// Held in a sibling static (rather than reading from `SharedContainer` at exit)
+/// because the `ContainerAsync` value is itself locked behind a `'static` future and
+/// the destructor must run synchronously without async access.
+static CONTAINER_ID: OnceLock<String> = OnceLock::new();
+
 async fn shared_container() -> &'static SharedContainer {
     CONTAINER
         .get_or_init(OnceCell::new)
@@ -43,6 +49,8 @@ async fn shared_container() -> &'static SharedContainer {
                 .await
                 .expect("starting mysql container");
 
+            let _ = CONTAINER_ID.set(container.id().to_string());
+
             let port = container.get_host_port_ipv4(3306).await.unwrap();
             let url = format!("mysql://root:test@localhost:{port}/testdb");
             SharedContainer {
@@ -51,6 +59,22 @@ async fn shared_container() -> &'static SharedContainer {
             }
         })
         .await
+}
+
+/// Stop and remove the shared container at process exit. Required because the
+/// `ContainerAsync` value lives in a `'static` (`CONTAINER`), so the language never
+/// runs its `Drop`. Using `ctor::dtor` schedules a synchronous shell-out to
+/// `docker rm -f` that fires after `main` returns – equivalent to the per-test
+/// RAII cleanup that existed before the shared-container refactor (commit c29f995).
+#[ctor::dtor]
+fn drop_container() {
+    if let Some(id) = CONTAINER_ID.get() {
+        let _ = std::process::Command::new("docker")
+            .args(["rm", "-f", id.as_str()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
 }
 
 /// Return an instrumented pool connected to the shared container.

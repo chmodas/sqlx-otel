@@ -42,6 +42,7 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dev-dependencies]
+ctor = "0.4"
 opentelemetry_sdk = { version = "0.31", features = ["testing", "rt-tokio"] }
 proptest = "1"
 serial_test = "3"

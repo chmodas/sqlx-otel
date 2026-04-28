@@ -182,7 +182,7 @@ pub fn assert_error_span(span: &SpanData) {
 // PoolConnection<DB>`, `&mut Transaction<'_, DB>`, and the matching `Annotated` /
 // `AnnotatedMut` wrappers, each gated by `for<'a> &'a mut DB::Connection: Executor<'a,
 // Database = DB>`. Test bodies generic over `DB` (with that HRTB declared) trigger
-// trait-resolution overflow on stable rustc — the compiler tries to satisfy the bound
+// trait-resolution overflow on stable rustc – the compiler tries to satisfy the bound
 // against multiple wrapper impls and recurses. Bumping `recursion_limit` does not
 // help; the chain genuinely diverges.
 //
@@ -1895,7 +1895,7 @@ macro_rules! test_describe_records_error {
 macro_rules! test_operation_duration_metric_is_recorded {
     ($pool_factory:expr, $dialect:expr) => {{
         use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
-        let _ = $dialect; // unused — backend doesn't influence the metric shape
+        let _ = $dialect; // unused – backend doesn't influence the metric shape
         let tel = $crate::common::TestTelemetry::install();
         let pool = $pool_factory;
 
@@ -2442,7 +2442,7 @@ macro_rules! test_query_map_position_2_via_pool {
     }};
 }
 
-/// `Query::with_annotations` after `bind` and `map` — last in the pipeline.
+/// `Query::with_annotations` after `bind` and `map` – last in the pipeline.
 #[macro_export]
 macro_rules! test_query_map_position_3_via_pool {
     ($pool_factory:expr, $dialect:expr) => {{

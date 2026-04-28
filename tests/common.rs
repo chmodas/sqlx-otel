@@ -340,3 +340,2534 @@ macro_rules! test_execute_creates_span_via_pool {
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
     }};
 }
+
+/// Counterpart to `test_execute_creates_span_via_pool!` for `&mut PoolConnection<DB>`.
+/// Acquires a connection from the pool, then exercises plain / annotated / shorthand
+/// executes against a freshly created table.
+#[macro_export]
+macro_rules! test_execute_creates_span_via_connection {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+        $crate::fresh_table!(
+            &pool,
+            "exec_conn_test",
+            &format!("id {}", $dialect.id_pk_column)
+        );
+        tel.reset();
+
+        let mut conn = pool.acquire().await.unwrap();
+        (&mut conn)
+            .execute("INSERT INTO exec_conn_test (id) VALUES (1)")
+            .await
+            .unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        assert!($crate::common::attr(&spans[0], "db.response.returned_rows").is_none());
+        assert!($crate::common::attr(&spans[0], "db.response.affected_rows").is_some());
+
+        conn.with_annotations($crate::common::test_annotations())
+            .execute("INSERT INTO exec_conn_test (id) VALUES (2)")
+            .await
+            .unwrap();
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        conn.with_operation("SELECT", "users")
+            .execute("INSERT INTO exec_conn_test (id) VALUES (3)")
+            .await
+            .unwrap();
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+    }};
+}
+
+/// Counterpart to `test_execute_creates_span_via_pool!` for `&mut Transaction<'_, DB>`.
+/// Begins a transaction, runs three executes, and commits before asserting on the
+/// collected spans.
+#[macro_export]
+macro_rules! test_execute_creates_span_via_transaction {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+        $crate::fresh_table!(
+            &pool,
+            "exec_tx_test",
+            &format!("id {}", $dialect.id_pk_column)
+        );
+        tel.reset();
+
+        let mut tx = pool.begin().await.unwrap();
+        (&mut tx)
+            .execute("INSERT INTO exec_tx_test (id) VALUES (1)")
+            .await
+            .unwrap();
+
+        tx.with_annotations($crate::common::test_annotations())
+            .execute("INSERT INTO exec_tx_test (id) VALUES (2)")
+            .await
+            .unwrap();
+
+        tx.with_operation("SELECT", "users")
+            .execute("INSERT INTO exec_tx_test (id) VALUES (3)")
+            .await
+            .unwrap();
+
+        tx.commit().await.unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 3);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        assert!($crate::common::attr(&spans[0], "db.response.returned_rows").is_none());
+        assert!($crate::common::attr(&spans[0], "db.response.affected_rows").is_some());
+        $crate::common::assert_annotated_span(&spans[1], &$dialect);
+        $crate::common::assert_annotated_span(&spans[2], &$dialect);
+    }};
+}
+
+/// `execute` against invalid SQL records an error span. Exercises plain, annotated, and
+/// shorthand annotation paths.
+#[macro_export]
+macro_rules! test_execute_records_error {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let result = (&pool).execute("INVALID SQL GIBBERISH").await;
+        assert!(result.is_err());
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        $crate::common::assert_error_span(&spans[0]);
+        assert!($crate::common::attr(&spans[0], "db.response.returned_rows").is_none());
+
+        let result = pool
+            .with_annotations($crate::common::test_annotations())
+            .execute("INVALID SQL GIBBERISH")
+            .await;
+        assert!(result.is_err());
+        let last = tel.spans().last().unwrap().clone();
+        $crate::common::assert_annotated_span(&last, &$dialect);
+        $crate::common::assert_error_span(&last);
+
+        let result = pool
+            .with_operation("SELECT", "users")
+            .execute("INVALID SQL GIBBERISH")
+            .await;
+        assert!(result.is_err());
+        let last = tel.spans().last().unwrap().clone();
+        $crate::common::assert_annotated_span(&last, &$dialect);
+        $crate::common::assert_error_span(&last);
+    }};
+}
+
+/// `execute_many` over a multi-statement query yields one span per stream consumption.
+/// Exercises plain, annotated, and shorthand paths against the wrapped pool.
+#[macro_export]
+macro_rules! test_execute_many_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use futures::StreamExt as _;
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let mut stream = (&pool).execute_many("SELECT 1; SELECT 2");
+        while stream.next().await.is_some() {}
+        drop(stream);
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.response.returned_rows"),
+            Some(opentelemetry::Value::I64(0))
+        );
+
+        let mut stream = pool
+            .with_annotations($crate::common::test_annotations())
+            .execute_many("SELECT 1; SELECT 2");
+        while stream.next().await.is_some() {}
+        drop(stream);
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        let mut stream = pool
+            .with_operation("SELECT", "users")
+            .execute_many("SELECT 1; SELECT 2");
+        while stream.next().await.is_some() {}
+        drop(stream);
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+    }};
+}
+
+/// `execute_many` against `&mut PoolConnection<DB>`. Same shape as the pool variant
+/// but acquires a connection first.
+#[macro_export]
+macro_rules! test_execute_many_via_connection {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use futures::StreamExt as _;
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut stream = (&mut conn).execute_many("SELECT 1; SELECT 2");
+        while stream.next().await.is_some() {}
+        drop(stream);
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.response.returned_rows"),
+            Some(opentelemetry::Value::I64(0))
+        );
+
+        let mut stream = conn
+            .with_annotations($crate::common::test_annotations())
+            .execute_many("SELECT 1; SELECT 2");
+        while stream.next().await.is_some() {}
+        drop(stream);
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        let mut stream = conn
+            .with_operation("SELECT", "users")
+            .execute_many("SELECT 1; SELECT 2");
+        while stream.next().await.is_some() {}
+        drop(stream);
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+    }};
+}
+
+/// `execute_many` against `&mut Transaction<'_, DB>`. Asserts on all three spans
+/// after commit.
+#[macro_export]
+macro_rules! test_execute_many_via_transaction {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use futures::StreamExt as _;
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let mut tx = pool.begin().await.unwrap();
+        let mut stream = (&mut tx).execute_many("SELECT 1; SELECT 2");
+        while stream.next().await.is_some() {}
+        drop(stream);
+
+        let mut stream = tx
+            .with_annotations($crate::common::test_annotations())
+            .execute_many("SELECT 1; SELECT 2");
+        while stream.next().await.is_some() {}
+        drop(stream);
+
+        let mut stream = tx
+            .with_operation("SELECT", "users")
+            .execute_many("SELECT 1; SELECT 2");
+        while stream.next().await.is_some() {}
+        drop(stream);
+
+        tx.commit().await.unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 3);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.response.returned_rows"),
+            Some(opentelemetry::Value::I64(0))
+        );
+        $crate::common::assert_annotated_span(&spans[1], &$dialect);
+        $crate::common::assert_annotated_span(&spans[2], &$dialect);
+    }};
+}
+
+/// `execute_many` against invalid SQL records an error span on the streaming path.
+#[macro_export]
+macro_rules! test_execute_many_records_error {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use futures::StreamExt as _;
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let mut stream = (&pool).execute_many("INVALID SQL GIBBERISH");
+        let result = stream.next().await;
+        assert!(result.is_some_and(|r| r.is_err()));
+        drop(stream);
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        $crate::common::assert_error_span(&spans[0]);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.response.returned_rows"),
+            Some(opentelemetry::Value::I64(0))
+        );
+
+        let mut stream = pool
+            .with_annotations($crate::common::test_annotations())
+            .execute_many("INVALID SQL GIBBERISH");
+        let result = stream.next().await;
+        assert!(result.is_some_and(|r| r.is_err()));
+        drop(stream);
+        let last = tel.spans().last().unwrap().clone();
+        $crate::common::assert_annotated_span(&last, &$dialect);
+        $crate::common::assert_error_span(&last);
+
+        let mut stream = pool
+            .with_operation("SELECT", "users")
+            .execute_many("INVALID SQL GIBBERISH");
+        let result = stream.next().await;
+        assert!(result.is_some_and(|r| r.is_err()));
+        drop(stream);
+        let last = tel.spans().last().unwrap().clone();
+        $crate::common::assert_annotated_span(&last, &$dialect);
+        $crate::common::assert_error_span(&last);
+    }};
+}
+
+/// `fetch` against the wrapped pool. Streams 2 rows, then exercises annotated and
+/// shorthand variants.
+#[macro_export]
+macro_rules! test_fetch_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use futures::StreamExt as _;
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let mut stream = (&pool).fetch("SELECT 1 UNION ALL SELECT 2");
+        let mut count = 0u64;
+        while stream.next().await.is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 2);
+        drop(stream);
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.response.returned_rows"),
+            Some(opentelemetry::Value::I64(2))
+        );
+
+        let mut stream = pool
+            .with_annotations($crate::common::test_annotations())
+            .fetch("SELECT 1 UNION ALL SELECT 2");
+        while stream.next().await.is_some() {}
+        drop(stream);
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        let mut stream = pool
+            .with_operation("SELECT", "users")
+            .fetch("SELECT 1 UNION ALL SELECT 2");
+        while stream.next().await.is_some() {}
+        drop(stream);
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+    }};
+}
+
+/// `fetch` against `&mut PoolConnection<DB>`.
+#[macro_export]
+macro_rules! test_fetch_via_connection {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use futures::StreamExt as _;
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut stream = (&mut conn).fetch("SELECT 1 UNION ALL SELECT 2");
+        while stream.next().await.is_some() {}
+        drop(stream);
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.response.returned_rows"),
+            Some(opentelemetry::Value::I64(2))
+        );
+
+        let mut stream = conn
+            .with_annotations($crate::common::test_annotations())
+            .fetch("SELECT 1 UNION ALL SELECT 2");
+        while stream.next().await.is_some() {}
+        drop(stream);
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        let mut stream = conn
+            .with_operation("SELECT", "users")
+            .fetch("SELECT 1 UNION ALL SELECT 2");
+        while stream.next().await.is_some() {}
+        drop(stream);
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+    }};
+}
+
+/// `fetch` against `&mut Transaction<'_, DB>`.
+#[macro_export]
+macro_rules! test_fetch_via_transaction {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use futures::StreamExt as _;
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let mut tx = pool.begin().await.unwrap();
+        let mut stream = (&mut tx).fetch("SELECT 1 UNION ALL SELECT 2");
+        while stream.next().await.is_some() {}
+        drop(stream);
+
+        let mut stream = tx
+            .with_annotations($crate::common::test_annotations())
+            .fetch("SELECT 1 UNION ALL SELECT 2");
+        while stream.next().await.is_some() {}
+        drop(stream);
+
+        let mut stream = tx
+            .with_operation("SELECT", "users")
+            .fetch("SELECT 1 UNION ALL SELECT 2");
+        while stream.next().await.is_some() {}
+        drop(stream);
+
+        tx.commit().await.unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 3);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.response.returned_rows"),
+            Some(opentelemetry::Value::I64(2))
+        );
+        $crate::common::assert_annotated_span(&spans[1], &$dialect);
+        $crate::common::assert_annotated_span(&spans[2], &$dialect);
+    }};
+}
+
+/// Verifies that dropping a `fetch` stream after consuming a single row still
+/// finalises and exports the span (with `returned_rows` reflecting the partial read).
+#[macro_export]
+macro_rules! test_fetch_stream_dropped_early_still_records_span {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use futures::StreamExt as _;
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        {
+            let mut stream = (&pool).fetch("SELECT 1 UNION ALL SELECT 2");
+            let _ = stream.next().await;
+        }
+
+        let spans = tel.spans();
+        assert_eq!(
+            spans.len(),
+            1,
+            "span should be recorded even when stream is dropped early"
+        );
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.response.returned_rows"),
+            Some(opentelemetry::Value::I64(1))
+        );
+    }};
+}
+
+/// `fetch` against invalid SQL records an error span on the streaming path.
+#[macro_export]
+macro_rules! test_fetch_stream_records_error {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use futures::StreamExt as _;
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let mut stream = (&pool).fetch("INVALID SQL");
+        let result = stream.next().await;
+        assert!(result.is_some_and(|r| r.is_err()));
+        drop(stream);
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        $crate::common::assert_error_span(&spans[0]);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.response.returned_rows"),
+            Some(opentelemetry::Value::I64(0))
+        );
+
+        let mut stream = pool
+            .with_annotations($crate::common::test_annotations())
+            .fetch("INVALID SQL");
+        let result = stream.next().await;
+        assert!(result.is_some_and(|r| r.is_err()));
+        drop(stream);
+        let last = tel.spans().last().unwrap().clone();
+        $crate::common::assert_annotated_span(&last, &$dialect);
+        $crate::common::assert_error_span(&last);
+
+        let mut stream = pool.with_operation("SELECT", "users").fetch("INVALID SQL");
+        let result = stream.next().await;
+        assert!(result.is_some_and(|r| r.is_err()));
+        drop(stream);
+        let last = tel.spans().last().unwrap().clone();
+        $crate::common::assert_annotated_span(&last, &$dialect);
+        $crate::common::assert_error_span(&last);
+    }};
+}
+
+/// `fetch_many` against the wrapped pool. Returns rows + result rows on a stream.
+#[macro_export]
+macro_rules! test_fetch_many_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use futures::StreamExt as _;
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let mut stream = (&pool).fetch_many("SELECT 1 UNION ALL SELECT 2");
+        let mut rows = 0u64;
+        let mut results = 0u64;
+        while let Some(item) = stream.next().await {
+            match item.unwrap() {
+                sqlx::Either::Left(_) => results += 1,
+                sqlx::Either::Right(_) => rows += 1,
+            }
+        }
+        drop(stream);
+
+        assert_eq!(rows, 2);
+        assert!(results >= 1, "should have at least one QueryResult");
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.response.returned_rows"),
+            Some(opentelemetry::Value::I64(2))
+        );
+
+        let mut stream = pool
+            .with_annotations($crate::common::test_annotations())
+            .fetch_many("SELECT 1 UNION ALL SELECT 2");
+        while stream.next().await.is_some() {}
+        drop(stream);
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        let mut stream = pool
+            .with_operation("SELECT", "users")
+            .fetch_many("SELECT 1 UNION ALL SELECT 2");
+        while stream.next().await.is_some() {}
+        drop(stream);
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+    }};
+}
+
+/// `fetch_many` against `&mut PoolConnection<DB>`.
+#[macro_export]
+macro_rules! test_fetch_many_via_connection {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use futures::StreamExt as _;
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut stream = (&mut conn).fetch_many("SELECT 1 UNION ALL SELECT 2");
+        while stream.next().await.is_some() {}
+        drop(stream);
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.response.returned_rows"),
+            Some(opentelemetry::Value::I64(2))
+        );
+
+        let mut stream = conn
+            .with_annotations($crate::common::test_annotations())
+            .fetch_many("SELECT 1 UNION ALL SELECT 2");
+        while stream.next().await.is_some() {}
+        drop(stream);
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        let mut stream = conn
+            .with_operation("SELECT", "users")
+            .fetch_many("SELECT 1 UNION ALL SELECT 2");
+        while stream.next().await.is_some() {}
+        drop(stream);
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+    }};
+}
+
+/// `fetch_many` against `&mut Transaction<'_, DB>`.
+#[macro_export]
+macro_rules! test_fetch_many_via_transaction {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use futures::StreamExt as _;
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let mut tx = pool.begin().await.unwrap();
+        let mut stream = (&mut tx).fetch_many("SELECT 1 UNION ALL SELECT 2");
+        while stream.next().await.is_some() {}
+        drop(stream);
+
+        let mut stream = tx
+            .with_annotations($crate::common::test_annotations())
+            .fetch_many("SELECT 1 UNION ALL SELECT 2");
+        while stream.next().await.is_some() {}
+        drop(stream);
+
+        let mut stream = tx
+            .with_operation("SELECT", "users")
+            .fetch_many("SELECT 1 UNION ALL SELECT 2");
+        while stream.next().await.is_some() {}
+        drop(stream);
+
+        tx.commit().await.unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 3);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.response.returned_rows"),
+            Some(opentelemetry::Value::I64(2))
+        );
+        $crate::common::assert_annotated_span(&spans[1], &$dialect);
+        $crate::common::assert_annotated_span(&spans[2], &$dialect);
+    }};
+}
+
+/// Verifies that dropping a `fetch_many` stream after consuming a single row still
+/// finalises and exports the span.
+#[macro_export]
+macro_rules! test_fetch_many_dropped_early_still_records_span {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use futures::StreamExt as _;
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        {
+            let mut stream = (&pool).fetch_many("SELECT 1 UNION ALL SELECT 2");
+            let _ = stream.next().await;
+        }
+
+        let spans = tel.spans();
+        assert_eq!(
+            spans.len(),
+            1,
+            "span should be recorded even when stream is dropped early"
+        );
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.response.returned_rows"),
+            Some(opentelemetry::Value::I64(1))
+        );
+    }};
+}
+
+/// `fetch_many` against invalid SQL records an error span on the streaming path.
+#[macro_export]
+macro_rules! test_fetch_many_records_error {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use futures::StreamExt as _;
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let mut stream = (&pool).fetch_many("INVALID SQL GIBBERISH");
+        let result = stream.next().await;
+        assert!(result.is_some_and(|r| r.is_err()));
+        drop(stream);
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        $crate::common::assert_error_span(&spans[0]);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.response.returned_rows"),
+            Some(opentelemetry::Value::I64(0))
+        );
+
+        let mut stream = pool
+            .with_annotations($crate::common::test_annotations())
+            .fetch_many("INVALID SQL GIBBERISH");
+        let result = stream.next().await;
+        assert!(result.is_some_and(|r| r.is_err()));
+        drop(stream);
+        let last = tel.spans().last().unwrap().clone();
+        $crate::common::assert_annotated_span(&last, &$dialect);
+        $crate::common::assert_error_span(&last);
+
+        let mut stream = pool
+            .with_operation("SELECT", "users")
+            .fetch_many("INVALID SQL GIBBERISH");
+        let result = stream.next().await;
+        assert!(result.is_some_and(|r| r.is_err()));
+        drop(stream);
+        let last = tel.spans().last().unwrap().clone();
+        $crate::common::assert_annotated_span(&last, &$dialect);
+        $crate::common::assert_error_span(&last);
+    }};
+}
+
+/// `fetch_all` against the wrapped pool. Returns 3 rows; exercises plain, annotated,
+/// and shorthand variants.
+#[macro_export]
+macro_rules! test_fetch_all_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let rows = (&pool)
+            .fetch_all("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.response.returned_rows"),
+            Some(opentelemetry::Value::I64(3))
+        );
+
+        pool.with_annotations($crate::common::test_annotations())
+            .fetch_all("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3")
+            .await
+            .unwrap();
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        pool.with_operation("SELECT", "users")
+            .fetch_all("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3")
+            .await
+            .unwrap();
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+    }};
+}
+
+/// `fetch_all` against `&mut PoolConnection<DB>`.
+#[macro_export]
+macro_rules! test_fetch_all_via_connection {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let rows = (&mut conn)
+            .fetch_all("SELECT 1 UNION ALL SELECT 2")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.response.returned_rows"),
+            Some(opentelemetry::Value::I64(2))
+        );
+
+        conn.with_annotations($crate::common::test_annotations())
+            .fetch_all("SELECT 1 UNION ALL SELECT 2")
+            .await
+            .unwrap();
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        conn.with_operation("SELECT", "users")
+            .fetch_all("SELECT 1 UNION ALL SELECT 2")
+            .await
+            .unwrap();
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+    }};
+}
+
+/// `fetch_all` against `&mut Transaction<'_, DB>`.
+#[macro_export]
+macro_rules! test_fetch_all_via_transaction {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let mut tx = pool.begin().await.unwrap();
+        let rows = (&mut tx)
+            .fetch_all("SELECT 1 UNION ALL SELECT 2")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+
+        tx.with_annotations($crate::common::test_annotations())
+            .fetch_all("SELECT 1 UNION ALL SELECT 2")
+            .await
+            .unwrap();
+
+        tx.with_operation("SELECT", "users")
+            .fetch_all("SELECT 1 UNION ALL SELECT 2")
+            .await
+            .unwrap();
+
+        tx.commit().await.unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 3);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.response.returned_rows"),
+            Some(opentelemetry::Value::I64(2))
+        );
+        $crate::common::assert_annotated_span(&spans[1], &$dialect);
+        $crate::common::assert_annotated_span(&spans[2], &$dialect);
+    }};
+}
+
+/// `fetch_all` against invalid SQL records an error span.
+#[macro_export]
+macro_rules! test_fetch_all_records_error {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let result = (&pool).fetch_all("INVALID SQL GIBBERISH").await;
+        assert!(result.is_err());
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        $crate::common::assert_error_span(&spans[0]);
+        assert!($crate::common::attr(&spans[0], "db.response.returned_rows").is_none());
+
+        let result = pool
+            .with_annotations($crate::common::test_annotations())
+            .fetch_all("INVALID SQL GIBBERISH")
+            .await;
+        assert!(result.is_err());
+        let last = tel.spans().last().unwrap().clone();
+        $crate::common::assert_annotated_span(&last, &$dialect);
+        $crate::common::assert_error_span(&last);
+
+        let result = pool
+            .with_operation("SELECT", "users")
+            .fetch_all("INVALID SQL GIBBERISH")
+            .await;
+        assert!(result.is_err());
+        let last = tel.spans().last().unwrap().clone();
+        $crate::common::assert_annotated_span(&last, &$dialect);
+        $crate::common::assert_error_span(&last);
+    }};
+}
+
+/// `fetch_one` against the wrapped pool. Returns 1 row.
+#[macro_export]
+macro_rules! test_fetch_one_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let _row = (&pool).fetch_one("SELECT 1").await.unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.response.returned_rows"),
+            Some(opentelemetry::Value::I64(1))
+        );
+
+        pool.with_annotations($crate::common::test_annotations())
+            .fetch_one("SELECT 1")
+            .await
+            .unwrap();
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        pool.with_operation("SELECT", "users")
+            .fetch_one("SELECT 1")
+            .await
+            .unwrap();
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+    }};
+}
+
+/// `fetch_one` against `&mut PoolConnection<DB>`.
+#[macro_export]
+macro_rules! test_fetch_one_via_connection {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let _row = (&mut conn).fetch_one("SELECT 1").await.unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.response.returned_rows"),
+            Some(opentelemetry::Value::I64(1))
+        );
+
+        conn.with_annotations($crate::common::test_annotations())
+            .fetch_one("SELECT 1")
+            .await
+            .unwrap();
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        conn.with_operation("SELECT", "users")
+            .fetch_one("SELECT 1")
+            .await
+            .unwrap();
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+    }};
+}
+
+/// `fetch_one` against `&mut Transaction<'_, DB>`.
+#[macro_export]
+macro_rules! test_fetch_one_via_transaction {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let mut tx = pool.begin().await.unwrap();
+        let _row = (&mut tx).fetch_one("SELECT 1").await.unwrap();
+
+        tx.with_annotations($crate::common::test_annotations())
+            .fetch_one("SELECT 1")
+            .await
+            .unwrap();
+
+        tx.with_operation("SELECT", "users")
+            .fetch_one("SELECT 1")
+            .await
+            .unwrap();
+
+        tx.commit().await.unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 3);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.response.returned_rows"),
+            Some(opentelemetry::Value::I64(1))
+        );
+        $crate::common::assert_annotated_span(&spans[1], &$dialect);
+        $crate::common::assert_annotated_span(&spans[2], &$dialect);
+    }};
+}
+
+/// `fetch_one` against invalid SQL records an error span.
+#[macro_export]
+macro_rules! test_fetch_one_records_error {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let result = (&pool).fetch_one("INVALID SQL GIBBERISH").await;
+        assert!(result.is_err());
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        $crate::common::assert_error_span(&spans[0]);
+        assert!($crate::common::attr(&spans[0], "db.response.returned_rows").is_none());
+
+        let result = pool
+            .with_annotations($crate::common::test_annotations())
+            .fetch_one("INVALID SQL GIBBERISH")
+            .await;
+        assert!(result.is_err());
+        let last = tel.spans().last().unwrap().clone();
+        $crate::common::assert_annotated_span(&last, &$dialect);
+        $crate::common::assert_error_span(&last);
+
+        let result = pool
+            .with_operation("SELECT", "users")
+            .fetch_one("INVALID SQL GIBBERISH")
+            .await;
+        assert!(result.is_err());
+        let last = tel.spans().last().unwrap().clone();
+        $crate::common::assert_annotated_span(&last, &$dialect);
+        $crate::common::assert_error_span(&last);
+    }};
+}
+
+/// `fetch_optional` against the wrapped pool when the query returns one row.
+#[macro_export]
+macro_rules! test_fetch_optional_records_one_row {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let result = (&pool).fetch_optional("SELECT 1").await.unwrap();
+        assert!(result.is_some());
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.response.returned_rows"),
+            Some(opentelemetry::Value::I64(1))
+        );
+
+        pool.with_annotations($crate::common::test_annotations())
+            .fetch_optional("SELECT 1")
+            .await
+            .unwrap();
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        pool.with_operation("SELECT", "users")
+            .fetch_optional("SELECT 1")
+            .await
+            .unwrap();
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+    }};
+}
+
+/// `fetch_optional` against `&mut PoolConnection<DB>`.
+#[macro_export]
+macro_rules! test_fetch_optional_via_connection {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let result = (&mut conn).fetch_optional("SELECT 1").await.unwrap();
+        assert!(result.is_some());
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.response.returned_rows"),
+            Some(opentelemetry::Value::I64(1))
+        );
+
+        conn.with_annotations($crate::common::test_annotations())
+            .fetch_optional("SELECT 1")
+            .await
+            .unwrap();
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        conn.with_operation("SELECT", "users")
+            .fetch_optional("SELECT 1")
+            .await
+            .unwrap();
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+    }};
+}
+
+/// `fetch_optional` against `&mut Transaction<'_, DB>`.
+#[macro_export]
+macro_rules! test_fetch_optional_via_transaction {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let mut tx = pool.begin().await.unwrap();
+        let result = (&mut tx).fetch_optional("SELECT 1").await.unwrap();
+        assert!(result.is_some());
+
+        tx.with_annotations($crate::common::test_annotations())
+            .fetch_optional("SELECT 1")
+            .await
+            .unwrap();
+
+        tx.with_operation("SELECT", "users")
+            .fetch_optional("SELECT 1")
+            .await
+            .unwrap();
+
+        tx.commit().await.unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 3);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.response.returned_rows"),
+            Some(opentelemetry::Value::I64(1))
+        );
+        $crate::common::assert_annotated_span(&spans[1], &$dialect);
+        $crate::common::assert_annotated_span(&spans[2], &$dialect);
+    }};
+}
+
+/// `fetch_optional` against invalid SQL records an error span.
+#[macro_export]
+macro_rules! test_fetch_optional_records_error {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let result = (&pool).fetch_optional("INVALID SQL GIBBERISH").await;
+        assert!(result.is_err());
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        $crate::common::assert_error_span(&spans[0]);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.response.returned_rows"),
+            None
+        );
+
+        let result = pool
+            .with_annotations($crate::common::test_annotations())
+            .fetch_optional("INVALID SQL GIBBERISH")
+            .await;
+        assert!(result.is_err());
+        let last = tel.spans().last().unwrap().clone();
+        $crate::common::assert_annotated_span(&last, &$dialect);
+        $crate::common::assert_error_span(&last);
+
+        let result = pool
+            .with_operation("SELECT", "users")
+            .fetch_optional("INVALID SQL GIBBERISH")
+            .await;
+        assert!(result.is_err());
+        let last = tel.spans().last().unwrap().clone();
+        $crate::common::assert_annotated_span(&last, &$dialect);
+        $crate::common::assert_error_span(&last);
+    }};
+}
+
+// ---------------------------------------------------------------------------
+// prepare / prepare_with / describe
+// ---------------------------------------------------------------------------
+
+/// `prepare` against the wrapped pool. No rows returned; just verifies the span shape.
+#[macro_export]
+macro_rules! test_prepare_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let _stmt = (&pool).prepare("SELECT 1").await.unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        assert!($crate::common::attr(&spans[0], "db.response.returned_rows").is_none());
+
+        pool.with_annotations($crate::common::test_annotations())
+            .prepare("SELECT 1")
+            .await
+            .unwrap();
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        pool.with_operation("SELECT", "users")
+            .prepare("SELECT 1")
+            .await
+            .unwrap();
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+    }};
+}
+
+/// `prepare` against `&mut PoolConnection<DB>`.
+#[macro_export]
+macro_rules! test_prepare_via_connection {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let _stmt = (&mut conn).prepare("SELECT 1").await.unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        assert!($crate::common::attr(&spans[0], "db.response.returned_rows").is_none());
+
+        conn.with_annotations($crate::common::test_annotations())
+            .prepare("SELECT 1")
+            .await
+            .unwrap();
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        conn.with_operation("SELECT", "users")
+            .prepare("SELECT 1")
+            .await
+            .unwrap();
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+    }};
+}
+
+/// `prepare` against `&mut Transaction<'_, DB>`.
+#[macro_export]
+macro_rules! test_prepare_via_transaction {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let mut tx = pool.begin().await.unwrap();
+        let _stmt = (&mut tx).prepare("SELECT 1").await.unwrap();
+
+        tx.with_annotations($crate::common::test_annotations())
+            .prepare("SELECT 1")
+            .await
+            .unwrap();
+
+        tx.with_operation("SELECT", "users")
+            .prepare("SELECT 1")
+            .await
+            .unwrap();
+
+        tx.commit().await.unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 3);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        assert!($crate::common::attr(&spans[0], "db.response.returned_rows").is_none());
+        $crate::common::assert_annotated_span(&spans[1], &$dialect);
+        $crate::common::assert_annotated_span(&spans[2], &$dialect);
+    }};
+}
+
+/// `prepare` against invalid SQL records an error span.
+#[macro_export]
+macro_rules! test_prepare_records_error {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let result = (&mut conn).prepare("INVALID SQL GIBBERISH").await;
+        assert!(result.is_err());
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        $crate::common::assert_error_span(&spans[0]);
+        assert!($crate::common::attr(&spans[0], "db.response.returned_rows").is_none());
+
+        let result = conn
+            .with_annotations($crate::common::test_annotations())
+            .prepare("INVALID SQL GIBBERISH")
+            .await;
+        assert!(result.is_err());
+        let last = tel.spans().last().unwrap().clone();
+        $crate::common::assert_annotated_span(&last, &$dialect);
+        $crate::common::assert_error_span(&last);
+
+        let result = conn
+            .with_operation("SELECT", "users")
+            .prepare("INVALID SQL GIBBERISH")
+            .await;
+        assert!(result.is_err());
+        let last = tel.spans().last().unwrap().clone();
+        $crate::common::assert_annotated_span(&last, &$dialect);
+        $crate::common::assert_error_span(&last);
+    }};
+}
+
+/// `prepare_with` against the wrapped pool.
+#[macro_export]
+macro_rules! test_prepare_with_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let _stmt = (&pool).prepare_with("SELECT ?", &[]).await.unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        assert!($crate::common::attr(&spans[0], "db.response.returned_rows").is_none());
+
+        pool.with_annotations($crate::common::test_annotations())
+            .prepare_with("SELECT ?", &[])
+            .await
+            .unwrap();
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        pool.with_operation("SELECT", "users")
+            .prepare_with("SELECT ?", &[])
+            .await
+            .unwrap();
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+    }};
+}
+
+/// `prepare_with` against `&mut PoolConnection<DB>`.
+#[macro_export]
+macro_rules! test_prepare_with_via_connection {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let _stmt = (&mut conn).prepare_with("SELECT ?", &[]).await.unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        assert!($crate::common::attr(&spans[0], "db.response.returned_rows").is_none());
+
+        conn.with_annotations($crate::common::test_annotations())
+            .prepare_with("SELECT ?", &[])
+            .await
+            .unwrap();
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        conn.with_operation("SELECT", "users")
+            .prepare_with("SELECT ?", &[])
+            .await
+            .unwrap();
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+    }};
+}
+
+/// `prepare_with` against `&mut Transaction<'_, DB>`.
+#[macro_export]
+macro_rules! test_prepare_with_via_transaction {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let mut tx = pool.begin().await.unwrap();
+        let _stmt = (&mut tx).prepare_with("SELECT ?", &[]).await.unwrap();
+
+        tx.with_annotations($crate::common::test_annotations())
+            .prepare_with("SELECT ?", &[])
+            .await
+            .unwrap();
+
+        tx.with_operation("SELECT", "users")
+            .prepare_with("SELECT ?", &[])
+            .await
+            .unwrap();
+
+        tx.commit().await.unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 3);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        assert!($crate::common::attr(&spans[0], "db.response.returned_rows").is_none());
+        $crate::common::assert_annotated_span(&spans[1], &$dialect);
+        $crate::common::assert_annotated_span(&spans[2], &$dialect);
+    }};
+}
+
+/// `prepare_with` against invalid SQL records an error span.
+#[macro_export]
+macro_rules! test_prepare_with_records_error {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let result = (&mut conn).prepare_with("INVALID SQL GIBBERISH", &[]).await;
+        assert!(result.is_err());
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        $crate::common::assert_error_span(&spans[0]);
+        assert!($crate::common::attr(&spans[0], "db.response.returned_rows").is_none());
+
+        let result = conn
+            .with_annotations($crate::common::test_annotations())
+            .prepare_with("INVALID SQL GIBBERISH", &[])
+            .await;
+        assert!(result.is_err());
+        let last = tel.spans().last().unwrap().clone();
+        $crate::common::assert_annotated_span(&last, &$dialect);
+        $crate::common::assert_error_span(&last);
+
+        let result = conn
+            .with_operation("SELECT", "users")
+            .prepare_with("INVALID SQL GIBBERISH", &[])
+            .await;
+        assert!(result.is_err());
+        let last = tel.spans().last().unwrap().clone();
+        $crate::common::assert_annotated_span(&last, &$dialect);
+        $crate::common::assert_error_span(&last);
+    }};
+}
+
+/// `describe` against the wrapped pool.
+#[macro_export]
+macro_rules! test_describe_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let _desc = (&pool).describe("SELECT 1").await.unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        assert!($crate::common::attr(&spans[0], "db.response.returned_rows").is_none());
+
+        pool.with_annotations($crate::common::test_annotations())
+            .describe("SELECT 1")
+            .await
+            .unwrap();
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        pool.with_operation("SELECT", "users")
+            .describe("SELECT 1")
+            .await
+            .unwrap();
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+    }};
+}
+
+/// `describe` against `&mut PoolConnection<DB>`.
+#[macro_export]
+macro_rules! test_describe_via_connection {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let _desc = (&mut conn).describe("SELECT 1").await.unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        assert!($crate::common::attr(&spans[0], "db.response.returned_rows").is_none());
+
+        conn.with_annotations($crate::common::test_annotations())
+            .describe("SELECT 1")
+            .await
+            .unwrap();
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        conn.with_operation("SELECT", "users")
+            .describe("SELECT 1")
+            .await
+            .unwrap();
+        $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+    }};
+}
+
+/// `describe` against `&mut Transaction<'_, DB>`.
+#[macro_export]
+macro_rules! test_describe_via_transaction {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let mut tx = pool.begin().await.unwrap();
+        let _desc = (&mut tx).describe("SELECT 1").await.unwrap();
+
+        tx.with_annotations($crate::common::test_annotations())
+            .describe("SELECT 1")
+            .await
+            .unwrap();
+
+        tx.with_operation("SELECT", "users")
+            .describe("SELECT 1")
+            .await
+            .unwrap();
+
+        tx.commit().await.unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 3);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        assert!($crate::common::attr(&spans[0], "db.response.returned_rows").is_none());
+        $crate::common::assert_annotated_span(&spans[1], &$dialect);
+        $crate::common::assert_annotated_span(&spans[2], &$dialect);
+    }};
+}
+
+/// `describe` against invalid SQL records an error span.
+#[macro_export]
+macro_rules! test_describe_records_error {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let result = (&mut conn).describe("INVALID SQL GIBBERISH").await;
+        assert!(result.is_err());
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_common_span_attributes(&spans[0], $dialect.system);
+        $crate::common::assert_error_span(&spans[0]);
+        assert!($crate::common::attr(&spans[0], "db.response.returned_rows").is_none());
+
+        let result = conn
+            .with_annotations($crate::common::test_annotations())
+            .describe("INVALID SQL GIBBERISH")
+            .await;
+        assert!(result.is_err());
+        let last = tel.spans().last().unwrap().clone();
+        $crate::common::assert_annotated_span(&last, &$dialect);
+        $crate::common::assert_error_span(&last);
+
+        let result = conn
+            .with_operation("SELECT", "users")
+            .describe("INVALID SQL GIBBERISH")
+            .await;
+        assert!(result.is_err());
+        let last = tel.spans().last().unwrap().clone();
+        $crate::common::assert_annotated_span(&last, &$dialect);
+        $crate::common::assert_error_span(&last);
+    }};
+}
+
+// ---------------------------------------------------------------------------
+// Misc: metrics, annotations
+// ---------------------------------------------------------------------------
+
+/// `db.client.operation.duration` histogram is populated for any executed query.
+#[macro_export]
+macro_rules! test_operation_duration_metric_is_recorded {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+        let _ = $dialect; // unused — backend doesn't influence the metric shape
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let _: (i32,) = sqlx::query_as("SELECT 1").fetch_one(&pool).await.unwrap();
+
+        let resource_metrics = tel.metrics();
+        assert!(!resource_metrics.is_empty(), "should have metric data");
+
+        let mut found_duration = false;
+        for rm in &resource_metrics {
+            for sm in rm.scope_metrics() {
+                for metric in sm.metrics() {
+                    if metric.name() == "db.client.operation.duration" {
+                        found_duration = true;
+                        assert_eq!(metric.unit(), "s");
+                        if let AggregatedMetrics::F64(MetricData::Histogram(hist)) = metric.data() {
+                            let dp: Vec<_> = hist.data_points().collect();
+                            assert!(!dp.is_empty(), "histogram should have data points");
+                            assert!(dp[0].count() > 0, "data point count should be > 0");
+                            let has_system = dp[0]
+                                .attributes()
+                                .any(|kv| kv.key.as_str() == "db.system.name");
+                            assert!(has_system, "metric should have db.system.name attribute");
+                        } else {
+                            panic!("db.client.operation.duration should be an f64 histogram");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            found_duration,
+            "db.client.operation.duration metric not found"
+        );
+    }};
+}
+
+/// All four annotation fields populated together; summary drives the span name.
+#[macro_export]
+macro_rules! test_annotation_all_four_fields {
+    ($pool_factory:expr, $dialect:expr) => {{
+        let _ = $dialect; // dialect.system is checked indirectly via assert_common_span_attributes when present
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        pool.with_annotations(
+            sqlx_otel::QueryAnnotations::new()
+                .operation("SELECT")
+                .collection("users")
+                .query_summary("users by id")
+                .stored_procedure("sp_get_users"),
+        )
+        .fetch_all("SELECT 1")
+        .await
+        .unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].name, "users by id");
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.operation.name"),
+            Some(opentelemetry::Value::String("SELECT".into())),
+        );
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.collection.name"),
+            Some(opentelemetry::Value::String("users".into())),
+        );
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.query.summary"),
+            Some(opentelemetry::Value::String("users by id".into())),
+        );
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.stored_procedure.name"),
+            Some(opentelemetry::Value::String("sp_get_users".into())),
+        );
+    }};
+}
+
+/// `db.query.summary` overrides the span name independently of `db.operation.name` and
+/// `db.collection.name`, but does not suppress those attributes.
+#[macro_export]
+macro_rules! test_query_summary_drives_span_name {
+    ($pool_factory:expr, $dialect:expr) => {{
+        let _ = $dialect;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        pool.with_annotations(
+            sqlx_otel::QueryAnnotations::new()
+                .operation("SELECT")
+                .collection("users")
+                .query_summary("users by tenant"),
+        )
+        .fetch_all("SELECT 1")
+        .await
+        .unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].name, "users by tenant");
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.query.summary"),
+            Some(opentelemetry::Value::String("users by tenant".into())),
+        );
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.operation.name"),
+            Some(opentelemetry::Value::String("SELECT".into())),
+        );
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.collection.name"),
+            Some(opentelemetry::Value::String("users".into())),
+        );
+    }};
+}
+
+// ---------------------------------------------------------------------------
+// query-side annotations: sqlx::query(...).with_annotations(...).<method>(executor)
+// ---------------------------------------------------------------------------
+
+/// `sqlx::query(...).with_annotations(...).execute_many(&pool)`.
+#[macro_export]
+macro_rules! test_query_execute_many_with_annotations_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use futures::StreamExt as _;
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        #[allow(deprecated)]
+        let mut stream = sqlx::query("SELECT 1; SELECT 2")
+            .with_annotations($crate::common::test_annotations())
+            .execute_many(&pool)
+            .await;
+        while stream.next().await.is_some() {}
+        drop(stream);
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+    }};
+}
+
+/// `sqlx::query(...).with_annotations(...).fetch(&pool)`.
+#[macro_export]
+macro_rules! test_query_fetch_with_annotations_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use futures::StreamExt as _;
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let mut stream = sqlx::query("SELECT 1 UNION ALL SELECT 2")
+            .with_annotations($crate::common::test_annotations())
+            .fetch(&pool);
+        while stream.next().await.is_some() {}
+        drop(stream);
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.response.returned_rows"),
+            Some(opentelemetry::Value::I64(2))
+        );
+    }};
+}
+
+/// `sqlx::query(...).with_annotations(...).fetch_many(&pool)`.
+#[macro_export]
+macro_rules! test_query_fetch_many_with_annotations_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use futures::StreamExt as _;
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        #[allow(deprecated)]
+        let mut stream = sqlx::query("SELECT 1 UNION ALL SELECT 2")
+            .with_annotations($crate::common::test_annotations())
+            .fetch_many(&pool);
+        while stream.next().await.is_some() {}
+        drop(stream);
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+    }};
+}
+
+/// `sqlx::query(...).with_annotations(...).fetch_all(&pool)`.
+#[macro_export]
+macro_rules! test_query_fetch_all_with_annotations_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let rows = sqlx::query("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3")
+            .with_annotations($crate::common::test_annotations())
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.response.returned_rows"),
+            Some(opentelemetry::Value::I64(3))
+        );
+    }};
+}
+
+/// `sqlx::query(...).with_annotations(...).fetch_one(&pool)`.
+#[macro_export]
+macro_rules! test_query_fetch_one_with_annotations_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let _row = sqlx::query("SELECT 1")
+            .with_annotations($crate::common::test_annotations())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.response.returned_rows"),
+            Some(opentelemetry::Value::I64(1))
+        );
+    }};
+}
+
+/// `sqlx::query("INVALID SQL").with_annotations(...).execute(&pool)` records an error span.
+#[macro_export]
+macro_rules! test_query_execute_with_annotations_records_error {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let result = sqlx::query("INVALID SQL GIBBERISH")
+            .with_annotations($crate::common::test_annotations())
+            .execute(&pool)
+            .await;
+        assert!(result.is_err());
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+        $crate::common::assert_error_span(&spans[0]);
+    }};
+}
+
+/// `sqlx::query_as(...).with_annotations(...).fetch(&pool)`.
+#[macro_export]
+macro_rules! test_query_as_fetch_with_annotations_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use futures::StreamExt as _;
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let mut stream = sqlx::query_as::<_, (i32,)>("SELECT 1 UNION ALL SELECT 2")
+            .with_annotations($crate::common::test_annotations())
+            .fetch(&pool);
+        while stream.next().await.is_some() {}
+        drop(stream);
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+    }};
+}
+
+/// `sqlx::query_as(...).with_annotations(...).fetch_many(&pool)`.
+#[macro_export]
+macro_rules! test_query_as_fetch_many_with_annotations_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use futures::StreamExt as _;
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        #[allow(deprecated)]
+        let mut stream = sqlx::query_as::<_, (i32,)>("SELECT 1 UNION ALL SELECT 2")
+            .with_annotations($crate::common::test_annotations())
+            .fetch_many(&pool);
+        while stream.next().await.is_some() {}
+        drop(stream);
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+    }};
+}
+
+/// `sqlx::query_as(...).with_annotations(...).fetch_all(&pool)`.
+#[macro_export]
+macro_rules! test_query_as_fetch_all_with_annotations_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let rows: Vec<(i32,)> = sqlx::query_as("SELECT 1 UNION ALL SELECT 2")
+            .with_annotations($crate::common::test_annotations())
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+    }};
+}
+
+/// `sqlx::query_as(...).with_annotations(...).fetch_one(&pool)`.
+#[macro_export]
+macro_rules! test_query_as_fetch_one_with_annotations_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let row: (i32,) = sqlx::query_as("SELECT 7")
+            .with_annotations($crate::common::test_annotations())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.0, 7);
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+    }};
+}
+
+/// `sqlx::query_as(...).with_annotations(...).fetch_optional(&pool)` returning none.
+#[macro_export]
+macro_rules! test_query_as_fetch_optional_with_annotations_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let row: Option<(i32,)> = sqlx::query_as("SELECT 1 WHERE 1 = 0")
+            .with_annotations($crate::common::test_annotations())
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+        assert!(row.is_none());
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+    }};
+}
+
+/// `sqlx::query_as("INVALID SQL").with_annotations(...).fetch_one(&pool)` records error.
+#[macro_export]
+macro_rules! test_query_as_fetch_one_with_annotations_records_error {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let result: Result<(i32,), _> = sqlx::query_as("INVALID SQL")
+            .with_annotations($crate::common::test_annotations())
+            .fetch_one(&pool)
+            .await;
+        assert!(result.is_err());
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+        $crate::common::assert_error_span(&spans[0]);
+    }};
+}
+
+/// `sqlx::query_scalar(...).with_annotations(...).fetch(&pool)`.
+#[macro_export]
+macro_rules! test_query_scalar_fetch_with_annotations_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use futures::StreamExt as _;
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let mut stream = sqlx::query_scalar::<_, i32>("SELECT 1 UNION ALL SELECT 2")
+            .with_annotations($crate::common::test_annotations())
+            .fetch(&pool);
+        while stream.next().await.is_some() {}
+        drop(stream);
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+    }};
+}
+
+/// `sqlx::query_scalar(...).with_annotations(...).fetch_many(&pool)`.
+#[macro_export]
+macro_rules! test_query_scalar_fetch_many_with_annotations_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use futures::StreamExt as _;
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        #[allow(deprecated)]
+        let mut stream = sqlx::query_scalar::<_, i32>("SELECT 1 UNION ALL SELECT 2")
+            .with_annotations($crate::common::test_annotations())
+            .fetch_many(&pool);
+        while stream.next().await.is_some() {}
+        drop(stream);
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+    }};
+}
+
+/// `sqlx::query_scalar(...).with_annotations(...).fetch_all(&pool)`.
+#[macro_export]
+macro_rules! test_query_scalar_fetch_all_with_annotations_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let rows: Vec<i32> = sqlx::query_scalar("SELECT 1 UNION ALL SELECT 2")
+            .with_annotations($crate::common::test_annotations())
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, vec![1, 2]);
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+    }};
+}
+
+/// `sqlx::query_scalar(...).with_annotations(...).fetch_one(&pool)`.
+#[macro_export]
+macro_rules! test_query_scalar_fetch_one_with_annotations_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let value: i32 = sqlx::query_scalar("SELECT 42")
+            .with_annotations($crate::common::test_annotations())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(value, 42);
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+    }};
+}
+
+/// `sqlx::query_scalar(...).with_annotations(...).fetch_optional(&pool)` returning none.
+#[macro_export]
+macro_rules! test_query_scalar_fetch_optional_with_annotations_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let value: Option<i32> = sqlx::query_scalar("SELECT 1 WHERE 1 = 0")
+            .with_annotations($crate::common::test_annotations())
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+        assert!(value.is_none());
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+    }};
+}
+
+// ---------------------------------------------------------------------------
+// query-side annotations: Map (Query::map / Query::try_map)
+// ---------------------------------------------------------------------------
+//
+// The closure parameter type for `.map(|row| ...)` is inferred from the surrounding
+// `Query<DB>` chain, so we don't need to spell out per-backend `SqliteRow` / `PgRow` /
+// `MySqlRow`.
+
+/// `Query::with_annotations` before `bind`/`map`. Position-1 in the builder pipeline.
+#[macro_export]
+macro_rules! test_query_map_position_1_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Row as _;
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let value: i32 = sqlx::query("SELECT 7")
+            .with_annotations($crate::common::test_annotations())
+            .map(|row: Row| row.get::<i32, _>(0))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(value, 7);
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+    }};
+}
+
+/// `Query::with_annotations` after `bind`, before `map`.
+#[macro_export]
+macro_rules! test_query_map_position_2_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Row as _;
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let value: i32 = sqlx::query("SELECT 11")
+            .with_annotations($crate::common::test_annotations())
+            .map(|row: Row| row.get::<i32, _>(0))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(value, 11);
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+    }};
+}
+
+/// `Query::with_annotations` after `bind` and `map` — last in the pipeline.
+#[macro_export]
+macro_rules! test_query_map_position_3_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Row as _;
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let value: i32 = sqlx::query("SELECT 13")
+            .map(|row: Row| row.get::<i32, _>(0))
+            .with_annotations($crate::common::test_annotations())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(value, 13);
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+    }};
+}
+
+/// Same as `query_map_position_3` but with `try_map`.
+#[macro_export]
+macro_rules! test_query_try_map_position_3_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Row as _;
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let value: i32 = sqlx::query("SELECT 17")
+            .try_map(|row: Row| Ok(row.get::<i32, _>(0)))
+            .with_annotations($crate::common::test_annotations())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(value, 17);
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+    }};
+}
+
+/// `Query::map` then `with_annotations` then `fetch(&pool)`.
+#[macro_export]
+macro_rules! test_map_fetch_with_annotations_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use futures::StreamExt as _;
+        use sqlx::Row as _;
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let mut stream = sqlx::query("SELECT 1 UNION ALL SELECT 2")
+            .map(|row: Row| row.get::<i32, _>(0))
+            .with_annotations($crate::common::test_annotations())
+            .fetch(&pool);
+        while stream.next().await.is_some() {}
+        drop(stream);
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.response.returned_rows"),
+            Some(opentelemetry::Value::I64(2))
+        );
+    }};
+}
+
+/// `Query::map` then `with_annotations` then `fetch_many(&pool)`.
+#[macro_export]
+macro_rules! test_map_fetch_many_with_annotations_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use futures::StreamExt as _;
+        use sqlx::Row as _;
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        #[allow(deprecated)]
+        let mut stream = sqlx::query("SELECT 1 UNION ALL SELECT 2")
+            .map(|row: Row| row.get::<i32, _>(0))
+            .with_annotations($crate::common::test_annotations())
+            .fetch_many(&pool);
+        while stream.next().await.is_some() {}
+        drop(stream);
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+    }};
+}
+
+/// `Query::map` then `with_annotations` then `fetch_all(&pool)`.
+#[macro_export]
+macro_rules! test_map_fetch_all_with_annotations_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Row as _;
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let rows: Vec<i32> = sqlx::query("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3")
+            .map(|row: Row| row.get::<i32, _>(0))
+            .with_annotations($crate::common::test_annotations())
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, vec![1, 2, 3]);
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+    }};
+}
+
+/// `Query::map` then `with_annotations` then `fetch_one(&pool)`.
+#[macro_export]
+macro_rules! test_map_fetch_one_with_annotations_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Row as _;
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let value: i32 = sqlx::query("SELECT 19")
+            .map(|row: Row| row.get::<i32, _>(0))
+            .with_annotations($crate::common::test_annotations())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(value, 19);
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+    }};
+}
+
+/// `Query::map` then `with_annotations` then `fetch_optional(&pool)`.
+#[macro_export]
+macro_rules! test_map_fetch_optional_with_annotations_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Row as _;
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let value: Option<i32> = sqlx::query("SELECT 1 WHERE 1 = 0")
+            .map(|row: Row| row.get::<i32, _>(0))
+            .with_annotations($crate::common::test_annotations())
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+        assert!(value.is_none());
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+    }};
+}
+
+/// Composing two `map` calls, with annotations between them.
+#[macro_export]
+macro_rules! test_map_compose_after_annotations_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Row as _;
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let value: i32 = sqlx::query("SELECT 5")
+            .map(|row: Row| row.get::<i32, _>(0))
+            .with_annotations($crate::common::test_annotations())
+            .map(|n| n * 2)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(value, 10);
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+    }};
+}
+
+/// Composing `map` then `try_map`, with annotations between.
+#[macro_export]
+macro_rules! test_map_try_map_compose_after_annotations_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Row as _;
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let value: i32 = sqlx::query("SELECT 6")
+            .map(|row: Row| row.get::<i32, _>(0))
+            .with_annotations($crate::common::test_annotations())
+            .try_map(|n: i32| Ok::<_, sqlx::Error>(n + 100))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(value, 106);
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+    }};
+}
+
+/// `Query::map` against `&mut PoolConnection<DB>`.
+#[macro_export]
+macro_rules! test_query_map_with_annotations_via_connection {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Row as _;
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let value: i32 = sqlx::query("SELECT 23")
+            .map(|row: Row| row.get::<i32, _>(0))
+            .with_annotations($crate::common::test_annotations())
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(value, 23);
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+    }};
+}
+
+/// `Query::map` against `&mut Transaction<'_, DB>`.
+#[macro_export]
+macro_rules! test_query_map_with_annotations_via_transaction {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Row as _;
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let mut tx = pool.begin().await.unwrap();
+        let value: i32 = sqlx::query("SELECT 29")
+            .map(|row: Row| row.get::<i32, _>(0))
+            .with_annotations($crate::common::test_annotations())
+            .fetch_one(&mut tx)
+            .await
+            .unwrap();
+        assert_eq!(value, 29);
+        tx.commit().await.unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+    }};
+}
+
+/// `Query::map` against invalid SQL records an error span.
+#[macro_export]
+macro_rules! test_query_map_with_annotations_records_error {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Row as _;
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let result: Result<i32, _> = sqlx::query("INVALID SQL")
+            .map(|row: Row| row.get::<i32, _>(0))
+            .with_annotations($crate::common::test_annotations())
+            .fetch_one(&pool)
+            .await;
+        assert!(result.is_err());
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+        $crate::common::assert_error_span(&spans[0]);
+    }};
+}
+
+/// `try_map` returning a mapper-side error: the database round-trip succeeds, the span
+/// reports success, but the user-visible `Result` carries the mapper's error.
+#[macro_export]
+macro_rules! test_query_try_map_with_annotations_propagates_mapper_error {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx_otel::QueryAnnotateExt as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let result: Result<i64, _> = sqlx::query("SELECT 1")
+            .try_map(|_row: Row| {
+                Err::<i64, _>(sqlx::Error::Decode(
+                    "intentional decode failure".to_string().into(),
+                ))
+            })
+            .with_annotations($crate::common::test_annotations())
+            .fetch_one(&pool)
+            .await;
+        assert!(result.is_err());
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+    }};
+}
+
+// ---------------------------------------------------------------------------
+// PoolBuilder with_* methods
+// ---------------------------------------------------------------------------
+//
+// These macros accept a *raw* pool factory (not the wrapped `Pool<DB>`) so the test
+// body can configure `PoolBuilder` itself with the override under test.
+
+/// `PoolBuilder::with_database` overrides the inferred `db.namespace`.
+#[macro_export]
+macro_rules! test_builder_with_database_overrides_namespace {
+    ($raw_pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let _ = $dialect;
+        let tel = $crate::common::TestTelemetry::install();
+        let raw = $raw_pool_factory;
+        let pool = sqlx_otel::PoolBuilder::from(raw)
+            .with_database("custom_db")
+            .build();
+
+        let _ = (&pool).fetch_optional("SELECT 1").await.unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.namespace"),
+            Some(opentelemetry::Value::String("custom_db".into()))
+        );
+    }};
+}
+
+/// `PoolBuilder::with_host` overrides the inferred `server.address`.
+#[macro_export]
+macro_rules! test_builder_with_host_overrides_server_address {
+    ($raw_pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let _ = $dialect;
+        let tel = $crate::common::TestTelemetry::install();
+        let raw = $raw_pool_factory;
+        let pool = sqlx_otel::PoolBuilder::from(raw)
+            .with_host("custom-host")
+            .build();
+
+        let _ = (&pool).fetch_optional("SELECT 1").await.unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "server.address"),
+            Some(opentelemetry::Value::String("custom-host".into()))
+        );
+    }};
+}
+
+/// `PoolBuilder::with_port` overrides the inferred `server.port`.
+#[macro_export]
+macro_rules! test_builder_with_port_overrides_server_port {
+    ($raw_pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let _ = $dialect;
+        let tel = $crate::common::TestTelemetry::install();
+        let raw = $raw_pool_factory;
+        let pool = sqlx_otel::PoolBuilder::from(raw).with_port(9999).build();
+
+        let _ = (&pool).fetch_optional("SELECT 1").await.unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "server.port"),
+            Some(opentelemetry::Value::I64(9999))
+        );
+    }};
+}
+
+/// `PoolBuilder::with_network_peer_address` populates `network.peer.address`.
+#[macro_export]
+macro_rules! test_builder_with_network_peer_address {
+    ($raw_pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let _ = $dialect;
+        let tel = $crate::common::TestTelemetry::install();
+        let raw = $raw_pool_factory;
+        let pool = sqlx_otel::PoolBuilder::from(raw)
+            .with_network_peer_address("10.0.0.5")
+            .build();
+
+        let _ = (&pool).fetch_optional("SELECT 1").await.unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "network.peer.address"),
+            Some(opentelemetry::Value::String("10.0.0.5".into()))
+        );
+    }};
+}
+
+/// `PoolBuilder::with_network_peer_port` populates `network.peer.port`.
+#[macro_export]
+macro_rules! test_builder_with_network_peer_port {
+    ($raw_pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let _ = $dialect;
+        let tel = $crate::common::TestTelemetry::install();
+        let raw = $raw_pool_factory;
+        let pool = sqlx_otel::PoolBuilder::from(raw)
+            .with_network_peer_port(5433)
+            .build();
+
+        let _ = (&pool).fetch_optional("SELECT 1").await.unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "network.peer.port"),
+            Some(opentelemetry::Value::I64(5433))
+        );
+    }};
+}
+
+/// `Pool::close` and `Pool::is_closed` round-trip.
+#[macro_export]
+macro_rules! test_pool_close_and_is_closed {
+    ($pool_factory:expr, $dialect:expr) => {{
+        let _ = $dialect;
+        let _tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        assert!(!pool.is_closed());
+        pool.close().await;
+        assert!(pool.is_closed());
+    }};
+}
+
+/// `QueryTextMode::Off` suppresses the `db.query.text` attribute.
+#[macro_export]
+macro_rules! test_query_text_mode_off_suppresses_sql {
+    ($raw_pool_factory:expr, $dialect:expr) => {{
+        let tel = $crate::common::TestTelemetry::install();
+        let raw = $raw_pool_factory;
+        let pool = sqlx_otel::PoolBuilder::from(raw)
+            .with_query_text_mode(sqlx_otel::QueryTextMode::Off)
+            .build();
+
+        let _: Option<(i32,)> = sqlx::query_as("SELECT 1")
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].span_kind, opentelemetry::trace::SpanKind::Client);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.system.name"),
+            Some(opentelemetry::Value::String($dialect.system.into()))
+        );
+        assert!($crate::common::attr(&spans[0], "db.namespace").is_some());
+        assert!(
+            $crate::common::attr(&spans[0], "db.query.text").is_none(),
+            "db.query.text should not be present when QueryTextMode::Off"
+        );
+    }};
+}

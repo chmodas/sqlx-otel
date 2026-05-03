@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- Query-side `with_annotations` / `with_operation` now compile inside `Send`-required async contexts (axum handlers, `tokio::spawn`, `tower::Service`-bounded futures). The `AnnotatedQuery::fetch_*` / `execute` forwarders were rewritten from `async fn` into `fn -> impl Future + Send + 'e`, so the HRTB carried by the internal `IntoAnnotatedExecutor` impls no longer leaks into auto-trait inference of an opaque coroutine. Span output is byte-identical to the executor-side surface; metrics emission is unchanged by construction because both surfaces continue to funnel through the same `Annotated<'_, Pool<DB>>` `Executor` impl ([#NN](https://github.com/chmodas/sqlx-otel/pull/31)).
+
 ## [0.2.0] – 2026-04-28
 
 ### Added

@@ -1115,3 +1115,9 @@ async fn query_scalar_macro_fetch_all_with_annotations_via_pool() {
 
     common::assert_one_annotated_span(&tel, &common::POSTGRES_DIALECT);
 }
+
+#[tokio::test]
+#[serial]
+async fn executor_side_query_side_parity_via_pool() {
+    test_executor_side_query_side_parity_via_pool!(test_pool().await, common::POSTGRES_DIALECT);
+}

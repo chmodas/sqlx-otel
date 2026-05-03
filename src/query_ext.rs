@@ -130,6 +130,33 @@ pub trait QueryAnnotateExt: sealed::Sealed + Sized {
     ///
     /// Equivalent to
     /// `self.with_annotations(QueryAnnotations::new().operation(op).collection(coll))`.
+    ///
+    /// The returned future is `Send` and may be used inside a `Send`-required async context
+    /// (e.g. `tokio::spawn`, axum handlers, `tower::Service`-bounded futures). The example
+    /// below intentionally swallows the inner `sqlx::Error` via `.ok().flatten()` – the
+    /// point is to exercise the `Send` contract on the spawned future at compile time, not
+    /// to demonstrate error handling. A non-`Send` future would fail to compile here, since
+    /// `tokio::spawn` requires `Send`.
+    ///
+    /// ```no_run
+    /// # #[cfg(feature = "sqlite")]
+    /// # async fn _doc() -> Result<(), Box<dyn std::error::Error>> {
+    /// # use sqlx_otel::PoolBuilder;
+    /// use sqlx_otel::QueryAnnotateExt as _;
+    /// # let pool: sqlx_otel::Pool<sqlx::Sqlite> =
+    /// #     PoolBuilder::from(sqlx::SqlitePool::connect(":memory:").await?).build();
+    ///
+    /// tokio::spawn(async move {
+    ///     let _: Option<(i32,)> = sqlx::query_as("SELECT 1")
+    ///         .with_operation("SELECT", "users")
+    ///         .fetch_optional(&pool)
+    ///         .await
+    ///         .ok()
+    ///         .flatten();
+    /// })
+    /// .await?;
+    /// # Ok(()) }
+    /// ```
     fn with_operation(
         self,
         operation: impl Into<String>,
@@ -215,9 +242,17 @@ impl<Q> std::fmt::Debug for AnnotatedQuery<Q> {
 /// `impl_executor!` already supports (`&Pool`, `&mut PoolConnection`, `&mut Transaction`),
 /// each producing the matching [`Annotated`] / [`AnnotatedMut`] wrapper.
 ///
-/// The HRTB `for<'a> &'a mut DB::Connection: sqlx::Executor<'a, Database = DB>` lives on
-/// each individual impl rather than on the trait, to avoid trait-resolution recursion when
-/// the user's executor type is itself constructed via the same HRTB.
+/// The HRTB `for<'a> &'a mut DB::Connection: sqlx::Executor<'a, Database = DB>` lives on each
+/// individual impl rather than on the trait, to avoid trait-resolution recursion when the
+/// user's executor type is itself constructed via the same HRTB. This bound used to leak into
+/// the `Send` auto-trait inference of `AnnotatedQuery::fetch_*` / `execute` when those methods
+/// were `async fn` – the resulting opaque coroutine carried a region-quantified obligation
+/// that rustc could not always discharge, which broke query-side annotation inside contexts
+/// requiring `Send` (`tokio::spawn`, axum handlers). The fix is in the *callers* of this
+/// trait, not the trait itself: the forwarders on `AnnotatedQuery` are written as
+/// `fn(...) -> impl Future + Send + 'e` returning `SQLx`'s own future directly, so no
+/// coroutine forms on this crate's side and the `Send` check delegates to the underlying
+/// `SQLx` future, which is already `Send`-clean for concrete backends.
 ///
 /// Users do not call this trait directly – they pass `&pool`, `&mut conn`, or `&mut tx` to
 /// [`AnnotatedQuery::execute`] / `fetch*` and the trait dispatches internally. The trait is
@@ -360,7 +395,10 @@ macro_rules! impl_annotated_query_fetch_forwarders {
         ///
         /// Returns any [`sqlx::Error`] surfaced by the underlying driver, including row
         /// decoding errors.
-        pub async fn fetch_all<'e, E>(self, executor: E) -> Result<Vec<$row>, sqlx::Error>
+        pub fn fetch_all<'e, E>(
+            self,
+            executor: E,
+        ) -> impl 'e + Send + std::future::Future<Output = Result<Vec<$row>, sqlx::Error>>
         where
             'q: 'e,
             A: 'e,
@@ -368,7 +406,7 @@ macro_rules! impl_annotated_query_fetch_forwarders {
             E: 'e + IntoAnnotatedExecutor<'e, DB>,
         {
             let wrapper = executor.into_annotated(self.annotations);
-            self.inner.fetch_all(wrapper).await
+            self.inner.fetch_all(wrapper)
         }
 
         /// Return exactly one row, erroring if none or more than one.
@@ -377,7 +415,10 @@ macro_rules! impl_annotated_query_fetch_forwarders {
         ///
         /// Returns [`sqlx::Error::RowNotFound`] when the result set is empty, or any other
         /// [`sqlx::Error`] surfaced by the underlying driver.
-        pub async fn fetch_one<'e, E>(self, executor: E) -> Result<$row, sqlx::Error>
+        pub fn fetch_one<'e, E>(
+            self,
+            executor: E,
+        ) -> impl 'e + Send + std::future::Future<Output = Result<$row, sqlx::Error>>
         where
             'q: 'e,
             A: 'e,
@@ -385,7 +426,7 @@ macro_rules! impl_annotated_query_fetch_forwarders {
             E: 'e + IntoAnnotatedExecutor<'e, DB>,
         {
             let wrapper = executor.into_annotated(self.annotations);
-            self.inner.fetch_one(wrapper).await
+            self.inner.fetch_one(wrapper)
         }
 
         /// Return at most one row.
@@ -393,10 +434,10 @@ macro_rules! impl_annotated_query_fetch_forwarders {
         /// # Errors
         ///
         /// Returns any [`sqlx::Error`] surfaced by the underlying driver.
-        pub async fn fetch_optional<'e, E>(
+        pub fn fetch_optional<'e, E>(
             self,
             executor: E,
-        ) -> Result<Option<$row>, sqlx::Error>
+        ) -> impl 'e + Send + std::future::Future<Output = Result<Option<$row>, sqlx::Error>>
         where
             'q: 'e,
             A: 'e,
@@ -404,7 +445,7 @@ macro_rules! impl_annotated_query_fetch_forwarders {
             E: 'e + IntoAnnotatedExecutor<'e, DB>,
         {
             let wrapper = executor.into_annotated(self.annotations);
-            self.inner.fetch_optional(wrapper).await
+            self.inner.fetch_optional(wrapper)
         }
     };
 }
@@ -442,14 +483,17 @@ where
     /// # Errors
     ///
     /// Returns any [`sqlx::Error`] surfaced by the underlying driver.
-    pub async fn execute<'e, E>(self, executor: E) -> Result<DB::QueryResult, sqlx::Error>
+    pub fn execute<'e, E>(
+        self,
+        executor: E,
+    ) -> impl 'e + Send + std::future::Future<Output = Result<DB::QueryResult, sqlx::Error>>
     where
         'q: 'e,
         A: 'e,
         E: 'e + IntoAnnotatedExecutor<'e, DB>,
     {
         let wrapper = executor.into_annotated(self.annotations);
-        self.inner.execute(wrapper).await
+        self.inner.execute(wrapper)
     }
 
     /// Execute multiple statements separated by `;` and return their results as a stream.
@@ -458,17 +502,17 @@ where
     /// existing executor-side surface. Only `Query` exposes this method – `QueryAs`,
     /// `QueryScalar`, and `Map` have no `execute_many` upstream.
     #[allow(deprecated)]
-    pub async fn execute_many<'e, E>(
+    pub fn execute_many<'e, E>(
         self,
         executor: E,
-    ) -> BoxStream<'e, Result<DB::QueryResult, sqlx::Error>>
+    ) -> impl 'e + Send + std::future::Future<Output = BoxStream<'e, Result<DB::QueryResult, sqlx::Error>>>
     where
         'q: 'e,
         A: 'e,
         E: 'e + IntoAnnotatedExecutor<'e, DB>,
     {
         let wrapper = executor.into_annotated(self.annotations);
-        self.inner.execute_many(wrapper).await
+        self.inner.execute_many(wrapper)
     }
 
     /// Map each row to another type. Mirrors [`sqlx::query::Query::map`] and carries the

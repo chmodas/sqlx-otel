@@ -323,6 +323,50 @@ pub fn assert_one_annotated_span(tel: &TestTelemetry, dialect: &Dialect) {
     assert_annotated_span(&spans[0], dialect);
 }
 
+/// Compare two single-span exporter snapshots and assert that the executor-side and
+/// query-side annotation surfaces emitted byte-identical span data on the dimensions
+/// users observe (name, kind, and the full annotation/connection attribute set). The
+/// `case` argument is included in failure messages so the cause is obvious when one of
+/// several builder-family pairs in a parity test fails.
+pub fn assert_span_parity(case: &str, exec_spans: &[SpanData], query_spans: &[SpanData]) {
+    assert_eq!(
+        exec_spans.len(),
+        1,
+        "{case}: executor-side emitted {} spans, expected 1",
+        exec_spans.len()
+    );
+    assert_eq!(
+        query_spans.len(),
+        1,
+        "{case}: query-side emitted {} spans, expected 1",
+        query_spans.len()
+    );
+    let exec = &exec_spans[0];
+    let query = &query_spans[0];
+
+    assert_eq!(exec.name, query.name, "{case}: span name differs");
+    assert_eq!(exec.span_kind, query.span_kind, "{case}: span kind differs");
+    for key in &[
+        "db.system.name",
+        "db.operation.name",
+        "db.collection.name",
+        "db.query.text",
+        "db.query.summary",
+        "db.namespace",
+        "db.stored_procedure.name",
+        "server.address",
+        "server.port",
+        "db.response.affected_rows",
+        "db.response.returned_rows",
+    ] {
+        assert_eq!(
+            attr(exec, key),
+            attr(query, key),
+            "{case}: attribute `{key}` differs across executor-side vs query-side",
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Parameterised test bodies (macro_rules)
 // ---------------------------------------------------------------------------
@@ -2213,13 +2257,28 @@ macro_rules! test_query_as_fetch_all_with_annotations_via_pool {
             .unwrap();
         assert_eq!(rows.len(), 2);
 
+        let pool_clone = pool.clone();
+        let rows: Vec<(i32,)> = tokio::spawn(async move {
+            sqlx::query_as("SELECT 1 UNION ALL SELECT 2")
+                .with_annotations($crate::common::test_annotations())
+                .fetch_all(&pool_clone)
+                .await
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+
         let spans = tel.spans();
-        assert_eq!(spans.len(), 1);
-        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+        assert_eq!(spans.len(), 2);
+        for span in &spans {
+            $crate::common::assert_annotated_span(span, &$dialect);
+        }
     }};
 }
 
-/// `sqlx::query_as(...).with_annotations(...).fetch_one(&pool)`.
+/// `sqlx::query_as(...).with_annotations(...).fetch_one(&pool)`. Runs inline and inside
+/// `tokio::spawn` to exercise the `Send`-required path.
 #[macro_export]
 macro_rules! test_query_as_fetch_one_with_annotations_via_pool {
     ($pool_factory:expr, $dialect:expr) => {{
@@ -2234,13 +2293,28 @@ macro_rules! test_query_as_fetch_one_with_annotations_via_pool {
             .unwrap();
         assert_eq!(row.0, 7);
 
+        let pool_clone = pool.clone();
+        let row: (i32,) = tokio::spawn(async move {
+            sqlx::query_as("SELECT 7")
+                .with_annotations($crate::common::test_annotations())
+                .fetch_one(&pool_clone)
+                .await
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(row.0, 7);
+
         let spans = tel.spans();
-        assert_eq!(spans.len(), 1);
-        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+        assert_eq!(spans.len(), 2);
+        for span in &spans {
+            $crate::common::assert_annotated_span(span, &$dialect);
+        }
     }};
 }
 
 /// `sqlx::query_as(...).with_annotations(...).fetch_optional(&pool)` returning none.
+/// Runs inline and inside `tokio::spawn` to exercise the `Send`-required path.
 #[macro_export]
 macro_rules! test_query_as_fetch_optional_with_annotations_via_pool {
     ($pool_factory:expr, $dialect:expr) => {{
@@ -2255,9 +2329,23 @@ macro_rules! test_query_as_fetch_optional_with_annotations_via_pool {
             .unwrap();
         assert!(row.is_none());
 
+        let pool_clone = pool.clone();
+        let row: Option<(i32,)> = tokio::spawn(async move {
+            sqlx::query_as("SELECT 1 WHERE 1 = 0")
+                .with_annotations($crate::common::test_annotations())
+                .fetch_optional(&pool_clone)
+                .await
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(row.is_none());
+
         let spans = tel.spans();
-        assert_eq!(spans.len(), 1);
-        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+        assert_eq!(spans.len(), 2);
+        for span in &spans {
+            $crate::common::assert_annotated_span(span, &$dialect);
+        }
     }};
 }
 
@@ -3147,7 +3235,11 @@ macro_rules! test_query_annotations_first_then_bind_via_pool {
 }
 
 /// Annotated `execute` against the wrapped pool. Uses `SELECT 1` so the test is
-/// portable; the executor records `affected_rows` regardless of statement kind.
+/// portable; the executor records `affected_rows` regardless of statement kind. The
+/// macro runs the call twice – once inline (documents the simplest usage) and once
+/// inside `tokio::spawn` (compile-time proof that the returned future is `Send`, the
+/// contract that broke under v0.2.0's `async fn` shape and was restored by converting
+/// the forwarder to `fn -> impl Future + Send + 'e`).
 #[macro_export]
 macro_rules! test_query_execute_with_annotations_via_pool {
     ($pool_factory:expr, $dialect:expr) => {{
@@ -3161,14 +3253,29 @@ macro_rules! test_query_execute_with_annotations_via_pool {
             .await
             .unwrap();
 
+        let pool_clone = pool.clone();
+        tokio::spawn(async move {
+            sqlx::query("SELECT 1")
+                .with_annotations($crate::common::test_annotations())
+                .execute(&pool_clone)
+                .await
+                .unwrap();
+        })
+        .await
+        .unwrap();
+
         let spans = tel.spans();
-        assert_eq!(spans.len(), 1);
-        $crate::common::assert_annotated_span(&spans[0], &$dialect);
-        assert!($crate::common::attr(&spans[0], "db.response.affected_rows").is_some());
+        assert_eq!(spans.len(), 2);
+        for span in &spans {
+            $crate::common::assert_annotated_span(span, &$dialect);
+            assert!($crate::common::attr(span, "db.response.affected_rows").is_some());
+        }
     }};
 }
 
-/// Annotated `execute` against `&mut PoolConnection<DB>`.
+/// Annotated `execute` against `&mut PoolConnection<DB>`. Runs inline and inside
+/// `tokio::spawn` to exercise the `Send`-required path over the `&mut PoolConnection`
+/// borrow.
 #[macro_export]
 macro_rules! test_query_execute_with_annotations_via_connection {
     ($pool_factory:expr, $dialect:expr) => {{
@@ -3182,14 +3289,31 @@ macro_rules! test_query_execute_with_annotations_via_connection {
             .execute(&mut conn)
             .await
             .unwrap();
+        drop(conn);
+
+        let pool_clone = pool.clone();
+        tokio::spawn(async move {
+            let mut conn = pool_clone.acquire().await.unwrap();
+            sqlx::query("SELECT 1")
+                .with_annotations($crate::common::test_annotations())
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        })
+        .await
+        .unwrap();
 
         let spans = tel.spans();
-        assert_eq!(spans.len(), 1);
-        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+        assert_eq!(spans.len(), 2);
+        for span in &spans {
+            $crate::common::assert_annotated_span(span, &$dialect);
+        }
     }};
 }
 
-/// Annotated `execute` against `&mut Transaction<'_, DB>`.
+/// Annotated `execute` against `&mut Transaction<'_, DB>`. Runs inline and inside
+/// `tokio::spawn` to exercise the `Send`-required path over the `&mut Transaction`
+/// borrow.
 #[macro_export]
 macro_rules! test_query_execute_with_annotations_via_transaction {
     ($pool_factory:expr, $dialect:expr) => {{
@@ -3205,9 +3329,24 @@ macro_rules! test_query_execute_with_annotations_via_transaction {
             .unwrap();
         tx.commit().await.unwrap();
 
+        let pool_clone = pool.clone();
+        tokio::spawn(async move {
+            let mut tx = pool_clone.begin().await.unwrap();
+            sqlx::query("SELECT 1")
+                .with_annotations($crate::common::test_annotations())
+                .execute(&mut tx)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+        })
+        .await
+        .unwrap();
+
         let spans = tel.spans();
-        assert_eq!(spans.len(), 1);
-        $crate::common::assert_annotated_span(&spans[0], &$dialect);
+        assert_eq!(spans.len(), 2);
+        for span in &spans {
+            $crate::common::assert_annotated_span(span, &$dialect);
+        }
     }};
 }
 
@@ -3255,5 +3394,76 @@ macro_rules! test_query_fetch_optional_with_annotations_via_pool {
             $crate::common::attr(&spans[0], "db.response.returned_rows"),
             Some(opentelemetry::Value::I64(0))
         );
+    }};
+}
+
+/// Parity assertion: executor-side and query-side annotation surfaces must produce
+/// byte-identical span attributes (per [`crate::query_ext`]'s "Choosing between
+/// executor-side and query-side" doc, the two surfaces are documented as semantically
+/// equivalent). Both code paths funnel through the same `Annotated<'_, Pool<DB>>`
+/// `Executor` impl; if a future refactor diverges them, this test fails. Exercises all
+/// three builder families (`query`, `query_as`, `query_scalar`) so a regression in any
+/// one of them is caught.
+#[macro_export]
+macro_rules! test_executor_side_query_side_parity_via_pool {
+    ($pool_factory:expr, $dialect:expr) => {{
+        use sqlx_otel::QueryAnnotateExt as _;
+        let pool = $pool_factory;
+        let tel = $crate::common::TestTelemetry::install();
+
+        // --- query (execute) -------------------------------------------------
+        let _ = sqlx::query("SELECT 1")
+            .execute(pool.with_operation("SELECT", "users"))
+            .await
+            .unwrap();
+        let exec_spans = tel.spans();
+        tel.reset();
+
+        let _ = sqlx::query("SELECT 1")
+            .with_operation("SELECT", "users")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let query_spans = tel.spans();
+        tel.reset();
+
+        $crate::common::assert_span_parity("query::execute", &exec_spans, &query_spans);
+
+        // --- query_as (fetch_optional) ---------------------------------------
+        let _: Option<(i32,)> = sqlx::query_as("SELECT 1")
+            .fetch_optional(pool.with_operation("SELECT", "users"))
+            .await
+            .unwrap();
+        let exec_spans = tel.spans();
+        tel.reset();
+
+        let _: Option<(i32,)> = sqlx::query_as("SELECT 1")
+            .with_operation("SELECT", "users")
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+        let query_spans = tel.spans();
+        tel.reset();
+
+        $crate::common::assert_span_parity("query_as::fetch_optional", &exec_spans, &query_spans);
+
+        // --- query_scalar (fetch_one) ----------------------------------------
+        let _: i32 = sqlx::query_scalar("SELECT 1")
+            .fetch_one(pool.with_operation("SELECT", "users"))
+            .await
+            .unwrap();
+        let exec_spans = tel.spans();
+        tel.reset();
+
+        let _: i32 = sqlx::query_scalar("SELECT 1")
+            .with_operation("SELECT", "users")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let query_spans = tel.spans();
+
+        $crate::common::assert_span_parity("query_scalar::fetch_one", &exec_spans, &query_spans);
+
+        let _ = $dialect;
     }};
 }

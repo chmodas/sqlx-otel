@@ -1051,3 +1051,9 @@ async fn query_span_inherits_parent_context_streaming() {
         "stream query span parent_span_id should equal the outer span's span_id",
     );
 }
+
+#[tokio::test]
+#[serial]
+async fn executor_side_query_side_parity_via_pool() {
+    test_executor_side_query_side_parity_via_pool!(test_pool().await, common::SQLITE_DIALECT);
+}

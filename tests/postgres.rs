@@ -588,6 +588,21 @@ async fn query_text_mode_obfuscated_replaces_literals() {
     test_query_text_mode_obfuscated_replaces_literals!(raw_pool().await, common::POSTGRES_DIALECT);
 }
 
+#[tokio::test]
+#[serial]
+async fn query_text_mode_full_compacts_multiline_sql() {
+    test_query_text_mode_full_compacts_multiline_sql!(raw_pool().await, common::POSTGRES_DIALECT);
+}
+
+#[tokio::test]
+#[serial]
+async fn query_text_mode_obfuscated_compacts_multiline_sql() {
+    test_query_text_mode_obfuscated_compacts_multiline_sql!(
+        raw_pool().await,
+        common::POSTGRES_DIALECT
+    );
+}
+
 // ===========================================================================
 // Annotations
 // ===========================================================================

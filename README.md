@@ -129,11 +129,27 @@ See [`QueryAnnotations`](https://docs.rs/sqlx-otel/latest/sqlx_otel/struct.Query
 
 | Mode             | Behaviour                                                                                          |
 |------------------|----------------------------------------------------------------------------------------------------|
-| `Full` (default) | Capture the parameterised query as-is. Safe because SQLx uses bind parameters.                     |
+| `Full` (default) | Capture the parameterised query. Safe because SQLx uses bind parameters.                           |
 | `Obfuscated`     | Replace literal values (string, numeric, hex, boolean, dollar-quoted) with `?` in `db.query.text`. |
 | `Off`            | Do not capture `db.query.text`.                                                                    |
 
 `Obfuscated` is useful when SQL is constructed via string interpolation rather than bind parameters – the structure of the query is preserved while sensitive literal values are redacted. Comments, identifiers (quoted or otherwise), operators, and `NULL` are kept verbatim.
+
+Both `Full` and `Obfuscated` collapse inter-token whitespace runs to a single space and trim leading/trailing whitespace before emitting `db.query.text`, so multi-line SQL written for source-level readability renders cleanly in OTel exports. Whitespace **inside** string literals, quoted identifiers, dollar-quoted bodies, and comments is preserved verbatim. For example, an UPSERT split across multiple lines for readability:
+
+```sql
+INSERT INTO items (id, name, qty)
+       VALUES (?1, ?2, ?3)
+       ON CONFLICT (id) DO UPDATE SET
+           name = excluded.name,
+           qty  = excluded.qty
+```
+
+emits as a single readable line in `db.query.text`:
+
+```
+INSERT INTO items (id, name, qty) VALUES (?1, ?2, ?3) ON CONFLICT (id) DO UPDATE SET name = excluded.name, qty = excluded.qty
+```
 
 ## Reference
 
@@ -152,7 +168,7 @@ Set on every `Executor` method (`execute`, `fetch`, `fetch_all`, `fetch_one`, `f
 | `network.protocol.name`          | Wire protocol; defaults per backend, overridable on builder | When applicable             |
 | `network.transport`              | OSI L4 transport (`"tcp"`, `"unix"`, `"pipe"`, `"inproc"`)  | When set via builder        |
 | `db.client.connection.pool.name` | Pool identifier set via `with_pool_name`                    | When set via builder        |
-| `db.query.text`                  | The SQL query string                                        | Unless `QueryTextMode::Off` |
+| `db.query.text`                  | The SQL query string with inter-token whitespace collapsed  | Unless `QueryTextMode::Off` |
 | `db.operation.name`              | Database operation (e.g. `SELECT`)                          | When annotated              |
 | `db.collection.name`             | Target table or collection                                  | When annotated              |
 | `db.query.summary`               | Low-cardinality query summary                               | When annotated              |

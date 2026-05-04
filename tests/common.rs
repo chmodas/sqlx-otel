@@ -102,6 +102,65 @@ pub fn metric_attr(
         .map(|kv| kv.value.clone())
 }
 
+/// Find a single histogram data point on the named metric whose attribute set contains
+/// the given expected key/value pairs. Returns `None` if the metric is absent or no data
+/// point matches. Generalises [`find_duration_data_point_with`] to any histogram (e.g.
+/// `db.client.response.affected_rows`).
+pub fn find_histogram_data_point_with(
+    metrics: &[opentelemetry_sdk::metrics::data::ResourceMetrics],
+    metric_name: &str,
+    expected: &[(&str, &str)],
+) -> Option<opentelemetry_sdk::metrics::data::HistogramDataPoint<f64>> {
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+    for rm in metrics {
+        for sm in rm.scope_metrics() {
+            for metric in sm.metrics() {
+                if metric.name() != metric_name {
+                    continue;
+                }
+                if let AggregatedMetrics::F64(MetricData::Histogram(hist)) = metric.data() {
+                    for dp in hist.data_points() {
+                        let matches = expected.iter().all(|(k, v)| {
+                            dp.attributes().any(|kv| {
+                                kv.key.as_str() == *k
+                                    && matches!(
+                                        &kv.value,
+                                        opentelemetry::Value::String(s) if s.as_str() == *v
+                                    )
+                            })
+                        });
+                        if matches {
+                            return Some(dp.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Assert the `db.client.response.affected_rows` histogram has at least one data point
+/// for the given backend `system`. The exact recorded value is already pinned on the
+/// span via `db.response.affected_rows`; this helper checks that the metric mirror is
+/// reaching the meter (the in-memory exporter aggregates cumulatively, so per-call value
+/// assertions across `tel.reset()` boundaries are not robust).
+pub fn assert_affected_rows_metric(tel: &TestTelemetry, system: &str) {
+    let metrics = tel.metrics();
+    let dp = find_histogram_data_point_with(
+        &metrics,
+        "db.client.response.affected_rows",
+        &[("db.system.name", system)],
+    )
+    .unwrap_or_else(|| {
+        panic!("no db.client.response.affected_rows data point found for system {system:?}")
+    });
+    assert!(
+        dp.count() > 0,
+        "db.client.response.affected_rows data point has zero count",
+    );
+}
+
 /// Locate the `db.client.operation.duration` histogram in a `ResourceMetrics` snapshot and
 /// return the first data point.
 ///
@@ -135,7 +194,7 @@ pub fn find_duration_data_point(
 ///
 /// Used by [`assert_metric_data_point`] and the per-method macros to verify that
 /// instrumentation for a specific scenario landed on the histogram with the dimensions
-/// the test asserts the *span* carries — i.e. metric/span attribute parity.
+/// the test asserts the *span* carries – i.e. metric/span attribute parity.
 pub fn find_duration_data_point_with(
     metrics: &[opentelemetry_sdk::metrics::data::ResourceMetrics],
     expected: &[(&str, &str)],
@@ -2277,7 +2336,7 @@ macro_rules! test_operation_duration_metric_carries_full_annotations {
 /// Targeted SQLSTATE assertion: on `sqlx::Error::Database`, the backend status code
 /// surfaces on the histogram as `db.response.status_code`. The expected code is backend-
 /// specific: `SQLite` extended result code `1` (`SQLITE_ERROR`), Postgres SQLSTATE
-/// `42P01`, `MySQL` SQLSTATE `42S02` — each backend's `tests/{sqlite,postgres,mysql}.rs`
+/// `42P01`, `MySQL` SQLSTATE `42S02` – each backend's `tests/{sqlite,postgres,mysql}.rs`
 /// passes the value it expects. Per-method `*_records_error` macros already assert the
 /// generic `error.type` propagation; this macro pins the SQLSTATE shape that varies per
 /// backend.
@@ -3575,6 +3634,7 @@ macro_rules! test_execute_records_affected_rows {
             "inserting 3 rows should affect 3 rows"
         );
         $crate::common::assert_metric_for_system(&tel, $dialect.system);
+        $crate::common::assert_affected_rows_metric(&tel, $dialect.system);
         tel.reset();
 
         // --- Upsert (dialect-specific) ---
@@ -3586,6 +3646,7 @@ macro_rules! test_execute_records_affected_rows {
             Some(opentelemetry::Value::I64($dialect.upsert_affected_rows)),
             "upsert affected_rows differs per backend"
         );
+        $crate::common::assert_affected_rows_metric(&tel, $dialect.system);
         tel.reset();
 
         // --- Update multiple rows (dialect-specific concat) ---
@@ -3600,6 +3661,7 @@ macro_rules! test_execute_records_affected_rows {
             Some(opentelemetry::Value::I64(2)),
             "updating two rows should affect 2 rows"
         );
+        $crate::common::assert_affected_rows_metric(&tel, $dialect.system);
         tel.reset();
 
         // --- Delete multiple rows ---
@@ -3614,6 +3676,7 @@ macro_rules! test_execute_records_affected_rows {
             Some(opentelemetry::Value::I64(3)),
             "deleting three rows should affect 3 rows"
         );
+        $crate::common::assert_affected_rows_metric(&tel, $dialect.system);
         tel.reset();
 
         // --- Delete with no matching rows ---
@@ -3629,6 +3692,7 @@ macro_rules! test_execute_records_affected_rows {
             "deleting non-existent rows should affect 0 rows"
         );
         $crate::common::assert_metric_for_system(&tel, $dialect.system);
+        $crate::common::assert_affected_rows_metric(&tel, $dialect.system);
     }};
 }
 

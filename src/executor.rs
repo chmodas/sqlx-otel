@@ -94,7 +94,7 @@ fn start_span(name: &str, span_attrs: Vec<KeyValue>) -> (OtelContext, Instant) {
 /// attributes plus the four annotation-derived attributes when present, plus error-path attributes
 /// (`error.type`, `db.response.status_code`) appended later by `record_error`. The unbounded
 /// `db.query.text` attribute is deliberately excluded; `db.query.summary` is caller-controlled and
-/// can be unbounded — that cardinality cost is inherited from the span side.
+/// can be unbounded – that cardinality cost is inherited from the span side.
 fn begin_query_span(
     attrs: &ConnectionAttributes,
     sql: Option<&str>,
@@ -187,16 +187,19 @@ fn record_affected_rows(cx: &OtelContext, rows: u64) {
     ));
 }
 
-/// End the span and record metrics.
+/// End the span and record metrics. `returned_rows` is `Some` for `fetch*` paths,
+/// `affected_rows` is `Some` for `execute` paths; both are `None` for paths that report
+/// neither (e.g. `prepare` / `describe` / `execute_many`'s streaming aggregate).
 fn finish(
     cx: &OtelContext,
     start: Instant,
-    rows: Option<u64>,
+    returned_rows: Option<u64>,
+    affected_rows: Option<u64>,
     metrics: &Metrics,
     attrs: &[KeyValue],
 ) {
     cx.span().end();
-    metrics.record(start.elapsed(), rows, attrs);
+    metrics.record(start.elapsed(), returned_rows, affected_rows, attrs);
 }
 
 /// Await a future, record any error on the span, then finish. Used by `execute`, `prepare`,
@@ -212,7 +215,7 @@ async fn execute_instrumented<T>(
     if let Err(err) = &result {
         record_error(&cx, err, &mut metric_attrs);
     }
-    finish(&cx, start, None, &metrics, &metric_attrs);
+    finish(&cx, start, None, None, &metrics, &metric_attrs);
     result
 }
 
@@ -297,6 +300,7 @@ impl<S, C> InstrumentedStream<S, C> {
                 &self.cx,
                 self.start,
                 Some(self.rows),
+                None,
                 &self.metrics,
                 &self.metric_attrs,
             );
@@ -395,15 +399,18 @@ macro_rules! impl_executor {
                 let fut = ($inner).execute(query);
                 Box::pin(async move {
                     let result = fut.await;
-                    match &result {
+                    let affected = match &result {
                         Ok(qr) => {
-                            record_affected_rows(&cx, DB::rows_affected(qr));
+                            let n = DB::rows_affected(qr);
+                            record_affected_rows(&cx, n);
+                            Some(n)
                         }
                         Err(err) => {
                             record_error(&cx, err, &mut metric_attrs);
+                            None
                         }
-                    }
-                    finish(&cx, start, None, &state.metrics, &metric_attrs);
+                    };
+                    finish(&cx, start, None, affected, &state.metrics, &metric_attrs);
                     result
                 })
             }
@@ -512,11 +519,11 @@ macro_rules! impl_executor {
                         Ok(rows) => {
                             let count = rows.len() as u64;
                             record_rows(&cx, count);
-                            finish(&cx, start, Some(count), &state.metrics, &metric_attrs);
+                            finish(&cx, start, Some(count), None, &state.metrics, &metric_attrs);
                         }
                         Err(err) => {
                             record_error(&cx, err, &mut metric_attrs);
-                            finish(&cx, start, None, &state.metrics, &metric_attrs);
+                            finish(&cx, start, None, None, &state.metrics, &metric_attrs);
                         }
                     }
                     result
@@ -545,11 +552,11 @@ macro_rules! impl_executor {
                     match &result {
                         Ok(_) => {
                             record_rows(&cx, 1);
-                            finish(&cx, start, Some(1), &state.metrics, &metric_attrs);
+                            finish(&cx, start, Some(1), None, &state.metrics, &metric_attrs);
                         }
                         Err(err) => {
                             record_error(&cx, err, &mut metric_attrs);
-                            finish(&cx, start, None, &state.metrics, &metric_attrs);
+                            finish(&cx, start, None, None, &state.metrics, &metric_attrs);
                         }
                     }
                     result
@@ -579,11 +586,11 @@ macro_rules! impl_executor {
                         Ok(maybe_row) => {
                             let count = u64::from(maybe_row.is_some());
                             record_rows(&cx, count);
-                            finish(&cx, start, Some(count), &state.metrics, &metric_attrs);
+                            finish(&cx, start, Some(count), None, &state.metrics, &metric_attrs);
                         }
                         Err(err) => {
                             record_error(&cx, err, &mut metric_attrs);
-                            finish(&cx, start, None, &state.metrics, &metric_attrs);
+                            finish(&cx, start, None, None, &state.metrics, &metric_attrs);
                         }
                     }
                     result
@@ -1177,7 +1184,7 @@ mod tests {
         /// the appended key set is exactly `{"db.operation.name" iff op.is_some(),
         /// "db.collection.name" iff coll.is_some(), "db.query.summary" iff
         /// query_summary.is_some(), "db.stored_procedure.name" iff
-        /// stored_procedure.is_some()}` — and nothing else, in particular none of the
+        /// stored_procedure.is_some()}` – and nothing else, in particular none of the
         /// connection or query-text keys leak through.
         #[test]
         fn append_annotation_attrs_membership_invariant(ann in any_annotations()) {

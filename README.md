@@ -13,9 +13,9 @@ The wrapper talks to the [`opentelemetry`](https://docs.rs/opentelemetry) API di
 
 ## Highlights
 
-- **Spans on every operation.** Every `sqlx::Executor` method emits a `SpanKind::Client` span carrying `db.system.name`, `db.namespace`, `server.address`/`port`, `db.query.text`, returned/affected row counts, and SQLSTATE / `error.type` on failure.
-- **Operation and pool metrics.** Histograms for query duration and rows returned; histograms, counters, and gauges for pool waits, hold times, timeouts, and connection state.
-- **Caller-supplied annotations.** The library does not parse SQL. Per-query attributes (`db.operation.name`, `db.collection.name`, `db.query.summary`) come from a small annotation API.
+- **Spans on every operation.** Every `sqlx::Executor` method emits a `SpanKind::Client` span carrying the OTel database-spans recommended set: `db.system.name`, `db.namespace`, `server.address`/`port`, `network.peer.address`/`port`, `network.protocol.name`, `network.transport`, `db.client.connection.pool.name`, `db.query.text`, returned/affected row counts, and SQLSTATE / `error.type` on failure.
+- **Span/metric attribute parity.** The `db.client.operation.duration` histogram carries the same bounded attribute set as spans – every annotation, every error-path attribute, every connection-level attribute – so dashboards can slice query latency by operation verb, target collection, error class, or pool name. `db.query.text` is the only span attribute deliberately excluded from metrics for cardinality.
+- **Caller-supplied annotations.** The library does not parse SQL. Per-query attributes (`db.operation.name`, `db.collection.name`, `db.query.summary`, `db.stored_procedure.name`) come from a small annotation API.
 - **Three backends, one API.** Postgres, SQLite, and MySQL behind feature flags; the wrapper API is identical across all three.
 - **Drop-in.** `&Pool<DB>` implements `sqlx::Executor`, so existing call sites keep working unchanged.
 
@@ -75,13 +75,17 @@ let pool = PoolBuilder::from(raw_pool)
     .with_port(5432)                        // override server.port
     .with_network_peer_address("10.0.0.5")  // network.peer.address (not auto-extracted)
     .with_network_peer_port(5432)           // network.peer.port    (not auto-extracted)
+    .with_network_protocol_name("postgresql") // override network.protocol.name (defaulted per backend)
+    .with_network_transport("tcp")          // network.transport    (not inferred from connect string)
     .with_query_text_mode(QueryTextMode::Off)
-    .with_pool_name("my-service-db")        // required for connection pool gauges
+    .with_pool_name("my-service-db")        // db.client.connection.pool.name + connection-count polling
     .with_pool_metrics_interval(Duration::from_secs(5))
     .build();
 ```
 
-`with_pool_name` is the switch that activates `db.client.connection.count` polling – the gauge is silent until both a pool name and a runtime feature are present.
+`with_pool_name` populates `db.client.connection.pool.name` on every span and per-operation metric, and is the switch that activates `db.client.connection.count` polling – the gauge is silent until both a pool name and a runtime feature are present.
+
+`network.protocol.name` defaults to the backend's wire protocol (`"postgresql"` for Postgres, `"mysql"` for MySQL, absent for SQLite); override only when the connection is tunnelled through a different application-layer protocol. `network.transport` is not inferred from the connect string – callers who want this attribute on spans / metrics must declare it explicitly so the value reflects the deployment configuration rather than a guess.
 
 ## Per-query annotations
 
@@ -137,25 +141,28 @@ See [`QueryAnnotations`](https://docs.rs/sqlx-otel/latest/sqlx_otel/struct.Query
 
 Set on every `Executor` method (`execute`, `fetch`, `fetch_all`, `fetch_one`, `fetch_optional`, `fetch_many`, `execute_many`, `prepare`, `prepare_with`, `describe`):
 
-| Attribute                   | Source                                          | Condition                   |
-|-----------------------------|-------------------------------------------------|-----------------------------|
-| `db.system.name`            | Backend (`"postgresql"`, `"sqlite"`, `"mysql"`) | Always                      |
-| `db.namespace`              | Database name, extracted from connect options   | When available              |
-| `server.address`            | Hostname, extracted from connect options        | When available              |
-| `server.port`               | Port, extracted from connect options            | When available              |
-| `network.peer.address`      | Resolved IP address                             | When set via builder        |
-| `network.peer.port`         | Resolved port                                   | When set via builder        |
-| `db.query.text`             | The SQL query string                            | Unless `QueryTextMode::Off` |
-| `db.operation.name`         | Database operation (e.g. `SELECT`)              | When annotated              |
-| `db.collection.name`        | Target table or collection                      | When annotated              |
-| `db.query.summary`          | Low-cardinality query summary                   | When annotated              |
-| `db.stored_procedure.name`  | Stored procedure name                           | When annotated              |
-| `db.response.returned_rows` | Row count                                       | On `fetch*` methods         |
-| `db.response.affected_rows` | Rows affected (`rows_affected()`)               | On `execute`                |
-| `db.response.status_code`   | SQLSTATE error code                             | On database errors          |
-| `error.type`                | Error variant name                              | On any error                |
+| Attribute                        | Source                                                      | Condition                   |
+|----------------------------------|-------------------------------------------------------------|-----------------------------|
+| `db.system.name`                 | Backend (`"postgresql"`, `"sqlite"`, `"mysql"`)             | Always                      |
+| `db.namespace`                   | Database name, extracted from connect options               | When available              |
+| `server.address`                 | Hostname, extracted from connect options                    | When available              |
+| `server.port`                    | Port, extracted from connect options                        | When available              |
+| `network.peer.address`           | Resolved IP address                                         | When set via builder        |
+| `network.peer.port`              | Resolved port                                               | When set via builder        |
+| `network.protocol.name`          | Wire protocol; defaults per backend, overridable on builder | When applicable             |
+| `network.transport`              | OSI L4 transport (`"tcp"`, `"unix"`, `"pipe"`, `"inproc"`)  | When set via builder        |
+| `db.client.connection.pool.name` | Pool identifier set via `with_pool_name`                    | When set via builder        |
+| `db.query.text`                  | The SQL query string                                        | Unless `QueryTextMode::Off` |
+| `db.operation.name`              | Database operation (e.g. `SELECT`)                          | When annotated              |
+| `db.collection.name`             | Target table or collection                                  | When annotated              |
+| `db.query.summary`               | Low-cardinality query summary                               | When annotated              |
+| `db.stored_procedure.name`       | Stored procedure name                                       | When annotated              |
+| `db.response.returned_rows`      | Row count                                                   | On `fetch*` methods         |
+| `db.response.affected_rows`      | Rows affected (`rows_affected()`)                           | On `execute`                |
+| `db.response.status_code`        | SQLSTATE error code                                         | On database errors          |
+| `error.type`                     | Error variant name                                          | On any error                |
 
-`db.response.affected_rows` is not part of the OpenTelemetry semantic conventions but we find it useful so have included it. It is a custom attribute that reports the database-confirmed count from `QueryResult::rows_affected()`, carrying the same connection-level attributes as `db.response.returned_rows`. It is not recorded for `execute_many`, which is [considered deprecated by the SQLx team](https://github.com/launchbadge/sqlx/issues/3108).
+`db.response.affected_rows` is not part of the OpenTelemetry semantic conventions, but we find it useful so have included it. It is a custom attribute that reports the database-confirmed count from `QueryResult::rows_affected()`, carrying the same connection-level attributes as `db.response.returned_rows`. It is not recorded for `execute_many`, which is [considered deprecated by the SQLx team](https://github.com/launchbadge/sqlx/issues/3108).
 
 On error, the span status is set to `Error` and an `exception` event is added with `exception.type` and `exception.message` attributes.
 
@@ -166,7 +173,7 @@ On error, the span status is set to `Error` and an `exception` event is added wi
 | `db.client.operation.duration`     | Histogram | `s`  | Duration of each database operation   |
 | `db.client.response.returned_rows` | Histogram |      | Number of rows returned per operation |
 
-These carry the connection-level attributes (`db.system.name`, `db.namespace`, `server.address`, `server.port`).
+These mirror the bounded portion of the span attribute set: connection-level attributes (`db.system.name`, `db.namespace`, `server.address`/`port`, `network.peer.address`/`port`, `network.protocol.name`, `network.transport`, `db.client.connection.pool.name` – wherever set), plus annotation-derived attributes (`db.operation.name`, `db.collection.name`, `db.query.summary`, `db.stored_procedure.name`) when present, plus error-path attributes (`error.type`, plus `db.response.status_code` for `sqlx::Error::Database`) on the error path. `db.query.text` is deliberately excluded for cardinality; `db.query.summary` is caller-controlled and inherits its cardinality cost from the span side.
 
 ### Connection pool metrics
 
@@ -185,11 +192,11 @@ The first four are recorded inline on every `acquire()` / connection drop – no
 
 ## Backend support
 
-| Backend    | `db.namespace`     | `server.address` / `server.port` | Notes                              |
-|------------|--------------------|----------------------------------|------------------------------------|
-| `postgres` | Database name      | Yes (from connect URL)           | –                                  |
-| `mysql`    | Database name      | Yes (from connect URL)           | –                                  |
-| `sqlite`   | File path or `:memory:` URI | n/a                     | No host/port; file or in-memory.   |
+| Backend    | `db.namespace`              | `server.address` / `server.port` | Default `network.protocol.name`     | Notes                            |
+|------------|-----------------------------|----------------------------------|-------------------------------------|----------------------------------|
+| `postgres` | Database name               | Yes (from connect URL)           | `"postgresql"`                      | –                                |
+| `mysql`    | Database name               | Yes (from connect URL)           | `"mysql"`                           | –                                |
+| `sqlite`   | File path or `:memory:` URI | n/a                              | absent (embedded; no wire protocol) | No host/port; file or in-memory. |
 
 `db.response.returned_rows`, `db.response.affected_rows`, `db.response.status_code`, and `error.type` are recorded uniformly across all three backends.
 

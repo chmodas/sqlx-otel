@@ -334,11 +334,26 @@ async fn describe_records_error() {
 // ===========================================================================
 // Metrics
 // ===========================================================================
+// Per-method coverage of `db.client.operation.duration` lives inside each
+// `test_<method>_*` macro via `assert_metric_for_system` / `assert_annotated_metric` /
+// `assert_error_metric`. The targeted SQLSTATE assertion below pins the backend-specific
+// `db.response.status_code` value because that dimension varies per driver and would
+// otherwise need a per-backend value plumbed into every error-path macro.
 
 #[tokio::test]
 #[serial]
-async fn operation_duration_metric_is_recorded() {
-    test_operation_duration_metric_is_recorded!(test_pool().await, common::SQLITE_DIALECT);
+async fn operation_duration_metric_carries_full_annotations() {
+    test_operation_duration_metric_carries_full_annotations!(
+        test_pool().await,
+        common::SQLITE_DIALECT
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn operation_duration_metric_carries_sqlstate() {
+    // SQLite extended result code `1` = SQLITE_ERROR (returned for `no such table`).
+    test_operation_duration_metric_carries_sqlstate!(test_pool().await, "1");
 }
 
 // ===========================================================================
@@ -399,6 +414,36 @@ async fn builder_with_network_peer_address() {
 #[serial]
 async fn builder_with_network_peer_port() {
     test_builder_with_network_peer_port!(raw_pool().await, common::SQLITE_DIALECT);
+}
+
+#[tokio::test]
+#[serial]
+async fn builder_with_pool_name_propagates_to_span_and_metric() {
+    test_builder_with_pool_name_propagates_to_span_and_metric!(
+        raw_pool().await,
+        common::SQLITE_DIALECT
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn builder_default_network_protocol_name_absent_for_sqlite() {
+    // SQLite is an embedded backend with no wire protocol; default omits
+    // `network.protocol.name`.
+    let expected: Option<&str> = None;
+    test_builder_default_network_protocol_name!(raw_pool().await, expected);
+}
+
+#[tokio::test]
+#[serial]
+async fn builder_with_network_protocol_name_overrides() {
+    test_builder_with_network_protocol_name_overrides!(raw_pool().await, common::SQLITE_DIALECT);
+}
+
+#[tokio::test]
+#[serial]
+async fn builder_with_network_transport() {
+    test_builder_with_network_transport!(raw_pool().await, common::SQLITE_DIALECT);
 }
 
 // ===========================================================================

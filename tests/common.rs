@@ -87,6 +87,227 @@ pub fn attr(span: &SpanData, key: &str) -> Option<opentelemetry::Value> {
         .map(|kv| kv.value.clone())
 }
 
+/// Find the attribute value for a given key on a histogram data point.
+///
+/// Mirrors [`attr`] for the metric side: walks the data point's attribute iterator and
+/// returns the cloned value for the first matching key. Used by the metric-attribute
+/// assertions in `test_operation_duration_metric_carries_*` to confirm the histogram
+/// emits the same dimensions the span carries.
+pub fn metric_attr(
+    dp: &opentelemetry_sdk::metrics::data::HistogramDataPoint<f64>,
+    key: &str,
+) -> Option<opentelemetry::Value> {
+    dp.attributes()
+        .find(|kv| kv.key.as_str() == key)
+        .map(|kv| kv.value.clone())
+}
+
+/// Locate the `db.client.operation.duration` histogram in a `ResourceMetrics` snapshot and
+/// return the first data point.
+///
+/// Returns `None` if the metric is absent or has no data points. Tests that assert on the
+/// data point's attributes should `unwrap()` the result so absence fails the test loudly
+/// rather than silently passing an empty-attribute set.
+pub fn find_duration_data_point(
+    metrics: &[opentelemetry_sdk::metrics::data::ResourceMetrics],
+) -> Option<opentelemetry_sdk::metrics::data::HistogramDataPoint<f64>> {
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+    for rm in metrics {
+        for sm in rm.scope_metrics() {
+            for metric in sm.metrics() {
+                if metric.name() != "db.client.operation.duration" {
+                    continue;
+                }
+                if let AggregatedMetrics::F64(MetricData::Histogram(hist)) = metric.data() {
+                    if let Some(dp) = hist.data_points().next() {
+                        return Some(dp.clone());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Find the first `db.client.operation.duration` data point whose attribute set contains
+/// every `(key, value)` pair in `expected`. Each expected value is matched as a string
+/// `opentelemetry::Value::String`. Returns `None` when no matching data point exists.
+///
+/// Used by [`assert_metric_data_point`] and the per-method macros to verify that
+/// instrumentation for a specific scenario landed on the histogram with the dimensions
+/// the test asserts the *span* carries — i.e. metric/span attribute parity.
+pub fn find_duration_data_point_with(
+    metrics: &[opentelemetry_sdk::metrics::data::ResourceMetrics],
+    expected: &[(&str, &str)],
+) -> Option<opentelemetry_sdk::metrics::data::HistogramDataPoint<f64>> {
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+    for rm in metrics {
+        for sm in rm.scope_metrics() {
+            for metric in sm.metrics() {
+                if metric.name() != "db.client.operation.duration" {
+                    continue;
+                }
+                if let AggregatedMetrics::F64(MetricData::Histogram(hist)) = metric.data() {
+                    for dp in hist.data_points() {
+                        let matches = expected.iter().all(|(k, v)| {
+                            dp.attributes().any(|kv| {
+                                kv.key.as_str() == *k
+                                    && matches!(
+                                        &kv.value,
+                                        opentelemetry::Value::String(s) if s.as_str() == *v
+                                    )
+                            })
+                        });
+                        if matches {
+                            return Some(dp.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Assert that the `db.client.operation.duration` histogram has a data point matching
+/// every `(key, value)` pair in `expected`, and that its `count() > 0`. Panics with a
+/// helpful message naming the missing pairs when no data point matches – the panic body
+/// is intentionally verbose so assertion failures point at the unsatisfied dimension
+/// rather than a generic "metric missing".
+pub fn assert_metric_data_point(tel: &TestTelemetry, expected: &[(&str, &str)]) {
+    let metrics = tel.metrics();
+    let dp = find_duration_data_point_with(&metrics, expected).unwrap_or_else(|| {
+        panic!(
+            "no db.client.operation.duration data point found matching expected attrs {expected:?}",
+        )
+    });
+    assert!(
+        dp.count() > 0,
+        "matching data point has zero count for expected attrs {expected:?}",
+    );
+}
+
+/// Assert that the duration histogram recorded a data point for the given backend
+/// `system`. The minimum bar every per-method macro should clear: this is the metric
+/// equivalent of [`assert_common_span_attributes`] and verifies that the method's
+/// instrumentation reached the meter at all.
+pub fn assert_metric_for_system(tel: &TestTelemetry, system: &str) {
+    assert_metric_data_point(tel, &[("db.system.name", system)]);
+}
+
+/// Assert that the duration histogram recorded a data point matching the standard
+/// [`test_annotations`] keys (`db.operation.name = "SELECT"`,
+/// `db.collection.name = "users"`) plus `db.system.name`. Used by every macro that
+/// exercises the annotated path so the metric carries the same dimensions the span
+/// assertions check via [`assert_annotated_span`].
+pub fn assert_annotated_metric(tel: &TestTelemetry, dialect: &Dialect) {
+    assert_metric_data_point(
+        tel,
+        &[
+            ("db.system.name", dialect.system),
+            ("db.operation.name", "SELECT"),
+            ("db.collection.name", "users"),
+        ],
+    );
+}
+
+/// Assert that the duration histogram recorded an *annotated* error-path data point
+/// matching the standard [`test_annotations`] keys (`db.operation.name = "SELECT"`,
+/// `db.collection.name = "users"`) plus a non-empty `error.type` plus the expected
+/// `db.system.name`. Used by every `*_records_error` macro that exercises an annotated
+/// failing call: pins the contract that `record_error` keeps annotation attrs and error
+/// attrs on the same `Vec<KeyValue>` so a single histogram data point carries both
+/// dimensions, which dashboards rely on to slice latency by failed operation + failed
+/// collection.
+pub fn assert_annotated_error_metric(tel: &TestTelemetry, dialect: &Dialect) {
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+    let metrics = tel.metrics();
+    let dp = metrics
+        .iter()
+        .flat_map(opentelemetry_sdk::metrics::data::ResourceMetrics::scope_metrics)
+        .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+        .filter(|m| m.name() == "db.client.operation.duration")
+        .filter_map(|m| {
+            if let AggregatedMetrics::F64(MetricData::Histogram(hist)) = m.data() {
+                Some(hist)
+            } else {
+                None
+            }
+        })
+        .flat_map(opentelemetry_sdk::metrics::data::Histogram::data_points)
+        .find(|dp| {
+            let attr_eq = |key: &str, value: &str| {
+                dp.attributes().any(|kv| {
+                    kv.key.as_str() == key
+                        && matches!(
+                            &kv.value,
+                            opentelemetry::Value::String(s) if s.as_str() == value
+                        )
+                })
+            };
+            let attr_present = |key: &str| {
+                dp.attributes().any(|kv| {
+                    kv.key.as_str() == key
+                        && matches!(
+                            &kv.value,
+                            opentelemetry::Value::String(s) if !s.as_str().is_empty()
+                        )
+                })
+            };
+            attr_eq("db.system.name", dialect.system)
+                && attr_eq("db.operation.name", "SELECT")
+                && attr_eq("db.collection.name", "users")
+                && attr_present("error.type")
+        });
+    assert!(
+        dp.is_some(),
+        "no annotated db.client.operation.duration data point with error.type and \
+         db.system.name = {:?} found",
+        dialect.system,
+    );
+}
+
+/// Assert that the duration histogram recorded a data point on the error path: the data
+/// point must carry `error.type` (any non-empty string – the exact value depends on the
+/// `sqlx::Error` variant under test) and the expected `db.system.name`. Used by every
+/// `*_records_error` macro.
+pub fn assert_error_metric(tel: &TestTelemetry, dialect: &Dialect) {
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+    let metrics = tel.metrics();
+    let dp = metrics
+        .iter()
+        .flat_map(opentelemetry_sdk::metrics::data::ResourceMetrics::scope_metrics)
+        .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+        .filter(|m| m.name() == "db.client.operation.duration")
+        .filter_map(|m| {
+            if let AggregatedMetrics::F64(MetricData::Histogram(hist)) = m.data() {
+                Some(hist)
+            } else {
+                None
+            }
+        })
+        .flat_map(opentelemetry_sdk::metrics::data::Histogram::data_points)
+        .find(|dp| {
+            let has_error_type = dp.attributes().any(|kv| {
+                kv.key.as_str() == "error.type"
+                    && matches!(&kv.value, opentelemetry::Value::String(s) if !s.as_str().is_empty())
+            });
+            let has_system = dp.attributes().any(|kv| {
+                kv.key.as_str() == "db.system.name"
+                    && matches!(
+                        &kv.value,
+                        opentelemetry::Value::String(s) if s.as_str() == dialect.system
+                    )
+            });
+            has_error_type && has_system
+        });
+    assert!(
+        dp.is_some(),
+        "no db.client.operation.duration data point with error.type and db.system.name = {:?} found",
+        dialect.system,
+    );
+}
+
 /// Assert that a span carries the common attributes every instrumented operation must have.
 ///
 /// `system` is the expected `db.system.name` value (e.g. `"sqlite"`, `"postgresql"`).
@@ -419,6 +640,8 @@ macro_rules! test_execute_creates_span_via_pool {
             .await
             .unwrap();
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -461,6 +684,8 @@ macro_rules! test_execute_creates_span_via_connection {
             .await
             .unwrap();
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -505,6 +730,8 @@ macro_rules! test_execute_creates_span_via_transaction {
         assert!($crate::common::attr(&spans[0], "db.response.affected_rows").is_some());
         $crate::common::assert_annotated_span(&spans[1], &$dialect);
         $crate::common::assert_annotated_span(&spans[2], &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -543,6 +770,8 @@ macro_rules! test_execute_records_error {
         let last = tel.spans().last().unwrap().clone();
         $crate::common::assert_annotated_span(&last, &$dialect);
         $crate::common::assert_error_span(&last);
+
+        $crate::common::assert_annotated_error_metric(&tel, &$dialect);
     }};
 }
 
@@ -581,6 +810,8 @@ macro_rules! test_execute_many_via_pool {
         while stream.next().await.is_some() {}
         drop(stream);
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -620,6 +851,8 @@ macro_rules! test_execute_many_via_connection {
         while stream.next().await.is_some() {}
         drop(stream);
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -661,6 +894,8 @@ macro_rules! test_execute_many_via_transaction {
         );
         $crate::common::assert_annotated_span(&spans[1], &$dialect);
         $crate::common::assert_annotated_span(&spans[2], &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -706,6 +941,8 @@ macro_rules! test_execute_many_records_error {
         let last = tel.spans().last().unwrap().clone();
         $crate::common::assert_annotated_span(&last, &$dialect);
         $crate::common::assert_error_span(&last);
+
+        $crate::common::assert_annotated_error_metric(&tel, &$dialect);
     }};
 }
 
@@ -748,6 +985,8 @@ macro_rules! test_fetch_via_pool {
         while stream.next().await.is_some() {}
         drop(stream);
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -786,6 +1025,8 @@ macro_rules! test_fetch_via_connection {
         while stream.next().await.is_some() {}
         drop(stream);
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -826,6 +1067,8 @@ macro_rules! test_fetch_via_transaction {
         );
         $crate::common::assert_annotated_span(&spans[1], &$dialect);
         $crate::common::assert_annotated_span(&spans[2], &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -855,6 +1098,8 @@ macro_rules! test_fetch_stream_dropped_early_still_records_span {
             $crate::common::attr(&spans[0], "db.response.returned_rows"),
             Some(opentelemetry::Value::I64(1))
         );
+
+        $crate::common::assert_metric_for_system(&tel, $dialect.system);
     }};
 }
 
@@ -898,6 +1143,8 @@ macro_rules! test_fetch_stream_records_error {
         let last = tel.spans().last().unwrap().clone();
         $crate::common::assert_annotated_span(&last, &$dialect);
         $crate::common::assert_error_span(&last);
+
+        $crate::common::assert_annotated_error_metric(&tel, &$dialect);
     }};
 }
 
@@ -945,6 +1192,8 @@ macro_rules! test_fetch_many_via_pool {
         while stream.next().await.is_some() {}
         drop(stream);
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -983,6 +1232,8 @@ macro_rules! test_fetch_many_via_connection {
         while stream.next().await.is_some() {}
         drop(stream);
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -1023,6 +1274,8 @@ macro_rules! test_fetch_many_via_transaction {
         );
         $crate::common::assert_annotated_span(&spans[1], &$dialect);
         $crate::common::assert_annotated_span(&spans[2], &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -1052,6 +1305,8 @@ macro_rules! test_fetch_many_dropped_early_still_records_span {
             $crate::common::attr(&spans[0], "db.response.returned_rows"),
             Some(opentelemetry::Value::I64(1))
         );
+
+        $crate::common::assert_metric_for_system(&tel, $dialect.system);
     }};
 }
 
@@ -1097,6 +1352,8 @@ macro_rules! test_fetch_many_records_error {
         let last = tel.spans().last().unwrap().clone();
         $crate::common::assert_annotated_span(&last, &$dialect);
         $crate::common::assert_error_span(&last);
+
+        $crate::common::assert_annotated_error_metric(&tel, &$dialect);
     }};
 }
 
@@ -1134,6 +1391,8 @@ macro_rules! test_fetch_all_via_pool {
             .await
             .unwrap();
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -1171,6 +1430,8 @@ macro_rules! test_fetch_all_via_connection {
             .await
             .unwrap();
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -1210,6 +1471,8 @@ macro_rules! test_fetch_all_via_transaction {
         );
         $crate::common::assert_annotated_span(&spans[1], &$dialect);
         $crate::common::assert_annotated_span(&spans[2], &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -1247,6 +1510,8 @@ macro_rules! test_fetch_all_records_error {
         let last = tel.spans().last().unwrap().clone();
         $crate::common::assert_annotated_span(&last, &$dialect);
         $crate::common::assert_error_span(&last);
+
+        $crate::common::assert_annotated_error_metric(&tel, &$dialect);
     }};
 }
 
@@ -1279,6 +1544,8 @@ macro_rules! test_fetch_one_via_pool {
             .await
             .unwrap();
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -1312,6 +1579,8 @@ macro_rules! test_fetch_one_via_connection {
             .await
             .unwrap();
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -1347,6 +1616,8 @@ macro_rules! test_fetch_one_via_transaction {
         );
         $crate::common::assert_annotated_span(&spans[1], &$dialect);
         $crate::common::assert_annotated_span(&spans[2], &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -1384,6 +1655,8 @@ macro_rules! test_fetch_one_records_error {
         let last = tel.spans().last().unwrap().clone();
         $crate::common::assert_annotated_span(&last, &$dialect);
         $crate::common::assert_error_span(&last);
+
+        $crate::common::assert_annotated_error_metric(&tel, &$dialect);
     }};
 }
 
@@ -1417,6 +1690,8 @@ macro_rules! test_fetch_optional_records_one_row {
             .await
             .unwrap();
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -1451,6 +1726,8 @@ macro_rules! test_fetch_optional_via_connection {
             .await
             .unwrap();
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -1487,6 +1764,8 @@ macro_rules! test_fetch_optional_via_transaction {
         );
         $crate::common::assert_annotated_span(&spans[1], &$dialect);
         $crate::common::assert_annotated_span(&spans[2], &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -1527,6 +1806,8 @@ macro_rules! test_fetch_optional_records_error {
         let last = tel.spans().last().unwrap().clone();
         $crate::common::assert_annotated_span(&last, &$dialect);
         $crate::common::assert_error_span(&last);
+
+        $crate::common::assert_annotated_error_metric(&tel, &$dialect);
     }};
 }
 
@@ -1560,6 +1841,8 @@ macro_rules! test_prepare_via_pool {
             .await
             .unwrap();
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -1590,6 +1873,8 @@ macro_rules! test_prepare_via_connection {
             .await
             .unwrap();
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -1622,6 +1907,8 @@ macro_rules! test_prepare_via_transaction {
         assert!($crate::common::attr(&spans[0], "db.response.returned_rows").is_none());
         $crate::common::assert_annotated_span(&spans[1], &$dialect);
         $crate::common::assert_annotated_span(&spans[2], &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -1660,6 +1947,8 @@ macro_rules! test_prepare_records_error {
         let last = tel.spans().last().unwrap().clone();
         $crate::common::assert_annotated_span(&last, &$dialect);
         $crate::common::assert_error_span(&last);
+
+        $crate::common::assert_annotated_error_metric(&tel, &$dialect);
     }};
 }
 
@@ -1692,6 +1981,8 @@ macro_rules! test_prepare_with_via_pool {
             .await
             .unwrap();
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -1725,6 +2016,8 @@ macro_rules! test_prepare_with_via_connection {
             .await
             .unwrap();
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -1760,6 +2053,8 @@ macro_rules! test_prepare_with_via_transaction {
         assert!($crate::common::attr(&spans[0], "db.response.returned_rows").is_none());
         $crate::common::assert_annotated_span(&spans[1], &$dialect);
         $crate::common::assert_annotated_span(&spans[2], &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -1798,6 +2093,8 @@ macro_rules! test_prepare_with_records_error {
         let last = tel.spans().last().unwrap().clone();
         $crate::common::assert_annotated_span(&last, &$dialect);
         $crate::common::assert_error_span(&last);
+
+        $crate::common::assert_annotated_error_metric(&tel, &$dialect);
     }};
 }
 
@@ -1827,6 +2124,8 @@ macro_rules! test_describe_via_pool {
             .await
             .unwrap();
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -1857,6 +2156,8 @@ macro_rules! test_describe_via_connection {
             .await
             .unwrap();
         $crate::common::assert_annotated_span(tel.spans().last().unwrap(), &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -1889,6 +2190,8 @@ macro_rules! test_describe_via_transaction {
         assert!($crate::common::attr(&spans[0], "db.response.returned_rows").is_none());
         $crate::common::assert_annotated_span(&spans[1], &$dialect);
         $crate::common::assert_annotated_span(&spans[2], &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -1927,6 +2230,8 @@ macro_rules! test_describe_records_error {
         let last = tel.spans().last().unwrap().clone();
         $crate::common::assert_annotated_span(&last, &$dialect);
         $crate::common::assert_error_span(&last);
+
+        $crate::common::assert_annotated_error_metric(&tel, &$dialect);
     }};
 }
 
@@ -1934,45 +2239,68 @@ macro_rules! test_describe_records_error {
 // Misc: metrics, annotations
 // ---------------------------------------------------------------------------
 
-/// `db.client.operation.duration` histogram is populated for any executed query.
+/// All four annotation fields set together must surface on the `db.client.operation.duration`
+/// histogram data point. Per-method macros only exercise the standard
+/// `test_annotations()` shape (`db.operation.name = "SELECT"`,
+/// `db.collection.name = "users"`), so this macro pins the integration-level guarantee
+/// for `db.query.summary` and `db.stored_procedure.name` propagation.
 #[macro_export]
-macro_rules! test_operation_duration_metric_is_recorded {
+macro_rules! test_operation_duration_metric_carries_full_annotations {
     ($pool_factory:expr, $dialect:expr) => {{
-        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
-        let _ = $dialect; // unused – backend doesn't influence the metric shape
         let tel = $crate::common::TestTelemetry::install();
         let pool = $pool_factory;
 
-        let _: (i32,) = sqlx::query_as("SELECT 1").fetch_one(&pool).await.unwrap();
+        pool.with_annotations(
+            sqlx_otel::QueryAnnotations::new()
+                .operation("SELECT")
+                .collection("users")
+                .query_summary("users by id")
+                .stored_procedure("sp_get_users"),
+        )
+        .fetch_one("SELECT 1")
+        .await
+        .unwrap();
+
+        $crate::common::assert_metric_data_point(
+            &tel,
+            &[
+                ("db.system.name", $dialect.system),
+                ("db.operation.name", "SELECT"),
+                ("db.collection.name", "users"),
+                ("db.query.summary", "users by id"),
+                ("db.stored_procedure.name", "sp_get_users"),
+            ],
+        );
+    }};
+}
+
+/// Targeted SQLSTATE assertion: on `sqlx::Error::Database`, the backend status code
+/// surfaces on the histogram as `db.response.status_code`. The expected code is backend-
+/// specific: `SQLite` extended result code `1` (`SQLITE_ERROR`), Postgres SQLSTATE
+/// `42P01`, `MySQL` SQLSTATE `42S02` — each backend's `tests/{sqlite,postgres,mysql}.rs`
+/// passes the value it expects. Per-method `*_records_error` macros already assert the
+/// generic `error.type` propagation; this macro pins the SQLSTATE shape that varies per
+/// backend.
+#[macro_export]
+macro_rules! test_operation_duration_metric_carries_sqlstate {
+    ($pool_factory:expr, $expected_code:expr) => {{
+        let tel = $crate::common::TestTelemetry::install();
+        let pool = $pool_factory;
+
+        let result = pool
+            .with_operation("SELECT", "nonexistent_table_xyz")
+            .fetch_one("SELECT * FROM nonexistent_table_xyz")
+            .await;
+        assert!(result.is_err(), "expected fetch_one to fail");
 
         let resource_metrics = tel.metrics();
-        assert!(!resource_metrics.is_empty(), "should have metric data");
+        let dp = $crate::common::find_duration_data_point(&resource_metrics)
+            .expect("db.client.operation.duration data point missing");
 
-        let mut found_duration = false;
-        for rm in &resource_metrics {
-            for sm in rm.scope_metrics() {
-                for metric in sm.metrics() {
-                    if metric.name() == "db.client.operation.duration" {
-                        found_duration = true;
-                        assert_eq!(metric.unit(), "s");
-                        if let AggregatedMetrics::F64(MetricData::Histogram(hist)) = metric.data() {
-                            let dp: Vec<_> = hist.data_points().collect();
-                            assert!(!dp.is_empty(), "histogram should have data points");
-                            assert!(dp[0].count() > 0, "data point count should be > 0");
-                            let has_system = dp[0]
-                                .attributes()
-                                .any(|kv| kv.key.as_str() == "db.system.name");
-                            assert!(has_system, "metric should have db.system.name attribute");
-                        } else {
-                            panic!("db.client.operation.duration should be an f64 histogram");
-                        }
-                    }
-                }
-            }
-        }
-        assert!(
-            found_duration,
-            "db.client.operation.duration metric not found"
+        assert_eq!(
+            $crate::common::metric_attr(&dp, "db.response.status_code"),
+            Some(opentelemetry::Value::String($expected_code.into())),
+            "metric must carry db.response.status_code for sqlx::Error::Database",
         );
     }};
 }
@@ -2079,6 +2407,8 @@ macro_rules! test_query_execute_many_with_annotations_via_pool {
         let spans = tel.spans();
         assert_eq!(spans.len(), 1);
         $crate::common::assert_annotated_span(&spans[0], &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -2104,6 +2434,8 @@ macro_rules! test_query_fetch_with_annotations_via_pool {
             $crate::common::attr(&spans[0], "db.response.returned_rows"),
             Some(opentelemetry::Value::I64(2))
         );
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -2126,6 +2458,8 @@ macro_rules! test_query_fetch_many_with_annotations_via_pool {
         let spans = tel.spans();
         assert_eq!(spans.len(), 1);
         $crate::common::assert_annotated_span(&spans[0], &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -2151,6 +2485,8 @@ macro_rules! test_query_fetch_all_with_annotations_via_pool {
             $crate::common::attr(&spans[0], "db.response.returned_rows"),
             Some(opentelemetry::Value::I64(3))
         );
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -2175,6 +2511,8 @@ macro_rules! test_query_fetch_one_with_annotations_via_pool {
             $crate::common::attr(&spans[0], "db.response.returned_rows"),
             Some(opentelemetry::Value::I64(1))
         );
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -2196,6 +2534,8 @@ macro_rules! test_query_execute_with_annotations_records_error {
         assert_eq!(spans.len(), 1);
         $crate::common::assert_annotated_span(&spans[0], &$dialect);
         $crate::common::assert_error_span(&spans[0]);
+
+        $crate::common::assert_annotated_error_metric(&tel, &$dialect);
     }};
 }
 
@@ -2217,6 +2557,8 @@ macro_rules! test_query_as_fetch_with_annotations_via_pool {
         let spans = tel.spans();
         assert_eq!(spans.len(), 1);
         $crate::common::assert_annotated_span(&spans[0], &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -2239,6 +2581,8 @@ macro_rules! test_query_as_fetch_many_with_annotations_via_pool {
         let spans = tel.spans();
         assert_eq!(spans.len(), 1);
         $crate::common::assert_annotated_span(&spans[0], &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -2274,6 +2618,8 @@ macro_rules! test_query_as_fetch_all_with_annotations_via_pool {
         for span in &spans {
             $crate::common::assert_annotated_span(span, &$dialect);
         }
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -2310,6 +2656,8 @@ macro_rules! test_query_as_fetch_one_with_annotations_via_pool {
         for span in &spans {
             $crate::common::assert_annotated_span(span, &$dialect);
         }
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -2346,6 +2694,8 @@ macro_rules! test_query_as_fetch_optional_with_annotations_via_pool {
         for span in &spans {
             $crate::common::assert_annotated_span(span, &$dialect);
         }
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -2367,6 +2717,8 @@ macro_rules! test_query_as_fetch_one_with_annotations_records_error {
         assert_eq!(spans.len(), 1);
         $crate::common::assert_annotated_span(&spans[0], &$dialect);
         $crate::common::assert_error_span(&spans[0]);
+
+        $crate::common::assert_annotated_error_metric(&tel, &$dialect);
     }};
 }
 
@@ -2388,6 +2740,8 @@ macro_rules! test_query_scalar_fetch_with_annotations_via_pool {
         let spans = tel.spans();
         assert_eq!(spans.len(), 1);
         $crate::common::assert_annotated_span(&spans[0], &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -2410,6 +2764,8 @@ macro_rules! test_query_scalar_fetch_many_with_annotations_via_pool {
         let spans = tel.spans();
         assert_eq!(spans.len(), 1);
         $crate::common::assert_annotated_span(&spans[0], &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -2431,6 +2787,8 @@ macro_rules! test_query_scalar_fetch_all_with_annotations_via_pool {
         let spans = tel.spans();
         assert_eq!(spans.len(), 1);
         $crate::common::assert_annotated_span(&spans[0], &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -2452,6 +2810,8 @@ macro_rules! test_query_scalar_fetch_one_with_annotations_via_pool {
         let spans = tel.spans();
         assert_eq!(spans.len(), 1);
         $crate::common::assert_annotated_span(&spans[0], &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -2473,6 +2833,8 @@ macro_rules! test_query_scalar_fetch_optional_with_annotations_via_pool {
         let spans = tel.spans();
         assert_eq!(spans.len(), 1);
         $crate::common::assert_annotated_span(&spans[0], &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -2504,6 +2866,8 @@ macro_rules! test_query_map_position_1_via_pool {
         let spans = tel.spans();
         assert_eq!(spans.len(), 1);
         $crate::common::assert_annotated_span(&spans[0], &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -2527,6 +2891,8 @@ macro_rules! test_query_map_position_2_via_pool {
         let spans = tel.spans();
         assert_eq!(spans.len(), 1);
         $crate::common::assert_annotated_span(&spans[0], &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -2550,6 +2916,8 @@ macro_rules! test_query_map_position_3_via_pool {
         let spans = tel.spans();
         assert_eq!(spans.len(), 1);
         $crate::common::assert_annotated_span(&spans[0], &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -2573,6 +2941,8 @@ macro_rules! test_query_try_map_position_3_via_pool {
         let spans = tel.spans();
         assert_eq!(spans.len(), 1);
         $crate::common::assert_annotated_span(&spans[0], &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -2600,6 +2970,8 @@ macro_rules! test_map_fetch_with_annotations_via_pool {
             $crate::common::attr(&spans[0], "db.response.returned_rows"),
             Some(opentelemetry::Value::I64(2))
         );
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -2624,6 +2996,8 @@ macro_rules! test_map_fetch_many_with_annotations_via_pool {
         let spans = tel.spans();
         assert_eq!(spans.len(), 1);
         $crate::common::assert_annotated_span(&spans[0], &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -2647,6 +3021,8 @@ macro_rules! test_map_fetch_all_with_annotations_via_pool {
         let spans = tel.spans();
         assert_eq!(spans.len(), 1);
         $crate::common::assert_annotated_span(&spans[0], &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -2670,6 +3046,8 @@ macro_rules! test_map_fetch_one_with_annotations_via_pool {
         let spans = tel.spans();
         assert_eq!(spans.len(), 1);
         $crate::common::assert_annotated_span(&spans[0], &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -2693,6 +3071,8 @@ macro_rules! test_map_fetch_optional_with_annotations_via_pool {
         let spans = tel.spans();
         assert_eq!(spans.len(), 1);
         $crate::common::assert_annotated_span(&spans[0], &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -2717,6 +3097,8 @@ macro_rules! test_map_compose_after_annotations_via_pool {
         let spans = tel.spans();
         assert_eq!(spans.len(), 1);
         $crate::common::assert_annotated_span(&spans[0], &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -2741,6 +3123,8 @@ macro_rules! test_map_try_map_compose_after_annotations_via_pool {
         let spans = tel.spans();
         assert_eq!(spans.len(), 1);
         $crate::common::assert_annotated_span(&spans[0], &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -2765,6 +3149,8 @@ macro_rules! test_query_map_with_annotations_via_connection {
         let spans = tel.spans();
         assert_eq!(spans.len(), 1);
         $crate::common::assert_annotated_span(&spans[0], &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -2790,6 +3176,8 @@ macro_rules! test_query_map_with_annotations_via_transaction {
         let spans = tel.spans();
         assert_eq!(spans.len(), 1);
         $crate::common::assert_annotated_span(&spans[0], &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -2813,6 +3201,8 @@ macro_rules! test_query_map_with_annotations_records_error {
         assert_eq!(spans.len(), 1);
         $crate::common::assert_annotated_span(&spans[0], &$dialect);
         $crate::common::assert_error_span(&spans[0]);
+
+        $crate::common::assert_annotated_error_metric(&tel, &$dialect);
     }};
 }
 
@@ -2839,6 +3229,8 @@ macro_rules! test_query_try_map_with_annotations_propagates_mapper_error {
         let spans = tel.spans();
         assert_eq!(spans.len(), 1);
         $crate::common::assert_annotated_span(&spans[0], &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -2939,6 +3331,145 @@ macro_rules! test_builder_with_network_peer_address {
     }};
 }
 
+/// `PoolBuilder::with_pool_name` propagates `db.client.connection.pool.name` onto every
+/// span and per-operation metric so dashboards can correlate pool-level signals (the
+/// `db.client.connection.*` family) with query-level latency.
+#[macro_export]
+macro_rules! test_builder_with_pool_name_propagates_to_span_and_metric {
+    ($raw_pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let _ = $dialect;
+        let tel = $crate::common::TestTelemetry::install();
+        let raw = $raw_pool_factory;
+        let pool = sqlx_otel::PoolBuilder::from(raw)
+            .with_pool_name("primary-rw")
+            .build();
+
+        let _ = (&pool).fetch_optional("SELECT 1").await.unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.client.connection.pool.name"),
+            Some(opentelemetry::Value::String("primary-rw".into())),
+            "span must carry db.client.connection.pool.name set via with_pool_name",
+        );
+
+        let resource_metrics = tel.metrics();
+        let dp = $crate::common::find_duration_data_point(&resource_metrics)
+            .expect("db.client.operation.duration data point missing");
+        assert_eq!(
+            $crate::common::metric_attr(&dp, "db.client.connection.pool.name"),
+            Some(opentelemetry::Value::String("primary-rw".into())),
+            "metric must carry db.client.connection.pool.name set via with_pool_name",
+        );
+    }};
+}
+
+/// Default `network.protocol.name` is the backend's wire protocol (Postgres / `MySQL`)
+/// or absent (`SQLite`). The expected value is supplied per backend because `Dialect`
+/// does not currently distinguish wire-protocol-bearing backends from embedded ones.
+#[macro_export]
+macro_rules! test_builder_default_network_protocol_name {
+    ($raw_pool_factory:expr, $expected:expr) => {{
+        use sqlx::Executor as _;
+        let tel = $crate::common::TestTelemetry::install();
+        let raw = $raw_pool_factory;
+        let pool = sqlx_otel::PoolBuilder::from(raw).build();
+
+        let _ = (&pool).fetch_optional("SELECT 1").await.unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        let actual_span = $crate::common::attr(&spans[0], "network.protocol.name");
+        let expected: Option<&str> = $expected;
+        assert_eq!(
+            actual_span,
+            expected.map(|s| opentelemetry::Value::String(s.to_owned().into())),
+            "span network.protocol.name must match the backend default",
+        );
+
+        let resource_metrics = tel.metrics();
+        let dp = $crate::common::find_duration_data_point(&resource_metrics)
+            .expect("db.client.operation.duration data point missing");
+        let actual_metric = $crate::common::metric_attr(&dp, "network.protocol.name");
+        assert_eq!(
+            actual_metric,
+            expected.map(|s| opentelemetry::Value::String(s.to_owned().into())),
+            "metric network.protocol.name must match the backend default",
+        );
+    }};
+}
+
+/// `PoolBuilder::with_network_protocol_name` overrides the backend default and the value
+/// surfaces on both spans and per-operation metrics.
+#[macro_export]
+macro_rules! test_builder_with_network_protocol_name_overrides {
+    ($raw_pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let _ = $dialect;
+        let tel = $crate::common::TestTelemetry::install();
+        let raw = $raw_pool_factory;
+        let pool = sqlx_otel::PoolBuilder::from(raw)
+            .with_network_protocol_name("custom-proto")
+            .build();
+
+        let _ = (&pool).fetch_optional("SELECT 1").await.unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "network.protocol.name"),
+            Some(opentelemetry::Value::String("custom-proto".into())),
+            "with_network_protocol_name must override the default on the span",
+        );
+
+        let resource_metrics = tel.metrics();
+        let dp = $crate::common::find_duration_data_point(&resource_metrics)
+            .expect("db.client.operation.duration data point missing");
+        assert_eq!(
+            $crate::common::metric_attr(&dp, "network.protocol.name"),
+            Some(opentelemetry::Value::String("custom-proto".into())),
+            "with_network_protocol_name must override the default on the metric",
+        );
+    }};
+}
+
+/// `PoolBuilder::with_network_transport` propagates `network.transport` onto spans and
+/// per-operation metrics. The wrapper does not infer transport from the connect string,
+/// so the attribute reflects the deployment configuration the caller declared.
+#[macro_export]
+macro_rules! test_builder_with_network_transport {
+    ($raw_pool_factory:expr, $dialect:expr) => {{
+        use sqlx::Executor as _;
+        let _ = $dialect;
+        let tel = $crate::common::TestTelemetry::install();
+        let raw = $raw_pool_factory;
+        let pool = sqlx_otel::PoolBuilder::from(raw)
+            .with_network_transport("tcp")
+            .build();
+
+        let _ = (&pool).fetch_optional("SELECT 1").await.unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "network.transport"),
+            Some(opentelemetry::Value::String("tcp".into())),
+            "span must carry network.transport set via with_network_transport",
+        );
+
+        let resource_metrics = tel.metrics();
+        let dp = $crate::common::find_duration_data_point(&resource_metrics)
+            .expect("db.client.operation.duration data point missing");
+        assert_eq!(
+            $crate::common::metric_attr(&dp, "network.transport"),
+            Some(opentelemetry::Value::String("tcp".into())),
+            "metric must carry network.transport set via with_network_transport",
+        );
+    }};
+}
+
 /// `PoolBuilder::with_network_peer_port` populates `network.peer.port`.
 #[macro_export]
 macro_rules! test_builder_with_network_peer_port {
@@ -3003,6 +3534,8 @@ macro_rules! test_query_text_mode_off_suppresses_sql {
             $crate::common::attr(&spans[0], "db.query.text").is_none(),
             "db.query.text should not be present when QueryTextMode::Off"
         );
+
+        $crate::common::assert_metric_for_system(&tel, $dialect.system);
     }};
 }
 
@@ -3041,6 +3574,7 @@ macro_rules! test_execute_records_affected_rows {
             Some(opentelemetry::Value::I64(3)),
             "inserting 3 rows should affect 3 rows"
         );
+        $crate::common::assert_metric_for_system(&tel, $dialect.system);
         tel.reset();
 
         // --- Upsert (dialect-specific) ---
@@ -3094,6 +3628,7 @@ macro_rules! test_execute_records_affected_rows {
             Some(opentelemetry::Value::I64(0)),
             "deleting non-existent rows should affect 0 rows"
         );
+        $crate::common::assert_metric_for_system(&tel, $dialect.system);
     }};
 }
 
@@ -3129,6 +3664,10 @@ macro_rules! test_transaction_rollback {
 #[macro_export]
 macro_rules! test_query_text_mode_obfuscated_replaces_literals {
     ($raw_pool_factory:expr, $dialect:expr) => {{
+        // This macro intentionally narrows scope to span-side `db.query.text` capture; it
+        // does not assert on metrics because the pool is constructed before the test
+        // telemetry is installed, so the pool's metric instruments bind to the no-op meter.
+        // Per-method metric coverage lives in every other `test_<method>_*` macro.
         use sqlx::Executor as _;
         let _ = $dialect;
         let raw = $raw_pool_factory;
@@ -3179,6 +3718,8 @@ macro_rules! test_fetch_optional_records_zero_rows {
             $crate::common::attr(&spans[0], "db.response.returned_rows"),
             Some(opentelemetry::Value::I64(0))
         );
+
+        $crate::common::assert_metric_for_system(&tel, $dialect.system);
     }};
 }
 
@@ -3205,6 +3746,8 @@ macro_rules! test_query_bind_first_then_annotations_via_pool {
         let spans = tel.spans();
         assert_eq!(spans.len(), 1);
         $crate::common::assert_annotated_span(&spans[0], &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -3231,6 +3774,8 @@ macro_rules! test_query_annotations_first_then_bind_via_pool {
         let spans = tel.spans();
         assert_eq!(spans.len(), 1);
         $crate::common::assert_annotated_span(&spans[0], &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -3270,6 +3815,8 @@ macro_rules! test_query_execute_with_annotations_via_pool {
             $crate::common::assert_annotated_span(span, &$dialect);
             assert!($crate::common::attr(span, "db.response.affected_rows").is_some());
         }
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -3308,6 +3855,8 @@ macro_rules! test_query_execute_with_annotations_via_connection {
         for span in &spans {
             $crate::common::assert_annotated_span(span, &$dialect);
         }
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -3347,6 +3896,8 @@ macro_rules! test_query_execute_with_annotations_via_transaction {
         for span in &spans {
             $crate::common::assert_annotated_span(span, &$dialect);
         }
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -3368,6 +3919,8 @@ macro_rules! test_query_with_operation_shorthand_via_pool {
         let spans = tel.spans();
         assert_eq!(spans.len(), 1);
         $crate::common::assert_annotated_span(&spans[0], &$dialect);
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -3394,6 +3947,8 @@ macro_rules! test_query_fetch_optional_with_annotations_via_pool {
             $crate::common::attr(&spans[0], "db.response.returned_rows"),
             Some(opentelemetry::Value::I64(0))
         );
+
+        $crate::common::assert_annotated_metric(&tel, &$dialect);
     }};
 }
 
@@ -3407,7 +3962,13 @@ macro_rules! test_query_fetch_optional_with_annotations_via_pool {
 #[macro_export]
 macro_rules! test_executor_side_query_side_parity_via_pool {
     ($pool_factory:expr, $dialect:expr) => {{
+        // This macro asserts span-side parity between the executor and query annotation
+        // surfaces. It does not assert on metrics because the pool is constructed before
+        // the test telemetry is installed, so the pool's metric instruments bind to the
+        // no-op meter. Per-method metric coverage lives in every other `test_<method>_*`
+        // macro.
         use sqlx_otel::QueryAnnotateExt as _;
+        let _ = $dialect;
         let pool = $pool_factory;
         let tel = $crate::common::TestTelemetry::install();
 
@@ -3463,7 +4024,5 @@ macro_rules! test_executor_side_query_side_parity_via_pool {
         let query_spans = tel.spans();
 
         $crate::common::assert_span_parity("query_scalar::fetch_one", &exec_spans, &query_spans);
-
-        let _ = $dialect;
     }};
 }

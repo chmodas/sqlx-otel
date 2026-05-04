@@ -6,9 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `PoolBuilder::with_network_protocol_name` and `with_network_transport` builder methods, plus a per-backend `Database::DEFAULT_NETWORK_PROTOCOL_NAME` constant (Postgres → `"postgresql"`, MySQL → `"mysql"`, SQLite → `None`). `network.protocol.name`, `network.transport`, and `db.client.connection.pool.name` now surface on every span and per-operation metric data point so dashboards can slice query latency by the same dimensions OTel's database-spans semconv recommends ([#32](https://github.com/chmodas/sqlx-otel/pull/32)).
+
+### Changed
+
+- `db.client.connection.pool.name` previously appeared only on the `db.client.connection.count` gauge; it now also propagates to spans, the `db.client.operation.duration` / `db.client.response.returned_rows` histograms, and the rest of the `db.client.connection.*` family via the shared connection-attribute set. The `count` gauge's attribute set is unchanged ([#32](https://github.com/chmodas/sqlx-otel/pull/32)).
+
 ### Fixed
 
-- Query-side `with_annotations` / `with_operation` now compile inside `Send`-required async contexts (axum handlers, `tokio::spawn`, `tower::Service`-bounded futures). The `AnnotatedQuery::fetch_*` / `execute` forwarders were rewritten from `async fn` into `fn -> impl Future + Send + 'e`, so the HRTB carried by the internal `IntoAnnotatedExecutor` impls no longer leaks into auto-trait inference of an opaque coroutine. Span output is byte-identical to the executor-side surface; metrics emission is unchanged by construction because both surfaces continue to funnel through the same `Annotated<'_, Pool<DB>>` `Executor` impl ([#NN](https://github.com/chmodas/sqlx-otel/pull/31)).
+- Query-side `with_annotations` / `with_operation` now compile inside `Send`-required async contexts (axum handlers, `tokio::spawn`, `tower::Service`-bounded futures). The `AnnotatedQuery::fetch_*` / `execute` forwarders were rewritten from `async fn` into `fn -> impl Future + Send + 'e`, so the HRTB carried by the internal `IntoAnnotatedExecutor` impls no longer leaks into auto-trait inference of an opaque coroutine. Span output is byte-identical to the executor-side surface; metrics emission is unchanged by construction because both surfaces continue to funnel through the same `Annotated<'_, Pool<DB>>` `Executor` impl ([#31](https://github.com/chmodas/sqlx-otel/pull/31)).
+- `db.client.operation.duration` histogram now carries annotation-derived attributes (`db.operation.name`, `db.collection.name`, `db.query.summary`, `db.stored_procedure.name`) and error-path attributes (`error.type`, plus `db.response.status_code` for `sqlx::Error::Database`). Previously only connection-level attributes (`db.system.name`, `db.namespace`) reached the histogram, so dashboards could not slice DB latency by operation verb, target collection, or error class. The `InstrumentedStream` poll loop also gains a single-error latch so streams that yield multiple `Err` items before terminating cannot append duplicate `error.type` / `db.response.status_code` keys ([#32](https://github.com/chmodas/sqlx-otel/pull/32)).
 
 ## [0.2.0] – 2026-04-28
 

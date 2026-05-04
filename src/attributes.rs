@@ -57,6 +57,18 @@ pub(crate) struct ConnectionAttributes {
     pub network_peer_address: Option<String>,
     /// `network.peer.port` – the resolved port, user-provided.
     pub network_peer_port: Option<u16>,
+    /// `network.protocol.name` – the OSI L7 wire protocol (e.g. `"postgresql"`, `"mysql"`).
+    /// `None` for embedded backends that do not speak a wire protocol (e.g. `SQLite`).
+    pub network_protocol_name: Option<String>,
+    /// `network.transport` – the OSI L4 transport (`"tcp"`, `"udp"`, `"pipe"`, `"unix"`,
+    /// `"inproc"`). User-provided via [`PoolBuilder::with_network_transport`](
+    /// crate::PoolBuilder::with_network_transport); the wrapper does not infer it from the
+    /// connect string.
+    pub network_transport: Option<String>,
+    /// `db.client.connection.pool.name` – user-provided pool identifier shared with the
+    /// `db.client.connection.*` metric family. Surfaces on every span and per-operation
+    /// metric so dashboards can correlate query latency with pool-level signals.
+    pub pool_name: Option<String>,
     /// Controls `db.query.text` capture.
     pub query_text_mode: QueryTextMode,
 }
@@ -65,7 +77,7 @@ impl ConnectionAttributes {
     /// Produce the base `KeyValue` set for span and metric attribute lists. Only includes
     /// attributes that have a value – optional fields are omitted when `None`.
     pub fn base_key_values(&self) -> Vec<KeyValue> {
-        let mut attrs = Vec::with_capacity(6);
+        let mut attrs = Vec::with_capacity(9);
         attrs.push(KeyValue::new(attribute::DB_SYSTEM_NAME, self.system));
         if let Some(ref host) = self.host {
             attrs.push(KeyValue::new(attribute::SERVER_ADDRESS, host.clone()));
@@ -81,6 +93,24 @@ impl ConnectionAttributes {
         }
         if let Some(port) = self.network_peer_port {
             attrs.push(KeyValue::new(attribute::NETWORK_PEER_PORT, i64::from(port)));
+        }
+        if let Some(ref proto) = self.network_protocol_name {
+            attrs.push(KeyValue::new(
+                attribute::NETWORK_PROTOCOL_NAME,
+                proto.clone(),
+            ));
+        }
+        if let Some(ref transport) = self.network_transport {
+            attrs.push(KeyValue::new(
+                attribute::NETWORK_TRANSPORT,
+                transport.clone(),
+            ));
+        }
+        if let Some(ref name) = self.pool_name {
+            attrs.push(KeyValue::new(
+                attribute::DB_CLIENT_CONNECTION_POOL_NAME,
+                name.clone(),
+            ));
         }
         attrs
     }
@@ -210,16 +240,22 @@ mod tests {
             namespace: Some("mydb".into()),
             network_peer_address: Some("127.0.0.1".into()),
             network_peer_port: Some(5432),
+            network_protocol_name: Some("postgresql".into()),
+            network_transport: Some("tcp".into()),
+            pool_name: Some("primary".into()),
             query_text_mode: QueryTextMode::Full,
         };
         let kvs = attrs.base_key_values();
-        assert_eq!(kvs.len(), 6);
+        assert_eq!(kvs.len(), 9);
         assert_eq!(kvs[0].key.as_str(), "db.system.name");
         assert_eq!(kvs[1].key.as_str(), "server.address");
         assert_eq!(kvs[2].key.as_str(), "server.port");
         assert_eq!(kvs[3].key.as_str(), "db.namespace");
         assert_eq!(kvs[4].key.as_str(), "network.peer.address");
         assert_eq!(kvs[5].key.as_str(), "network.peer.port");
+        assert_eq!(kvs[6].key.as_str(), "network.protocol.name");
+        assert_eq!(kvs[7].key.as_str(), "network.transport");
+        assert_eq!(kvs[8].key.as_str(), "db.client.connection.pool.name");
     }
 
     #[test]
@@ -231,6 +267,9 @@ mod tests {
             namespace: None,
             network_peer_address: None,
             network_peer_port: None,
+            network_protocol_name: None,
+            network_transport: None,
+            pool_name: None,
             query_text_mode: QueryTextMode::Off,
         };
         let kvs = attrs.base_key_values();
@@ -328,6 +367,9 @@ mod tests {
             namespace in proptest::option::of("[a-z]{1,16}"),
             network_peer_address in proptest::option::of("[0-9.:]{1,32}"),
             network_peer_port in proptest::option::of(any::<u16>()),
+            network_protocol_name in proptest::option::of("[a-z]{1,16}"),
+            network_transport in proptest::option::of("[a-z]{1,8}"),
+            pool_name in proptest::option::of("[a-z0-9-]{1,32}"),
         ) {
             let attrs = ConnectionAttributes {
                 system: "sqlite",
@@ -336,6 +378,9 @@ mod tests {
                 namespace: namespace.clone(),
                 network_peer_address: network_peer_address.clone(),
                 network_peer_port,
+                network_protocol_name: network_protocol_name.clone(),
+                network_transport: network_transport.clone(),
+                pool_name: pool_name.clone(),
                 query_text_mode: QueryTextMode::Off,
             };
             let kvs = attrs.base_key_values();
@@ -344,9 +389,26 @@ mod tests {
                 + usize::from(port.is_some())
                 + usize::from(namespace.is_some())
                 + usize::from(network_peer_address.is_some())
-                + usize::from(network_peer_port.is_some());
+                + usize::from(network_peer_port.is_some())
+                + usize::from(network_protocol_name.is_some())
+                + usize::from(network_transport.is_some())
+                + usize::from(pool_name.is_some());
             prop_assert_eq!(kvs.len(), expected);
             prop_assert_eq!(kvs[0].key.as_str(), "db.system.name");
+
+            let keys: Vec<&str> = kvs.iter().map(|k| k.key.as_str()).collect();
+            prop_assert_eq!(
+                keys.contains(&"network.protocol.name"),
+                network_protocol_name.is_some(),
+            );
+            prop_assert_eq!(
+                keys.contains(&"network.transport"),
+                network_transport.is_some(),
+            );
+            prop_assert_eq!(
+                keys.contains(&"db.client.connection.pool.name"),
+                pool_name.is_some(),
+            );
         }
     }
 }

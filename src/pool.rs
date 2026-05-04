@@ -53,6 +53,8 @@ pub struct PoolBuilder<DB: sqlx::Database> {
     namespace: Option<String>,
     network_peer_address: Option<String>,
     network_peer_port: Option<u16>,
+    network_protocol_name: Option<String>,
+    network_transport: Option<String>,
     query_text_mode: QueryTextMode,
     pool_name: Option<String>,
     pool_metrics_interval: Duration,
@@ -60,7 +62,10 @@ pub struct PoolBuilder<DB: sqlx::Database> {
 
 impl<DB: Database> From<sqlx::Pool<DB>> for PoolBuilder<DB> {
     /// Create a builder from an existing `sqlx::Pool`, auto-extracting connection
-    /// attributes from the backend's connect options.
+    /// attributes from the backend's connect options. `network.protocol.name` is
+    /// pre-populated from [`Database::DEFAULT_NETWORK_PROTOCOL_NAME`] (the wire protocol
+    /// for Postgres / `MySQL`; absent for `SQLite`); override via
+    /// [`with_network_protocol_name`](Self::with_network_protocol_name).
     fn from(pool: sqlx::Pool<DB>) -> Self {
         let (host, port, namespace) = DB::connection_attributes(&pool);
         Self {
@@ -70,6 +75,8 @@ impl<DB: Database> From<sqlx::Pool<DB>> for PoolBuilder<DB> {
             namespace,
             network_peer_address: None,
             network_peer_port: None,
+            network_protocol_name: DB::DEFAULT_NETWORK_PROTOCOL_NAME.map(String::from),
+            network_transport: None,
             query_text_mode: QueryTextMode::default(),
             pool_name: None,
             pool_metrics_interval: Duration::from_secs(10),
@@ -110,6 +117,27 @@ impl<DB: Database> PoolBuilder<DB> {
     #[must_use]
     pub fn with_network_peer_port(mut self, port: u16) -> Self {
         self.network_peer_port = Some(port);
+        self
+    }
+
+    /// Override the `network.protocol.name` attribute. Defaults to the backend's wire
+    /// protocol via [`Database::DEFAULT_NETWORK_PROTOCOL_NAME`] (`"postgresql"` /
+    /// `"mysql"`; absent for `SQLite`). Override when the connection is tunnelled through
+    /// a different application-layer protocol or when reporting to a system that expects a
+    /// specific name.
+    #[must_use]
+    pub fn with_network_protocol_name(mut self, name: impl Into<String>) -> Self {
+        self.network_protocol_name = Some(name.into());
+        self
+    }
+
+    /// Set the `network.transport` attribute (the OSI L4 transport: `"tcp"`, `"udp"`,
+    /// `"pipe"`, `"unix"`, `"inproc"`). The wrapper does not infer transport from the
+    /// connect string – callers who want this attribute on spans / metrics must set it
+    /// explicitly so the value reflects the deployment configuration rather than a guess.
+    #[must_use]
+    pub fn with_network_transport(mut self, transport: impl Into<String>) -> Self {
+        self.network_transport = Some(transport.into());
         self
     }
 
@@ -167,6 +195,9 @@ impl<DB: Database> PoolBuilder<DB> {
             namespace: self.namespace,
             network_peer_address: self.network_peer_address,
             network_peer_port: self.network_peer_port,
+            network_protocol_name: self.network_protocol_name,
+            network_transport: self.network_transport,
+            pool_name: self.pool_name,
             query_text_mode: self.query_text_mode,
         });
         let metrics = Arc::new(Metrics::new());

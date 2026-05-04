@@ -18,6 +18,30 @@ use crate::metrics::Metrics;
 // Span helpers
 // ---------------------------------------------------------------------------
 
+/// Append the four per-query semantic convention annotation attributes
+/// (`db.operation.name`, `db.collection.name`, `db.query.summary`, `db.stored_procedure.name`) onto
+/// the supplied vector, one push per field that is `Some`. Used by both the span attribute builder
+/// and `begin_query_span`'s metric attribute list so the two emit identical annotation-derived
+/// keys.
+fn append_annotation_attrs(kv: &mut Vec<KeyValue>, annotations: Option<&QueryAnnotations>) {
+    let Some(ann) = annotations else { return };
+    if let Some(ref op) = ann.operation {
+        kv.push(KeyValue::new(attribute::DB_OPERATION_NAME, op.clone()));
+    }
+    if let Some(ref coll) = ann.collection {
+        kv.push(KeyValue::new(attribute::DB_COLLECTION_NAME, coll.clone()));
+    }
+    if let Some(ref summary) = ann.query_summary {
+        kv.push(KeyValue::new(attribute::DB_QUERY_SUMMARY, summary.clone()));
+    }
+    if let Some(ref sp) = ann.stored_procedure {
+        kv.push(KeyValue::new(
+            attribute::DB_STORED_PROCEDURE_NAME,
+            sp.clone(),
+        ));
+    }
+}
+
 /// Build span attributes for a query, combining connection-level and per-query values.
 ///
 /// When `annotations` is provided, the four per-query semantic convention attributes
@@ -29,23 +53,7 @@ fn build_attributes(
     annotations: Option<&QueryAnnotations>,
 ) -> Vec<KeyValue> {
     let mut kv = attrs.base_key_values();
-    if let Some(ann) = annotations {
-        if let Some(ref op) = ann.operation {
-            kv.push(KeyValue::new(attribute::DB_OPERATION_NAME, op.clone()));
-        }
-        if let Some(ref coll) = ann.collection {
-            kv.push(KeyValue::new(attribute::DB_COLLECTION_NAME, coll.clone()));
-        }
-        if let Some(ref summary) = ann.query_summary {
-            kv.push(KeyValue::new(attribute::DB_QUERY_SUMMARY, summary.clone()));
-        }
-        if let Some(ref sp) = ann.stored_procedure {
-            kv.push(KeyValue::new(
-                attribute::DB_STORED_PROCEDURE_NAME,
-                sp.clone(),
-            ));
-        }
-    }
+    append_annotation_attrs(&mut kv, annotations);
     if let Some(sql) = sql {
         match attrs.query_text_mode {
             QueryTextMode::Full => {
@@ -75,12 +83,18 @@ fn start_span(name: &str, span_attrs: Vec<KeyValue>) -> (OtelContext, Instant) {
     (cx, Instant::now())
 }
 
-/// Start an instrumented query: derive the span name from the connection attributes and
-/// per-query annotations, build the span and metric attribute lists, and open the span.
+/// Start an instrumented query: derive the span name from the connection attributes and per-query
+/// annotations, build the span and metric attribute lists, and open the span.
 ///
-/// Returns the span's context, the timing reference for `finish()`, and the metric
-/// attribute list. This consolidates the boilerplate that every `Executor` method shares
-/// before delegating to the inner `SQLx` call.
+/// Returns the span's context, the timing reference for `finish()`, and the metric attribute list.
+/// This consolidates the boilerplate that every `Executor` method shares before delegating to the
+/// inner `SQLx` call.
+///
+/// The returned `metric_attrs` mirror the bounded portion of the span attribute set: connection
+/// attributes plus the four annotation-derived attributes when present, plus error-path attributes
+/// (`error.type`, `db.response.status_code`) appended later by `record_error`. The unbounded
+/// `db.query.text` attribute is deliberately excluded; `db.query.summary` is caller-controlled and
+/// can be unbounded — that cardinality cost is inherited from the span side.
 fn begin_query_span(
     attrs: &ConnectionAttributes,
     sql: Option<&str>,
@@ -95,7 +109,8 @@ fn begin_query_span(
     });
     let name = attributes::span_name(attrs.system, op, coll, summary);
     let span_attrs = build_attributes(attrs, sql, annotations);
-    let metric_attrs = attrs.base_key_values();
+    let mut metric_attrs = attrs.base_key_values();
+    append_annotation_attrs(&mut metric_attrs, annotations);
     let (cx, start) = start_span(&name, span_attrs);
     (cx, start, metric_attrs)
 }
@@ -123,27 +138,34 @@ fn error_type(err: &sqlx::Error) -> &'static str {
     }
 }
 
-/// Record an error on the span within the given context: set status, `error.type`, and
-/// add an exception event.
-fn record_error(cx: &OtelContext, err: &sqlx::Error) {
+/// Record an error on the span within the given context: set status, `error.type`, and add an
+/// exception event. Also append `error.type` and `db.response.status_code` (SQLSTATE for
+/// `sqlx::Error::Database`) onto `metric_attrs` so the histogram emission carries the same
+/// error-path dimensions as the span. Single source of truth for `error_type(err)` and SQLSTATE
+/// extraction.
+fn record_error(cx: &OtelContext, err: &sqlx::Error, metric_attrs: &mut Vec<KeyValue>) {
     let span = cx.span();
+    let kind = error_type(err);
     span.set_status(Status::Error {
         description: Cow::Owned(err.to_string()),
     });
-    span.set_attribute(KeyValue::new(attribute::ERROR_TYPE, error_type(err)));
+    span.set_attribute(KeyValue::new(attribute::ERROR_TYPE, kind));
+    metric_attrs.push(KeyValue::new(attribute::ERROR_TYPE, kind));
     // Extract SQLSTATE or database-specific error code when available.
     if let sqlx::Error::Database(db_err) = err {
         if let Some(code) = db_err.code() {
+            let code = code.into_owned();
             span.set_attribute(KeyValue::new(
                 attribute::DB_RESPONSE_STATUS_CODE,
-                code.into_owned(),
+                code.clone(),
             ));
+            metric_attrs.push(KeyValue::new(attribute::DB_RESPONSE_STATUS_CODE, code));
         }
     }
     span.add_event(
         "exception",
         vec![
-            KeyValue::new("exception.type", error_type(err)),
+            KeyValue::new("exception.type", kind),
             KeyValue::new("exception.message", err.to_string()),
         ],
     );
@@ -184,11 +206,11 @@ async fn execute_instrumented<T>(
     cx: OtelContext,
     start: Instant,
     metrics: std::sync::Arc<Metrics>,
-    metric_attrs: Vec<KeyValue>,
+    mut metric_attrs: Vec<KeyValue>,
 ) -> Result<T, sqlx::Error> {
     let result = fut.await;
     if let Err(err) = &result {
-        record_error(&cx, err);
+        record_error(&cx, err, &mut metric_attrs);
     }
     finish(&cx, start, None, &metrics, &metric_attrs);
     result
@@ -241,6 +263,7 @@ struct InstrumentedStream<S, C> {
     rows: u64,
     metrics: std::sync::Arc<Metrics>,
     metric_attrs: Vec<KeyValue>,
+    error_recorded: bool,
     finished: bool,
     _counter: std::marker::PhantomData<C>,
 }
@@ -260,6 +283,7 @@ impl<S, C> InstrumentedStream<S, C> {
             rows: 0,
             metrics,
             metric_attrs,
+            error_recorded: false,
             finished: false,
             _counter: std::marker::PhantomData,
         }
@@ -298,7 +322,16 @@ where
                 Poll::Ready(Some(Ok(item)))
             }
             Poll::Ready(Some(Err(err))) => {
-                record_error(&self.cx, &err);
+                if !self.error_recorded {
+                    self.error_recorded = true;
+                    // Re-borrow `&mut *self` to split the disjoint-field borrow:
+                    // `record_error` needs `&self.cx` (immutable) and `&mut self.metric_attrs`
+                    // (mutable) simultaneously. Going through `Pin<&mut Self>::deref_mut`
+                    // (sound here because of the explicit `Unpin` impl below) lets the
+                    // borrow checker see the two fields as distinct.
+                    let this = &mut *self;
+                    record_error(&this.cx, &err, &mut this.metric_attrs);
+                }
                 Poll::Ready(Some(Err(err)))
             }
             Poll::Ready(None) => {
@@ -357,7 +390,7 @@ macro_rules! impl_executor {
             {
                 let sql = query.sql().to_owned();
                 let state = $self_.state.clone();
-                let (cx, start, metric_attrs) =
+                let (cx, start, mut metric_attrs) =
                     begin_query_span(&state.attrs, Some(&sql), $ann);
                 let fut = ($inner).execute(query);
                 Box::pin(async move {
@@ -367,7 +400,7 @@ macro_rules! impl_executor {
                             record_affected_rows(&cx, DB::rows_affected(qr));
                         }
                         Err(err) => {
-                            record_error(&cx, err);
+                            record_error(&cx, err, &mut metric_attrs);
                         }
                     }
                     finish(&cx, start, None, &state.metrics, &metric_attrs);
@@ -470,7 +503,7 @@ macro_rules! impl_executor {
             {
                 let sql = query.sql().to_owned();
                 let state = $self_.state.clone();
-                let (cx, start, metric_attrs) =
+                let (cx, start, mut metric_attrs) =
                     begin_query_span(&state.attrs, Some(&sql), $ann);
                 let fut = ($inner).fetch_all(query);
                 Box::pin(async move {
@@ -482,7 +515,7 @@ macro_rules! impl_executor {
                             finish(&cx, start, Some(count), &state.metrics, &metric_attrs);
                         }
                         Err(err) => {
-                            record_error(&cx, err);
+                            record_error(&cx, err, &mut metric_attrs);
                             finish(&cx, start, None, &state.metrics, &metric_attrs);
                         }
                     }
@@ -504,7 +537,7 @@ macro_rules! impl_executor {
             {
                 let sql = query.sql().to_owned();
                 let state = $self_.state.clone();
-                let (cx, start, metric_attrs) =
+                let (cx, start, mut metric_attrs) =
                     begin_query_span(&state.attrs, Some(&sql), $ann);
                 let fut = ($inner).fetch_one(query);
                 Box::pin(async move {
@@ -515,7 +548,7 @@ macro_rules! impl_executor {
                             finish(&cx, start, Some(1), &state.metrics, &metric_attrs);
                         }
                         Err(err) => {
-                            record_error(&cx, err);
+                            record_error(&cx, err, &mut metric_attrs);
                             finish(&cx, start, None, &state.metrics, &metric_attrs);
                         }
                     }
@@ -537,7 +570,7 @@ macro_rules! impl_executor {
             {
                 let sql = query.sql().to_owned();
                 let state = $self_.state.clone();
-                let (cx, start, metric_attrs) =
+                let (cx, start, mut metric_attrs) =
                     begin_query_span(&state.attrs, Some(&sql), $ann);
                 let fut = ($inner).fetch_optional(query);
                 Box::pin(async move {
@@ -549,7 +582,7 @@ macro_rules! impl_executor {
                             finish(&cx, start, Some(count), &state.metrics, &metric_attrs);
                         }
                         Err(err) => {
-                            record_error(&cx, err);
+                            record_error(&cx, err, &mut metric_attrs);
                             finish(&cx, start, None, &state.metrics, &metric_attrs);
                         }
                     }
@@ -728,6 +761,53 @@ mod tests {
         // construct an unknown variant, but it ensures forward compatibility.
     }
 
+    /// `InstrumentedStream::poll_next`'s `error_recorded` guard prevents `record_error`
+    /// from running more than once when the underlying stream yields multiple `Err`s
+    /// before terminating. Without the guard, the metric's attribute slice would
+    /// accumulate duplicate `error.type` (and `db.response.status_code`) `KeyValue`s,
+    /// producing a malformed histogram data point. Driven directly via a mock stream so
+    /// the assertion does not depend on backend stream-termination semantics.
+    #[test]
+    fn instrumented_stream_records_error_only_once_when_polled_past_err() {
+        use futures::StreamExt as _;
+        use futures::executor::block_on;
+        use futures::stream;
+
+        let metrics = std::sync::Arc::new(crate::metrics::Metrics::new());
+        let metric_attrs = vec![KeyValue::new(attribute::DB_SYSTEM_NAME, "postgresql")];
+        let (cx, start) = start_span("test", Vec::new());
+
+        // Yield two distinct `Err`s back-to-back, then `None`.
+        let inner = stream::iter(vec![
+            Err::<u64, _>(sqlx::Error::ColumnNotFound("x".into())),
+            Err(sqlx::Error::ColumnNotFound("y".into())),
+        ]);
+        let mut s = InstrumentedStream::<_, CountAll>::new(inner, cx, start, metrics, metric_attrs);
+
+        block_on(async {
+            assert!(matches!(s.next().await, Some(Err(_))), "expected first Err");
+            assert!(
+                matches!(s.next().await, Some(Err(_))),
+                "expected second Err"
+            );
+            assert!(s.next().await.is_none(), "expected stream to terminate");
+        });
+
+        let error_type_count = s
+            .metric_attrs
+            .iter()
+            .filter(|kv| kv.key.as_str() == "error.type")
+            .count();
+        assert_eq!(
+            error_type_count, 1,
+            "error.type must appear exactly once even when the stream yields multiple Err items",
+        );
+        assert!(
+            s.error_recorded,
+            "error_recorded should latch true after the first Err",
+        );
+    }
+
     fn test_attrs() -> ConnectionAttributes {
         ConnectionAttributes {
             system: "postgresql",
@@ -736,6 +816,9 @@ mod tests {
             namespace: Some("mydb".into()),
             network_peer_address: None,
             network_peer_port: None,
+            network_protocol_name: None,
+            network_transport: None,
+            pool_name: None,
             query_text_mode: QueryTextMode::Full,
         }
     }
@@ -836,6 +919,53 @@ mod tests {
     }
 
     #[test]
+    fn append_annotation_attrs_pushes_all_four_when_set() {
+        let ann = QueryAnnotations::new()
+            .operation("SELECT")
+            .collection("users")
+            .query_summary("users by id")
+            .stored_procedure("sp_get_users");
+        let mut kv = Vec::new();
+        append_annotation_attrs(&mut kv, Some(&ann));
+        let pairs: Vec<(&str, &opentelemetry::Value)> =
+            kv.iter().map(|k| (k.key.as_str(), &k.value)).collect();
+        assert_eq!(pairs.len(), 4, "expected one push per annotation field");
+        assert!(pairs.contains(&(
+            "db.operation.name",
+            &opentelemetry::Value::String("SELECT".into())
+        )));
+        assert!(pairs.contains(&(
+            "db.collection.name",
+            &opentelemetry::Value::String("users".into())
+        )));
+        assert!(pairs.contains(&(
+            "db.query.summary",
+            &opentelemetry::Value::String("users by id".into())
+        )));
+        assert!(pairs.contains(&(
+            "db.stored_procedure.name",
+            &opentelemetry::Value::String("sp_get_users".into())
+        )));
+    }
+
+    #[test]
+    fn append_annotation_attrs_none_pushes_nothing() {
+        let mut kv = Vec::new();
+        append_annotation_attrs(&mut kv, None);
+        assert!(kv.is_empty(), "no pushes expected when annotations is None");
+    }
+
+    #[test]
+    fn append_annotation_attrs_default_pushes_nothing() {
+        let mut kv = Vec::new();
+        append_annotation_attrs(&mut kv, Some(&QueryAnnotations::new()));
+        assert!(
+            kv.is_empty(),
+            "no pushes expected when every annotation field is None"
+        );
+    }
+
+    #[test]
     fn build_attributes_annotation_field_permutations() {
         type Setter = fn(QueryAnnotations) -> QueryAnnotations;
 
@@ -901,6 +1031,9 @@ mod tests {
             namespace,
             network_peer_address,
             network_peer_port,
+            network_protocol_name: None,
+            network_transport: None,
+            pool_name: None,
             query_text_mode,
         }
     }
@@ -1038,6 +1171,40 @@ mod tests {
             prop_assert!(!keys.contains(&"db.collection.name"));
             prop_assert!(!keys.contains(&"db.query.summary"));
             prop_assert!(!keys.contains(&"db.stored_procedure.name"));
+        }
+
+        /// `append_annotation_attrs` membership invariant: starting from an empty vector,
+        /// the appended key set is exactly `{"db.operation.name" iff op.is_some(),
+        /// "db.collection.name" iff coll.is_some(), "db.query.summary" iff
+        /// query_summary.is_some(), "db.stored_procedure.name" iff
+        /// stored_procedure.is_some()}` — and nothing else, in particular none of the
+        /// connection or query-text keys leak through.
+        #[test]
+        fn append_annotation_attrs_membership_invariant(ann in any_annotations()) {
+            let mut kv = Vec::new();
+            append_annotation_attrs(&mut kv, Some(&ann));
+            let keys: Vec<&str> = kv.iter().map(|k| k.key.as_str()).collect();
+
+            prop_assert_eq!(keys.contains(&"db.operation.name"), ann.operation.is_some());
+            prop_assert_eq!(keys.contains(&"db.collection.name"), ann.collection.is_some());
+            prop_assert_eq!(keys.contains(&"db.query.summary"), ann.query_summary.is_some());
+            prop_assert_eq!(
+                keys.contains(&"db.stored_procedure.name"),
+                ann.stored_procedure.is_some(),
+            );
+
+            // No connection or query-text keys leak in from a stray copy-paste of
+            // `build_attributes` semantics.
+            prop_assert!(!keys.contains(&"db.system.name"));
+            prop_assert!(!keys.contains(&"db.namespace"));
+            prop_assert!(!keys.contains(&"db.query.text"));
+
+            // Cardinality matches the count of `Some` annotation fields.
+            let expected_count = usize::from(ann.operation.is_some())
+                + usize::from(ann.collection.is_some())
+                + usize::from(ann.query_summary.is_some())
+                + usize::from(ann.stored_procedure.is_some());
+            prop_assert_eq!(kv.len(), expected_count);
         }
     }
 }

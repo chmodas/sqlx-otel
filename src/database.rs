@@ -18,6 +18,13 @@ pub trait Database: sqlx::Database + sealed::Sealed {
     /// `"sqlite"`, `"mysql"`).
     const SYSTEM: &'static str;
 
+    /// Default `network.protocol.name` for this backend. `Some("postgresql")` /
+    /// `Some("mysql")` for the network-protocol backends; `None` for embedded backends
+    /// that do not speak a wire protocol (e.g. `SQLite`). Used by `PoolBuilder::from` to
+    /// pre-populate the attribute on every span and per-operation metric; override via
+    /// [`PoolBuilder::with_network_protocol_name`](crate::PoolBuilder::with_network_protocol_name).
+    const DEFAULT_NETWORK_PROTOCOL_NAME: Option<&'static str>;
+
     /// Extract host, port, and database namespace from the backend's connect options.
     ///
     /// Returns `(host, port, namespace)` where any component may be `None` if the backend
@@ -74,6 +81,7 @@ fn url_based_connection_attributes<O: sqlx::ConnectOptions>(
 #[cfg_attr(docsrs, doc(cfg(feature = "sqlite")))]
 impl Database for sqlx::Sqlite {
     const SYSTEM: &'static str = "sqlite";
+    const DEFAULT_NETWORK_PROTOCOL_NAME: Option<&'static str> = None;
 
     fn connection_attributes(
         pool: &sqlx::Pool<Self>,
@@ -95,6 +103,7 @@ impl Database for sqlx::Sqlite {
 #[cfg_attr(docsrs, doc(cfg(feature = "postgres")))]
 impl Database for sqlx::Postgres {
     const SYSTEM: &'static str = "postgresql";
+    const DEFAULT_NETWORK_PROTOCOL_NAME: Option<&'static str> = Some("postgresql");
 
     fn connection_attributes(
         pool: &sqlx::Pool<Self>,
@@ -111,6 +120,7 @@ impl Database for sqlx::Postgres {
 #[cfg_attr(docsrs, doc(cfg(feature = "mysql")))]
 impl Database for sqlx::MySql {
     const SYSTEM: &'static str = "mysql";
+    const DEFAULT_NETWORK_PROTOCOL_NAME: Option<&'static str> = Some("mysql");
 
     fn connection_attributes(
         pool: &sqlx::Pool<Self>,

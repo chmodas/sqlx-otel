@@ -168,12 +168,15 @@ On error, the span status is set to `Error` and an `exception` event is added wi
 
 ### Operation metrics
 
-| Instrument                         | Type      | Unit | Description                           |
-|------------------------------------|-----------|------|---------------------------------------|
-| `db.client.operation.duration`     | Histogram | `s`  | Duration of each database operation   |
-| `db.client.response.returned_rows` | Histogram |      | Number of rows returned per operation |
+| Instrument                         | Type      | Unit | Description                                   |
+|------------------------------------|-----------|------|-----------------------------------------------|
+| `db.client.operation.duration`     | Histogram | `s`  | Duration of each database operation           |
+| `db.client.response.returned_rows` | Histogram |      | Number of rows returned per `fetch*` call     |
+| `db.client.response.affected_rows` | Histogram |      | Rows affected per `execute` call (custom)     |
 
 These mirror the bounded portion of the span attribute set: connection-level attributes (`db.system.name`, `db.namespace`, `server.address`/`port`, `network.peer.address`/`port`, `network.protocol.name`, `network.transport`, `db.client.connection.pool.name` – wherever set), plus annotation-derived attributes (`db.operation.name`, `db.collection.name`, `db.query.summary`, `db.stored_procedure.name`) when present, plus error-path attributes (`error.type`, plus `db.response.status_code` for `sqlx::Error::Database`) on the error path. `db.query.text` is deliberately excluded for cardinality; `db.query.summary` is caller-controlled and inherits its cardinality cost from the span side.
+
+`db.client.response.affected_rows` is not part of the OpenTelemetry semantic conventions – we ship it for the same reason as the matching span attribute: backends report a useful database-confirmed count that's worth slicing alongside duration. It is recorded only on `execute()` calls (where `QueryResult::rows_affected()` is meaningful) and is not recorded for `execute_many` (deprecated upstream).
 
 ### Connection pool metrics
 

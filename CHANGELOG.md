@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `db.client.response.affected_rows` histogram – a custom metric (no OTel semconv equivalent) mirroring the existing `db.response.affected_rows` span attribute. Recorded on `execute()` calls; carries the same connection / annotation / error attribute set as the duration histogram so dashboards can slice mutation throughput by the same dimensions ([#33](https://github.com/chmodas/sqlx-otel/pull/33)).
 - `PoolBuilder::with_network_protocol_name` and `with_network_transport` builder methods, plus a per-backend `Database::DEFAULT_NETWORK_PROTOCOL_NAME` constant (Postgres → `"postgresql"`, MySQL → `"mysql"`, SQLite → `None`). `network.protocol.name`, `network.transport`, and `db.client.connection.pool.name` now surface on every span and per-operation metric data point so dashboards can slice query latency by the same dimensions OTel's database-spans semconv recommends ([#32](https://github.com/chmodas/sqlx-otel/pull/32)).
 
 ### Changed

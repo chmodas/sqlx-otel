@@ -3754,6 +3754,69 @@ macro_rules! test_query_text_mode_obfuscated_replaces_literals {
     }};
 }
 
+/// `QueryTextMode::Full` (default) emits `db.query.text` with inter-token whitespace
+/// collapsed to a single space. The query is dialect-neutral (no placeholders, just a
+/// constant SELECT split across lines), so the only dialect input is the raw pool factory
+/// used to build a default-configured pool.
+#[macro_export]
+macro_rules! test_query_text_mode_full_compacts_multiline_sql {
+    ($raw_pool_factory:expr, $dialect:expr) => {{
+        // The pool is constructed before the test telemetry is installed, so the pool's
+        // metric instruments bind to the no-op meter; this macro asserts on span-side
+        // capture only, in line with `test_query_text_mode_obfuscated_replaces_literals`.
+        use sqlx::Executor as _;
+        let _ = $dialect;
+        let raw = $raw_pool_factory;
+        let pool = sqlx_otel::PoolBuilder::from(raw).build();
+
+        let tel = $crate::common::TestTelemetry::install();
+        let _row = (&pool)
+            .fetch_optional("SELECT\n  1,\n  2,\n  3")
+            .await
+            .unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.query.text"),
+            Some(opentelemetry::Value::String("SELECT 1, 2, 3".into())),
+            "multi-line SQL must be collapsed to single-space-separated tokens"
+        );
+    }};
+}
+
+/// `QueryTextMode::Obfuscated` emits `db.query.text` with literals replaced by `?` *and*
+/// inter-token whitespace collapsed to a single space. The query is dialect-neutral
+/// (`SELECT 1, 'alice', 3.14` split across lines), so the only dialect input is the raw
+/// pool factory used to build a custom-configured pool.
+#[macro_export]
+macro_rules! test_query_text_mode_obfuscated_compacts_multiline_sql {
+    ($raw_pool_factory:expr, $dialect:expr) => {{
+        // Span-side assertion only; metrics are bound to the no-op meter for the same
+        // reason as `test_query_text_mode_obfuscated_replaces_literals`.
+        use sqlx::Executor as _;
+        let _ = $dialect;
+        let raw = $raw_pool_factory;
+        let pool = sqlx_otel::PoolBuilder::from(raw)
+            .with_query_text_mode(sqlx_otel::QueryTextMode::Obfuscated)
+            .build();
+
+        let tel = $crate::common::TestTelemetry::install();
+        let _row = (&pool)
+            .fetch_optional("SELECT 1,\n  'alice',\n  3.14")
+            .await
+            .unwrap();
+
+        let spans = tel.spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            $crate::common::attr(&spans[0], "db.query.text"),
+            Some(opentelemetry::Value::String("SELECT ?, ?, ?".into())),
+            "Obfuscated mode must redact literals and collapse multi-line whitespace"
+        );
+    }};
+}
+
 /// `fetch_optional` against an empty table returns `None` and records `returned_rows = 0`.
 /// Uses `fresh_table!` to set up a guaranteed-empty table.
 #[macro_export]

@@ -57,12 +57,16 @@ fn build_attributes(
     if let Some(sql) = sql {
         match attrs.query_text_mode {
             QueryTextMode::Full => {
-                kv.push(KeyValue::new(attribute::DB_QUERY_TEXT, sql.to_owned()));
-            }
-            QueryTextMode::Obfuscated => {
                 kv.push(KeyValue::new(
                     attribute::DB_QUERY_TEXT,
-                    crate::obfuscate::obfuscate(sql),
+                    crate::compact::compact_whitespace(sql),
+                ));
+            }
+            QueryTextMode::Obfuscated => {
+                let obfuscated = crate::obfuscate::obfuscate(sql);
+                kv.push(KeyValue::new(
+                    attribute::DB_QUERY_TEXT,
+                    crate::compact::compact_whitespace(&obfuscated),
                 ));
             }
             QueryTextMode::Off => {}
@@ -1054,6 +1058,54 @@ mod tests {
         ]
     }
 
+    /// Sentinel embedded inside marked literals for the chain no-leak proptest. Mirrors
+    /// the constant in `obfuscate::tests::proptests` so a single failure mode (a literal
+    /// kind escaping redaction) is detected through both the standalone `obfuscate`
+    /// invariants and the executor-level chain invariants. The chain generators below
+    /// intentionally duplicate the token shapes from `obfuscate::tests::proptests` and
+    /// `compact::tests::proptests`; if a token shape needs adjusting, mirror the change
+    /// in all three modules so the chain invariants stay honest.
+    const CHAIN_SENTINEL: &str = "XSECRETX";
+
+    /// Minimal fragment generator for the chain proptests: covers the token kinds whose
+    /// composition through `obfuscate -> compact_whitespace` exercises every region of
+    /// both state machines. Bodies are alphabetic-and-digit so the sentinel cannot
+    /// accidentally appear in a non-literal token.
+    fn chain_fragment_any() -> impl Strategy<Value = String> {
+        let token = prop_oneof![
+            "[a-z_][a-z0-9_]{0,7}".prop_map(String::from),
+            "[ \t\n]{0,5}".prop_map(String::from),
+            "[a-z0-9 _]{0,8}".prop_map(|inner| format!("'{inner}'")),
+            "[a-z0-9 _]{0,8}".prop_map(|inner| format!("\"{inner}\"")),
+            (
+                "[a-z_]{0,3}".prop_map(String::from),
+                "[a-z0-9 _]{0,8}".prop_map(String::from),
+            )
+                .prop_map(|(tag, body)| format!("${tag}${body}${tag}$")),
+            "[a-z0-9 _]{0,12}".prop_map(|inner| format!("--{inner}\n")),
+            "[a-z0-9 _]{0,12}".prop_map(|inner| format!("/*{inner}*/")),
+            "[0-9]{1,5}".prop_map(String::from),
+            prop::sample::select(vec![",", ";", "=", "(", ")", "+", "*", "?"])
+                .prop_map(String::from),
+        ];
+        prop::collection::vec(token, 0..12).prop_map(|tokens| tokens.concat())
+    }
+
+    /// Marked-literal fragment generator: every string and dollar-quoted body embeds the
+    /// sentinel. Surrounding tokens never contain the sentinel because their bodies are
+    /// lowercase-only. If any literal kind is not redacted by `obfuscate`, the sentinel
+    /// leaks through to the chain output.
+    fn chain_fragment_marked() -> impl Strategy<Value = String> {
+        let token = prop_oneof![
+            "[a-z_][a-z0-9_]{0,7}".prop_map(String::from),
+            "[ \t\n]{0,5}".prop_map(String::from),
+            Just(format!("'{CHAIN_SENTINEL}'")),
+            "[a-z_]{0,3}".prop_map(|tag| format!("${tag}${CHAIN_SENTINEL}${tag}$")),
+            prop::sample::select(vec![",", ";", "=", "(", ")"]).prop_map(String::from),
+        ];
+        prop::collection::vec(token, 0..10).prop_map(|tokens| tokens.concat())
+    }
+
     /// Strategy for an arbitrary `QueryAnnotations` whose four fields are independently
     /// `None` or `Some(s)` for a bounded-length string `s`.
     fn any_annotations() -> impl Strategy<Value = QueryAnnotations> {
@@ -1178,6 +1230,63 @@ mod tests {
             prop_assert!(!keys.contains(&"db.collection.name"));
             prop_assert!(!keys.contains(&"db.query.summary"));
             prop_assert!(!keys.contains(&"db.stored_procedure.name"));
+        }
+
+        /// Chain idempotence for the `Obfuscated` arm pipeline:
+        /// `compact_whitespace(obfuscate(s))` is a fixed point. Both passes are
+        /// individually idempotent (proven in their own modules); their composition must
+        /// also be – running the chain twice produces the same string as running it once.
+        #[test]
+        fn chain_compact_obfuscate_idempotent(s in chain_fragment_any()) {
+            let f = |x: &str| crate::compact::compact_whitespace(&crate::obfuscate::obfuscate(x));
+            let once = f(&s);
+            let twice = f(&once);
+            prop_assert_eq!(once, twice);
+        }
+
+        /// No-leak through chain: every literal in the input embeds the sentinel
+        /// `XSECRETX`. After `compact_whitespace(obfuscate(s))`, the sentinel must be
+        /// gone – otherwise some literal kind escaped redaction or the compaction step
+        /// introduced a path that re-exposed redacted bytes.
+        #[test]
+        fn chain_compact_obfuscate_no_leak(s in chain_fragment_marked()) {
+            let f = |x: &str| crate::compact::compact_whitespace(&crate::obfuscate::obfuscate(x));
+            let out = f(&s);
+            prop_assert!(
+                !out.contains("XSECRETX"),
+                "sentinel leaked through chain: input={s:?} output={out:?}"
+            );
+        }
+
+        /// Trim invariant on the emitted `db.query.text`: for both `Full` and
+        /// `Obfuscated` modes, the captured value never starts or ends with `' '`.
+        /// Trailing `'\n'` is permitted (line-comment terminator); only `' '` is
+        /// forbidden as a leading or trailing byte.
+        #[test]
+        fn chain_emitted_query_text_trim_invariant(
+            sql in any::<String>(),
+            mode in prop_oneof![
+                Just(QueryTextMode::Full),
+                Just(QueryTextMode::Obfuscated),
+            ],
+        ) {
+            let attrs = make_connection_attributes(None, None, None, None, None, mode);
+            let kv = build_attributes(&attrs, Some(&sql), None);
+            let value = kv
+                .iter()
+                .find(|k| k.key.as_str() == "db.query.text")
+                .map(|k| k.value.clone());
+            // For Full/Obfuscated with sql=Some, db.query.text must be present. If the
+            // key disappears or its value type drifts away from String, the assertions
+            // below would silently pass – fail loudly instead so a future regression in
+            // the dispatch site is caught.
+            let value = value.expect("db.query.text must be emitted for Full/Obfuscated");
+            let opentelemetry::Value::String(s) = value else {
+                panic!("db.query.text must be a String value, got {value:?}");
+            };
+            let s = s.as_str();
+            prop_assert!(!s.starts_with(' '), "leading space in db.query.text: {s:?}");
+            prop_assert!(!s.ends_with(' '), "trailing space in db.query.text: {s:?}");
         }
 
         /// `append_annotation_attrs` membership invariant: starting from an empty vector,

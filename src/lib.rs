@@ -73,7 +73,7 @@
 //! | `server.port`               | Port extracted from connect options                      | When available              |
 //! | `network.peer.address`      | Resolved IP address                                      | When set via builder        |
 //! | `network.peer.port`         | Resolved port                                            | When set via builder        |
-//! | `db.query.text`             | The SQL query string                                     | Unless [`QueryTextMode::Off`] |
+//! | `db.query.text`             | The SQL query string with inter-token whitespace collapsed | Unless [`QueryTextMode::Off`] |
 //! | `db.operation.name`         | Database operation (e.g. `SELECT`)                       | When [annotated]            |
 //! | `db.collection.name`        | Target table or collection                               | When [annotated]            |
 //! | `db.query.summary`          | Low-cardinality query summary                            | When [annotated]            |
@@ -227,6 +227,7 @@
 #[macro_use]
 mod annotations;
 pub(crate) mod attributes;
+mod compact;
 mod connection;
 mod database;
 mod executor;

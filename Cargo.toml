@@ -24,8 +24,8 @@ pedantic = "warn"
 
 [dependencies]
 futures = "0.3"
-opentelemetry = "0.31"
-opentelemetry-semantic-conventions = { version = "0.31", features = ["semconv_experimental"] }
+opentelemetry = "0.32"
+opentelemetry-semantic-conventions = { version = "0.32", features = ["semconv_experimental"] }
 sqlx = { version = "0.8", default-features = false }
 async-std = { version = "1", optional = true }
 tokio = { version = "1", features = ["rt", "time"], optional = true }
@@ -42,12 +42,12 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dev-dependencies]
-ctor = "0.10"
-opentelemetry_sdk = { version = "0.31", features = ["testing", "rt-tokio"] }
+dtor = "1"
+opentelemetry_sdk = { version = "0.32", features = ["testing", "rt-tokio"] }
 proptest = "1"
 serial_test = "3"
 sqlx = { version = "0.8", features = ["macros", "sqlite", "postgres", "mysql", "runtime-tokio"] }
-testcontainers = "0.27"
+testcontainers = "0.28"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [[example]]

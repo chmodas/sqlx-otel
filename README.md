@@ -28,7 +28,7 @@ The wrapper talks to the [`opentelemetry`](https://docs.rs/opentelemetry) API di
 
 ```toml
 [dependencies]
-sqlx-otel = { version = "0.2.0", features = ["postgres", "runtime-tokio"] }
+sqlx-otel = { version = "0.4.0", features = ["postgres", "runtime-tokio"] }
 ```
 
 ```rust
@@ -221,9 +221,28 @@ The first four are recorded inline on every `acquire()` / connection drop – no
 
 ## Compatibility
 
-- **MSRV:** Rust **1.85.0**.
-- **SQLx:** `0.8.x`.
-- **OpenTelemetry:** `0.31.x`.
+| sqlx-otel | sqlx    | opentelemetry | MSRV     |
+| --------- | ------- | ------------- | -------- |
+| `0.4.x`   | `0.8.x` | `0.32.x`      | `1.85.0` |
+| `0.3.x`   | `0.8.x` | `0.31.x`      | `1.85.0` |
+| `0.2.x`   | `0.8.x` | `0.31.x`      | `1.85.0` |
+| `0.1.x`   | `0.8.x` | `0.31.x`      | `1.85.0` |
+
+Pick the row matching the `sqlx` and `opentelemetry` versions your application already uses. Older releases stay on crates.io indefinitely and are never yanked, so pinning to an earlier row is a supported way to stay put.
+
+## Versioning policy
+
+`sqlx` and `opentelemetry` are both pre-1.0, so Cargo compares their *minor* version for compatibility: `0.31` and `0.32` are separate ranges that never unify, whether or not the release actually changed anything. If your application's versions drift from the ones sqlx-otel was built against, Cargo resolves both copies into the build graph, and the two libraries fail differently.
+
+**`sqlx` fails at compile time.** Its types are part of this crate's public API, and types from semver-incompatible releases are distinct types. A `Pool` from `sqlx` `0.9` will not go into a wrapper built against `sqlx` `0.8`.
+
+**`opentelemetry` fails silently at runtime.** It coordinates through process-global state, so two copies means two registries. Your application installs its provider in one; the wrapper emits into the other. Spans and metrics disappear, with no error and no warning.
+
+Hence:
+
+- Either library bumping its minor triggers a minor release here.
+- Bugs are not backported. Fixes ship in the next release.
+- MSRV tracks [sqlx's MSRV policy](https://github.com/transact-rs/sqlx/blob/main/FAQ.md#MSRV).
 
 ## License
 

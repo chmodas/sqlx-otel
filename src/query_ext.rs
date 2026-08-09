@@ -452,7 +452,7 @@ macro_rules! impl_annotated_query_fetch_forwarders {
 
 /// Emit the `bind` method on a specialised impl block.
 ///
-/// `SQLx` restricts `bind` to the default `<DB as Database>::Arguments<'q>` parameter, so
+/// `SQLx` restricts `bind` to the default `<DB as Database>::Arguments` parameter, so
 /// each builder family has its own dedicated impl block keyed on the default arguments.
 macro_rules! impl_annotated_query_bind {
     () => {
@@ -473,7 +473,7 @@ macro_rules! impl_annotated_query_bind {
 impl<'q, DB, A> AnnotatedQuery<Query<'q, DB, A>>
 where
     DB: Database,
-    A: 'q + Send + sqlx::IntoArguments<'q, DB>,
+    A: 'q + Send + sqlx::IntoArguments<DB>,
 {
     impl_annotated_query_fetch_forwarders!(row = DB::Row, extra_bounds = ());
 
@@ -547,7 +547,7 @@ where
     }
 }
 
-impl<'q, DB> AnnotatedQuery<Query<'q, DB, <DB as sqlx::Database>::Arguments<'q>>>
+impl<'q, DB> AnnotatedQuery<Query<'q, DB, <DB as sqlx::Database>::Arguments>>
 where
     DB: sqlx::Database,
 {
@@ -559,13 +559,13 @@ where
 impl<'q, DB, O, A> AnnotatedQuery<QueryAs<'q, DB, O, A>>
 where
     DB: Database,
-    A: 'q + Send + sqlx::IntoArguments<'q, DB>,
+    A: 'q + Send + sqlx::IntoArguments<DB>,
     O: Send + Unpin + for<'r> sqlx::FromRow<'r, DB::Row>,
 {
     impl_annotated_query_fetch_forwarders!(row = O, extra_bounds = (DB: 'e, O: 'e,));
 }
 
-impl<'q, DB, O> AnnotatedQuery<QueryAs<'q, DB, O, <DB as sqlx::Database>::Arguments<'q>>>
+impl<'q, DB, O> AnnotatedQuery<QueryAs<'q, DB, O, <DB as sqlx::Database>::Arguments>>
 where
     DB: sqlx::Database,
 {
@@ -577,14 +577,14 @@ where
 impl<'q, DB, O, A> AnnotatedQuery<QueryScalar<'q, DB, O, A>>
 where
     DB: Database,
-    A: 'q + Send + sqlx::IntoArguments<'q, DB>,
+    A: 'q + Send + sqlx::IntoArguments<DB>,
     O: Send + Unpin,
     (O,): Send + Unpin + for<'r> sqlx::FromRow<'r, DB::Row>,
 {
     impl_annotated_query_fetch_forwarders!(row = O, extra_bounds = (DB: 'e, O: 'e,));
 }
 
-impl<'q, DB, O> AnnotatedQuery<QueryScalar<'q, DB, O, <DB as sqlx::Database>::Arguments<'q>>>
+impl<'q, DB, O> AnnotatedQuery<QueryScalar<'q, DB, O, <DB as sqlx::Database>::Arguments>>
 where
     DB: sqlx::Database,
 {
@@ -598,7 +598,7 @@ where
     DB: Database,
     F: FnMut(DB::Row) -> Result<O, sqlx::Error> + Send,
     O: Send + Unpin,
-    A: 'q + Send + sqlx::IntoArguments<'q, DB>,
+    A: 'q + Send + sqlx::IntoArguments<DB>,
 {
     impl_annotated_query_fetch_forwarders!(row = O, extra_bounds = (DB: 'e, F: 'e, O: 'e,));
 

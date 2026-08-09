@@ -4,19 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] – 2026-08-09
+
+### Changed
+
+- **BREAKING:** Upgraded to `sqlx` `0.9`, which raised the minimum supported Rust version from `1.85.0` to `1.94.0`.
+
 ## [0.4.0] – 2026-08-08
 
 ### Changed
 
-- **Action required:** Upgraded to `opentelemetry` / `opentelemetry-semantic-conventions` `0.32`. Upgrade your own `opentelemetry` and `opentelemetry_sdk` to match, or spans and metrics stop being emitted.
+- **Action required:** Upgraded to `opentelemetry` and `opentelemetry-semantic-conventions` `0.32`. Applications must move their own `opentelemetry` and `opentelemetry_sdk` to `0.32` as well, or spans and metrics stop being emitted.
 
 ### Fixed
 
 - The pool-metrics polling task no longer stops when a single cloned `Pool` is dropped. All clones share one `Arc<AtomicBool>` shutdown flag, so the first clone to drop was flipping it and silently ending `db.client.connection.*` collection for every surviving clone. The task now stops only once the last clone is dropped, matching what the documentation already implied.
-
-### Internal
-
-- Test-only: replaced `ctor` with the `dtor` crate, whose `#[dtor]` macro was split out of `ctor` and removed in `ctor` 1.0, and marked the container-cleanup destructors `unsafe` per `dtor` 1.0's deprecation of the safe form. Bumped `testcontainers` to `0.28`. No effect on the published crate.
 
 ## [0.3.0] – 2026-05-05
 
@@ -64,3 +66,4 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 [0.2.0]: https://github.com/chmodas/sqlx-otel/releases/tag/v0.2.0
 [0.3.0]: https://github.com/chmodas/sqlx-otel/releases/tag/v0.3.0
 [0.4.0]: https://github.com/chmodas/sqlx-otel/releases/tag/v0.4.0
+[0.5.0]: https://github.com/chmodas/sqlx-otel/releases/tag/v0.5.0

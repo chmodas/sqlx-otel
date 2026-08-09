@@ -28,7 +28,7 @@ The wrapper talks to the [`opentelemetry`](https://docs.rs/opentelemetry) API di
 
 ```toml
 [dependencies]
-sqlx-otel = { version = "0.4.0", features = ["postgres", "runtime-tokio"] }
+sqlx-otel = { version = "0.5.0", features = ["postgres", "runtime-tokio"] }
 ```
 
 ```rust
@@ -223,6 +223,7 @@ The first four are recorded inline on every `acquire()` / connection drop – no
 
 | sqlx-otel | sqlx    | opentelemetry | MSRV     |
 | --------- | ------- | ------------- | -------- |
+| `0.5.x`   | `0.9.x` | `0.32.x`      | `1.94.0` |
 | `0.4.x`   | `0.8.x` | `0.32.x`      | `1.85.0` |
 | `0.3.x`   | `0.8.x` | `0.31.x`      | `1.85.0` |
 | `0.2.x`   | `0.8.x` | `0.31.x`      | `1.85.0` |

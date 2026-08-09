@@ -236,6 +236,7 @@ mod obfuscate;
 mod pool;
 mod pool_metrics;
 mod query_ext;
+mod rebuilt_query;
 mod runtime;
 mod transaction;
 

@@ -9,7 +9,8 @@
         "type_info": {
           "type": "VarString",
           "flags": "NOT_NULL | NO_DEFAULT_VALUE",
-          "max_size": 1020
+          "max_size": 1020,
+          "collation": 45
         }
       }
     ],

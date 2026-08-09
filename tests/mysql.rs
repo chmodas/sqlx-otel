@@ -44,7 +44,7 @@ async fn shared_container() -> &'static SharedContainer {
                 .with_env_var("MYSQL_ROOT_PASSWORD", "test")
                 .with_env_var("MYSQL_DATABASE", "testdb")
                 .with_env_var("MYSQL_ALLOW_EMPTY_PASSWORD", "no")
-                .with_startup_timeout(Duration::from_secs(120))
+                .with_startup_timeout(Duration::from_mins(2))
                 .start()
                 .await
                 .expect("starting mysql container");
@@ -257,6 +257,18 @@ async fn fetch_all_records_error() {
 #[serial]
 async fn fetch_one_via_pool() {
     test_fetch_one_via_pool!(test_pool().await, common::MYSQL_DIALECT);
+}
+
+#[tokio::test]
+#[serial]
+async fn raw_sql_preserves_simple_protocol() {
+    test_raw_sql_preserves_simple_protocol!(test_pool().await, common::MYSQL_DIALECT);
+}
+
+#[tokio::test]
+#[serial]
+async fn owned_sql_string_query_text() {
+    test_owned_sql_string_query_text!(test_pool().await, common::MYSQL_DIALECT);
 }
 
 #[tokio::test]

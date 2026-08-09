@@ -197,6 +197,18 @@ async fn fetch_one_via_pool() {
 
 #[tokio::test]
 #[serial]
+async fn raw_sql_preserves_simple_protocol() {
+    test_raw_sql_preserves_simple_protocol!(test_pool().await, common::SQLITE_DIALECT);
+}
+
+#[tokio::test]
+#[serial]
+async fn owned_sql_string_query_text() {
+    test_owned_sql_string_query_text!(test_pool().await, common::SQLITE_DIALECT);
+}
+
+#[tokio::test]
+#[serial]
 async fn fetch_one_via_connection() {
     test_fetch_one_via_connection!(test_pool().await, common::SQLITE_DIALECT);
 }

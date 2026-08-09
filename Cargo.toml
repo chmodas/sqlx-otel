@@ -1,6 +1,6 @@
 [package]
 name = "sqlx-otel"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 authors = ["Borislav Borisov <chmodas@astutebits.com>"]
 license = "MIT OR Apache-2.0"
@@ -11,7 +11,7 @@ documentation = "https://docs.rs/sqlx-otel/"
 description = "Thin wrapper around SQLx that emits OpenTelemetry spans and metrics following the database client semantic conventions."
 categories = ["database", "asynchronous", "development-tools::profiling"]
 keywords = ["sqlx", "opentelemetry", "metrics", "database", "instrumentation"]
-rust-version = "1.85.0"
+rust-version = "1.94.0"
 
 exclude = [
   ".gitignore",
@@ -26,14 +26,20 @@ pedantic = "warn"
 futures = "0.3"
 opentelemetry = "0.32"
 opentelemetry-semantic-conventions = { version = "0.32", features = ["semconv_experimental"] }
-sqlx = { version = "0.8", default-features = false }
+# `offline` is what makes `Executor::describe` a present, required # trait method, and it has to 
+# be set on `sqlx-core` and on every driver.
+sqlx = { version = "0.9", default-features = false }
+sqlx-core = { version = "0.9", default-features = false, features = ["offline"] }
+sqlx-sqlite = { version = "0.9", default-features = false, features = ["offline"], optional = true }
+sqlx-postgres = { version = "0.9", default-features = false, features = ["offline"], optional = true }
+sqlx-mysql = { version = "0.9", default-features = false, features = ["offline"], optional = true }
 async-std = { version = "1", optional = true }
 tokio = { version = "1", features = ["rt", "time"], optional = true }
 
 [features]
-sqlite = ["sqlx/sqlite"]
-postgres = ["sqlx/postgres"]
-mysql = ["sqlx/mysql"]
+sqlite = ["sqlx/sqlite", "dep:sqlx-sqlite"]
+postgres = ["sqlx/postgres", "dep:sqlx-postgres"]
+mysql = ["sqlx/mysql", "dep:sqlx-mysql"]
 runtime-tokio = ["dep:tokio"]
 runtime-async-std = ["dep:async-std"]
 
@@ -46,7 +52,7 @@ dtor = "1"
 opentelemetry_sdk = { version = "0.32", features = ["testing", "rt-tokio"] }
 proptest = "1"
 serial_test = "3"
-sqlx = { version = "0.8", features = ["macros", "sqlite", "postgres", "mysql", "runtime-tokio"] }
+sqlx = { version = "0.9", features = ["macros", "sqlite", "postgres", "mysql", "mysql-rsa", "runtime-tokio"] }
 testcontainers = "0.28"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 

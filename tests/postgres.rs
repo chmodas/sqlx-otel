@@ -44,7 +44,7 @@ async fn shared_container() -> &'static SharedContainer {
                 .with_env_var("POSTGRES_USER", "postgres")
                 .with_env_var("POSTGRES_DB", "testdb")
                 .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
-                .with_startup_timeout(Duration::from_secs(60))
+                .with_startup_timeout(Duration::from_mins(1))
                 .start()
                 .await
                 .expect("starting postgres container");
@@ -260,6 +260,18 @@ async fn fetch_all_records_error() {
 #[serial]
 async fn fetch_one_via_pool() {
     test_fetch_one_via_pool!(test_pool().await, common::POSTGRES_DIALECT);
+}
+
+#[tokio::test]
+#[serial]
+async fn raw_sql_preserves_simple_protocol() {
+    test_raw_sql_preserves_simple_protocol!(test_pool().await, common::POSTGRES_DIALECT);
+}
+
+#[tokio::test]
+#[serial]
+async fn owned_sql_string_query_text() {
+    test_owned_sql_string_query_text!(test_pool().await, common::POSTGRES_DIALECT);
 }
 
 #[tokio::test]

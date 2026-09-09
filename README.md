@@ -207,7 +207,19 @@ These mirror the bounded portion of the span attribute set: connection-level att
 | `db.client.connection.idle.max`           | Gauge           |      | Maximum idle connections (equals `max` in SQLx)       |
 | `db.client.connection.idle.min`           | Gauge           |      | Configured minimum connections                        |
 
-The first four are recorded inline on every `acquire()` / connection drop – no sampling gaps. `db.client.connection.count` is polled by a background task and requires both a runtime feature (`runtime-tokio` or `runtime-async-std`) and a pool name set via `PoolBuilder::with_pool_name`. The remaining three are static gauges recorded once at pool construction.
+Explicit `acquire()`, implicit pool queries (including annotated and streaming queries),
+and `begin()` share one instrumented acquisition. Queries within a transaction do not
+acquire again. Wait time covers completed acquisition attempts, including semaphore wait,
+connection creation and validation, but excludes query execution and `BEGIN`. Dropping a
+waiting future decrements pending requests without recording a completed wait or a pool
+timeout. Only `sqlx::Error::PoolTimedOut` increments the timeout counter. Pending and
+timeout series are initialized at zero; wait buckets resolve submillisecond acquisitions.
+Connection-use time follows the lease through transaction commit, rollback, or drop.
+
+`db.client.connection.count` is polled by a background task and requires both a runtime
+feature (`runtime-tokio` or `runtime-async-std`) and a pool name set via
+`PoolBuilder::with_pool_name`. Polling and export intervals can miss brief utilization or
+pending-request peaks. The remaining three are static gauges recorded once at construction.
 
 ## Backend support
 

@@ -265,7 +265,7 @@ mod tests {
     fn test_state() -> SharedState {
         use std::sync::Arc;
 
-        use crate::attributes::{ConnectionAttributes, QueryTextMode};
+        use crate::attributes::{ConnectionAttributes, QuerySummaryMode, QueryTextMode};
         use crate::metrics::Metrics;
 
         SharedState {
@@ -280,6 +280,7 @@ mod tests {
                 network_transport: None,
                 pool_name: None,
                 query_text_mode: QueryTextMode::Off,
+                query_summary_mode: QuerySummaryMode::Off,
             }),
             metrics: Arc::new(Metrics::new()),
         }

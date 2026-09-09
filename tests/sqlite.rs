@@ -499,6 +499,74 @@ async fn query_summary_drives_span_name() {
     test_query_summary_drives_span_name!(test_pool().await, common::SQLITE_DIALECT);
 }
 
+#[tokio::test]
+#[serial]
+async fn automatic_summaries_are_opt_in_and_group_without_literal_values() {
+    use sqlx_otel::{QueryAnnotations, QuerySummaryMode, QueryTextMode};
+
+    let tel = common::TestTelemetry::install();
+    let default_pool = PoolBuilder::from(raw_pool().await)
+        .with_query_text_mode(QueryTextMode::Off)
+        .build();
+    default_pool
+        .fetch_all("SELECT name FROM sqlite_master")
+        .await
+        .unwrap();
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(common::attr(&spans[0], "db.query.summary"), None);
+    tel.reset();
+
+    let pool = PoolBuilder::from(raw_pool().await)
+        .with_query_text_mode(QueryTextMode::Off)
+        .with_query_summary_mode(QuerySummaryMode::Auto)
+        .build();
+    for sql in [
+        "SELECT name FROM sqlite_master WHERE name = 'private_a'",
+        "SELECT name FROM sqlite_master WHERE name = 'private_b'",
+    ] {
+        sqlx::query(sql).fetch_all(&pool).await.unwrap();
+    }
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 2);
+    for span in &spans {
+        assert_eq!(span.name, "SELECT sqlite_master");
+        assert_eq!(
+            common::attr(span, "db.query.summary"),
+            Some("SELECT sqlite_master".into())
+        );
+        assert_eq!(common::attr(span, "db.query.text"), None);
+        assert_eq!(common::attr(span, "db.operation.name"), None);
+        assert_eq!(common::attr(span, "db.collection.name"), None);
+    }
+    let metrics = tel.metrics();
+    let point = common::find_histogram_data_point_with(
+        &metrics,
+        "db.client.operation.duration",
+        &[("db.query.summary", "SELECT sqlite_master")],
+    )
+    .unwrap();
+    assert_eq!(point.count(), 2);
+    tel.reset();
+
+    sqlx::query("SELECT name FROM sqlite_master")
+        .with_annotations(QueryAnnotations::new().query_summary("schema lookup"))
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].name, "schema lookup");
+    assert!(
+        common::find_histogram_data_point_with(
+            &tel.metrics(),
+            "db.client.operation.duration",
+            &[("db.query.summary", "schema lookup")],
+        )
+        .is_some()
+    );
+}
+
 // ===========================================================================
 // query-side annotations: sqlx::query(...).with_annotations(...).execute(&pool)
 // ===========================================================================

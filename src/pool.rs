@@ -4,7 +4,7 @@ use std::time::Duration;
 use opentelemetry_semantic_conventions::metric as semconv_metric;
 
 use crate::annotations::{Annotated, QueryAnnotations};
-use crate::attributes::{ConnectionAttributes, QueryTextMode};
+use crate::attributes::{ConnectionAttributes, QuerySummaryMode, QueryTextMode};
 use crate::connection::PoolConnection;
 use crate::database::Database;
 use crate::metrics::Metrics;
@@ -31,13 +31,14 @@ pub(crate) struct SharedState {
 /// ```no_run
 /// # #[cfg(feature = "sqlite")]
 /// # async fn _doc() -> Result<(), sqlx::Error> {
-/// use sqlx_otel::{PoolBuilder, QueryTextMode};
+/// use sqlx_otel::{PoolBuilder, QuerySummaryMode, QueryTextMode};
 /// use std::time::Duration;
 ///
 /// let raw = sqlx::SqlitePool::connect(":memory:").await?;
 /// let pool = PoolBuilder::from(raw)
 ///     .with_database("my_db")
 ///     .with_query_text_mode(QueryTextMode::Obfuscated)
+///     .with_query_summary_mode(QuerySummaryMode::Auto)
 ///     .with_pool_name("my-service-db")
 ///     .with_pool_metrics_interval(Duration::from_secs(5))
 ///     .build();
@@ -56,6 +57,7 @@ pub struct PoolBuilder<DB: sqlx::Database> {
     network_protocol_name: Option<String>,
     network_transport: Option<String>,
     query_text_mode: QueryTextMode,
+    query_summary_mode: QuerySummaryMode,
     pool_name: Option<String>,
     pool_metrics_interval: Duration,
 }
@@ -78,6 +80,7 @@ impl<DB: Database> From<sqlx::Pool<DB>> for PoolBuilder<DB> {
             network_protocol_name: DB::DEFAULT_NETWORK_PROTOCOL_NAME.map(String::from),
             network_transport: None,
             query_text_mode: QueryTextMode::default(),
+            query_summary_mode: QuerySummaryMode::default(),
             pool_name: None,
             pool_metrics_interval: Duration::from_secs(10),
         }
@@ -149,6 +152,19 @@ impl<DB: Database> PoolBuilder<DB> {
         self
     }
 
+    /// Configure automatic low-cardinality `db.query.summary` generation. Defaults to
+    /// [`QuerySummaryMode::Off`].
+    ///
+    /// [`QuerySummaryMode::Auto`] extracts only the outer SQL operation and primary
+    /// target, independently of [`QueryTextMode`]. Any explicit per-query
+    /// [`QueryAnnotations`] disable inference, even without a custom summary. See
+    /// [`QuerySummaryMode`] for limits and cardinality considerations.
+    #[must_use]
+    pub fn with_query_summary_mode(mut self, mode: QuerySummaryMode) -> Self {
+        self.query_summary_mode = mode;
+        self
+    }
+
     /// Set the `db.client.connection.pool.name` attribute and enable the
     /// `db.client.connection.count` polling task.
     ///
@@ -199,6 +215,7 @@ impl<DB: Database> PoolBuilder<DB> {
             network_transport: self.network_transport,
             pool_name: self.pool_name,
             query_text_mode: self.query_text_mode,
+            query_summary_mode: self.query_summary_mode,
         });
         let metrics = Arc::new(Metrics::new());
         let meter = opentelemetry::global::meter("sqlx-otel");

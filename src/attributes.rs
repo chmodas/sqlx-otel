@@ -27,7 +27,8 @@ use opentelemetry_semantic_conventions::attribute;
 ///   otherwise), operators, and `NULL` are kept verbatim.
 /// - **[`Off`](Self::Off)** – appropriate when the query text is itself sensitive
 ///   (proprietary schemas, query shapes that reveal business logic) or when query-text
-///   cardinality must be eliminated entirely.
+///   cardinality must be eliminated entirely. Keep [`QuerySummaryMode::Off`] as well
+///   when object names are sensitive: automatic summaries can still emit those names.
 ///
 /// `db.query.parameter.<key>` capture is **not supported** – `SQLx`'s `Execute` trait does
 /// not expose bind values, and reverse-engineering them from the encoded buffer would tie
@@ -48,6 +49,46 @@ pub enum QueryTextMode {
     Obfuscated,
     /// Do not capture `db.query.text` at all.
     Off,
+}
+
+/// Controls whether `sqlx-otel` generates a low-cardinality `db.query.summary`.
+///
+/// Automatic summaries contain only the outer SQL operation and its primary target, such
+/// as `SELECT users` or `INSERT orders`. For a query whose outer target is a common table
+/// expression, the summarizer resolves the CTE to its primary physical target when
+/// possible. Recognized literals are scrubbed before extraction; supported forms omit
+/// predicates, selected columns, and bind parameters. Generated summaries name the span
+/// and appear on operation metrics, independently of [`QueryTextMode`] (including
+/// [`QueryTextMode::Off`]).
+/// They do not infer `db.operation.name` or `db.collection.name`.
+///
+/// This mode is off by default. Any explicit [`QueryAnnotations`](crate::QueryAnnotations)
+/// disable automatic summaries for that query, even when they do not supply a summary.
+/// This is a best-effort extractor, not a complete SQL parser: unsupported forms may
+/// yield an operation-only or inaccurate summary, or keep the generic span name. This is
+/// not a general SQL redaction boundary; leave it off for sensitive SQL. Summaries are
+/// capped at 255 bytes, falling back to the operation rather than truncating an identifier.
+/// Dynamic object names still contribute to metric cardinality. Keep this mode off or
+/// supply explicit annotations if object names are sensitive or unbounded.
+///
+/// The shared scrubber treats backslashes as escapes in single-quoted literals and always
+/// treats `"` as an identifier quote. It does not model `PostgreSQL`
+/// `standard_conforming_strings`, `SQLite` literal backslashes, or `MySQL`
+/// `NO_BACKSLASH_ESCAPES`/default double-quoted strings; in those forms literal text can
+/// surface as the summary target. Use explicit annotations or keep this mode off for
+/// queries that depend on those semantics.
+///
+/// Configured via
+/// [`PoolBuilder::with_query_summary_mode`](crate::PoolBuilder::with_query_summary_mode).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum QuerySummaryMode {
+    /// Do not generate `db.query.summary`. Explicit [`QueryAnnotations`](crate::QueryAnnotations)
+    /// are unaffected.
+    #[default]
+    Off,
+    /// Generate a best-effort low-cardinality summary when no explicit query annotations
+    /// were supplied.
+    Auto,
 }
 
 /// Immutable, connection-level OpenTelemetry attributes shared by every span and metric
@@ -84,6 +125,8 @@ pub(crate) struct ConnectionAttributes {
     pub pool_name: Option<String>,
     /// Controls `db.query.text` capture.
     pub query_text_mode: QueryTextMode,
+    /// Controls automatic `db.query.summary` generation.
+    pub query_summary_mode: QuerySummaryMode,
 }
 
 impl ConnectionAttributes {
@@ -257,6 +300,7 @@ mod tests {
             network_transport: Some("tcp".into()),
             pool_name: Some("primary".into()),
             query_text_mode: QueryTextMode::Full,
+            query_summary_mode: QuerySummaryMode::Off,
         };
         let kvs = attrs.base_key_values();
         assert_eq!(kvs.len(), 9);
@@ -284,6 +328,7 @@ mod tests {
             network_transport: None,
             pool_name: None,
             query_text_mode: QueryTextMode::Off,
+            query_summary_mode: QuerySummaryMode::Off,
         };
         let kvs = attrs.base_key_values();
         assert_eq!(kvs.len(), 1);
@@ -395,6 +440,7 @@ mod tests {
                 network_transport: network_transport.clone(),
                 pool_name: pool_name.clone(),
                 query_text_mode: QueryTextMode::Off,
+                query_summary_mode: QuerySummaryMode::Off,
             };
             let kvs = attrs.base_key_values();
             let expected = 1

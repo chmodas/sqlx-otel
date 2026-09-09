@@ -412,7 +412,7 @@ impl<DB: Database> Pool<DB> {
     ///
     /// Returns `sqlx::Error` if `BEGIN` fails – typically due to a connection problem or
     /// because the underlying connection cannot start a new transaction.
-    pub async fn begin(&self) -> Result<Transaction<'_, DB>, sqlx::Error> {
+    pub async fn begin(&self) -> Result<Transaction<'static, DB>, sqlx::Error> {
         self.inner.begin().await.map(|inner| Transaction {
             inner,
             state: self.state.clone(),

@@ -409,6 +409,29 @@ async fn transaction_rollback() {
     test_transaction_rollback!(test_pool().await, common::SQLITE_DIALECT);
 }
 
+/// Returning an owned transaction must not borrow the pool handle. This helper
+/// deliberately requires the public API to preserve `SQLx`'s static lifetime.
+async fn owned_transaction(
+    pool: &Pool<Sqlite>,
+) -> Result<sqlx_otel::Transaction<'static, Sqlite>, sqlx::Error> {
+    pool.begin().await
+}
+
+#[tokio::test]
+#[serial]
+async fn pool_transaction_can_outlive_pool_handle() {
+    let mut transaction = {
+        let pool = test_pool().await;
+        owned_transaction(&pool).await.unwrap()
+    };
+
+    sqlx::query("SELECT 1")
+        .execute(&mut transaction)
+        .await
+        .unwrap();
+    transaction.rollback().await.unwrap();
+}
+
 // ===========================================================================
 // PoolBuilder with_* methods
 // ===========================================================================

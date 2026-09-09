@@ -34,12 +34,18 @@ use crate::pool::SharedState;
 pub struct PoolConnection<DB: sqlx::Database> {
     pub(crate) inner: sqlx::pool::PoolConnection<DB>,
     pub(crate) state: SharedState,
+    pub(crate) usage: ConnectionUsage,
+}
+
+/// Moves with an owned connection into a transaction, preserving the complete lease duration.
+#[derive(Debug)]
+pub(crate) struct ConnectionUsage {
     pub(crate) use_time: Arc<Histogram<f64>>,
     pub(crate) acquired_at: Instant,
     pub(crate) base_attrs: Vec<KeyValue>,
 }
 
-impl<DB: sqlx::Database> Drop for PoolConnection<DB> {
+impl Drop for ConnectionUsage {
     fn drop(&mut self) {
         self.use_time
             .record(self.acquired_at.elapsed().as_secs_f64(), &self.base_attrs);

@@ -111,8 +111,13 @@
 //! | `db.client.connection.idle.max`         | Gauge           |      | Maximum idle connections (equals `max` in `SQLx`)    |
 //! | `db.client.connection.idle.min`         | Gauge           |      | Configured minimum connections                       |
 //!
-//! The first four are recorded inline on every `acquire()` and connection drop – no sampling
-//! gaps. `connection.count` is polled by a background task and requires both
+//! Explicit acquisition, implicit pool queries (including annotated and streaming queries),
+//! and `begin()` share one instrumented acquisition. Queries within a transaction do not
+//! acquire again. Wait time covers completed acquisition attempts and excludes `BEGIN` and
+//! query execution. Caller cancellation clears pending without recording a completed wait
+//! or a pool timeout. Connection use time follows the lease through transaction completion.
+//! Pending and timeout series start at zero. Polling/export can miss brief gauge peaks.
+//! `connection.count` is polled by a background task and requires both
 //! [`PoolBuilder::with_pool_name`] and a runtime feature (`runtime-tokio` or
 //! `runtime-async-std`); without either, the gauge is silent. The remaining three are static
 //! gauges recorded once at [`PoolBuilder::build`].
@@ -234,6 +239,7 @@ mod executor;
 mod metrics;
 mod obfuscate;
 mod pool;
+mod pool_executor;
 mod pool_metrics;
 mod query_ext;
 mod rebuilt_query;

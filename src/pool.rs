@@ -224,7 +224,7 @@ impl<DB: Database> PoolBuilder<DB> {
             .build()
             .record(min_conns, &base_attrs);
 
-        Pool {
+        let pool = Pool {
             inner: self.pool,
             state: SharedState { attrs, metrics },
             metrics_shutdown,
@@ -235,6 +235,10 @@ impl<DB: Database> PoolBuilder<DB> {
                     .with_description(
                         "The time it took to obtain an open connection from the pool.",
                     )
+                    .with_boundaries(vec![
+                        0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5,
+                        1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+                    ])
                     .build(),
             ),
             use_time: Arc::new(
@@ -260,7 +264,10 @@ impl<DB: Database> PoolBuilder<DB> {
                     .with_description("The number of pending requests for an open connection.")
                     .build(),
             ),
-        }
+        };
+        pool.pending_requests.add(0, &base_attrs);
+        pool.timeouts.add(0, &base_attrs);
+        pool
     }
 
     /// Spawn the pool metrics background task if a pool name is set and a runtime is
@@ -382,9 +389,13 @@ impl<DB: Database> Pool<DB> {
     pub async fn acquire(&self) -> Result<PoolConnection<DB>, sqlx::Error> {
         let attrs = self.state.attrs.base_key_values();
         self.pending_requests.add(1, &attrs);
+        let pending = PendingAcquisition {
+            counter: &self.pending_requests,
+            attrs: &attrs,
+        };
         let start = std::time::Instant::now();
         let result = self.inner.acquire().await;
-        self.pending_requests.add(-1, &attrs);
+        drop(pending);
         self.wait_time.record(start.elapsed().as_secs_f64(), &attrs);
 
         if let Err(sqlx::Error::PoolTimedOut) = &result {
@@ -394,9 +405,11 @@ impl<DB: Database> Pool<DB> {
         result.map(|inner| PoolConnection {
             inner,
             state: self.state.clone(),
-            use_time: self.use_time.clone(),
-            acquired_at: std::time::Instant::now(),
-            base_attrs: attrs,
+            usage: crate::connection::ConnectionUsage {
+                use_time: self.use_time.clone(),
+                acquired_at: std::time::Instant::now(),
+                base_attrs: attrs,
+            },
         })
     }
 
@@ -413,9 +426,16 @@ impl<DB: Database> Pool<DB> {
     /// Returns `sqlx::Error` if `BEGIN` fails – typically due to a connection problem or
     /// because the underlying connection cannot start a new transaction.
     pub async fn begin(&self) -> Result<Transaction<'_, DB>, sqlx::Error> {
-        self.inner.begin().await.map(|inner| Transaction {
+        let PoolConnection {
             inner,
-            state: self.state.clone(),
+            state,
+            usage,
+        } = self.acquire().await?;
+        let inner = sqlx::Transaction::begin(inner, None).await?;
+        Ok(Transaction {
+            inner,
+            state,
+            usage,
         })
     }
 
@@ -482,5 +502,18 @@ impl<DB: Database> Pool<DB> {
                 .operation(operation)
                 .collection(collection),
         )
+    }
+}
+
+// A caller timeout or task abort may drop acquire() while it is still awaiting SQLx.
+// Keep pending truthful on that path without classifying caller cancellation as PoolTimedOut.
+struct PendingAcquisition<'a> {
+    counter: &'a opentelemetry::metrics::UpDownCounter<i64>,
+    attrs: &'a [opentelemetry::KeyValue],
+}
+
+impl Drop for PendingAcquisition<'_> {
+    fn drop(&mut self) {
+        self.counter.add(-1, self.attrs);
     }
 }

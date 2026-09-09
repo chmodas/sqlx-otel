@@ -11,6 +11,224 @@ use std::time::Duration;
 
 const POOL_NAME: &str = "test-pool";
 
+fn histogram_count(tel: &common::TestTelemetry, name: &str) -> u64 {
+    tel.reset();
+    let metrics = tel.metrics();
+    let Some(metric) = find_metric(&metrics, name) else {
+        return 0;
+    };
+    let AggregatedMetrics::F64(MetricData::Histogram(hist)) = metric.data() else {
+        panic!("expected histogram")
+    };
+    hist.data_points()
+        .map(opentelemetry_sdk::metrics::data::HistogramDataPoint::count)
+        .sum()
+}
+
+fn pending_count(tel: &common::TestTelemetry) -> i64 {
+    tel.reset();
+    let metrics = tel.metrics();
+    let metric = find_metric(&metrics, "db.client.connection.pending_requests").unwrap();
+    let AggregatedMetrics::I64(MetricData::Sum(sum)) = metric.data() else {
+        panic!("expected pending sum")
+    };
+    sum.data_points()
+        .map(opentelemetry_sdk::metrics::data::SumDataPoint::value)
+        .sum()
+}
+
+fn timeout_count(tel: &common::TestTelemetry) -> u64 {
+    tel.reset();
+    let metrics = tel.metrics();
+    let metric = find_metric(&metrics, "db.client.connection.timeouts").unwrap();
+    let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() else {
+        panic!("expected timeout sum")
+    };
+    sum.data_points()
+        .map(opentelemetry_sdk::metrics::data::SumDataPoint::value)
+        .sum()
+}
+
+#[tokio::test]
+#[serial]
+async fn every_pool_executor_path_acquires_once_without_duplicate_query_spans() {
+    use futures::TryStreamExt;
+    use sqlx_otel::QueryAnnotateExt;
+    let tel = common::TestTelemetry::install();
+    let pool = PoolBuilder::from(sqlx::SqlitePool::connect(":memory:").await.unwrap()).build();
+    pool.execute("CREATE TABLE test (id integer)")
+        .await
+        .unwrap();
+    pool.execute("INSERT INTO test VALUES (1)").await.unwrap();
+    pool.fetch_all("SELECT id FROM test").await.unwrap();
+    pool.fetch_one("SELECT id FROM test").await.unwrap();
+    pool.fetch_optional("SELECT id FROM test").await.unwrap();
+    pool.fetch("SELECT id FROM test")
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    #[allow(deprecated)]
+    pool.fetch_many("SELECT id FROM test")
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    pool.execute_many("UPDATE test SET id = 2")
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    pool.prepare_with(sqlx::SqlStr::from_static("SELECT id FROM test"), &[])
+        .await
+        .unwrap();
+    pool.describe(sqlx::SqlStr::from_static("SELECT id FROM test"))
+        .await
+        .unwrap();
+    pool.with_operation("SELECT", "test")
+        .fetch_one("SELECT id FROM test")
+        .await
+        .unwrap();
+    sqlx::query("SELECT id FROM test")
+        .with_operation("SELECT", "test")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        tel.spans().len(),
+        12,
+        "query instrumentation must not be nested"
+    );
+    assert_eq!(histogram_count(&tel, "db.client.connection.wait_time"), 12);
+    assert_eq!(histogram_count(&tel, "db.client.connection.use_time"), 12);
+    assert_eq!(pending_count(&tel), 0);
+    assert_eq!(timeout_count(&tel), 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn transactions_keep_one_acquisition_and_measure_the_complete_lease() {
+    let tel = common::TestTelemetry::install();
+    let pool = PoolBuilder::from(sqlx::SqlitePool::connect(":memory:").await.unwrap()).build();
+    for finish in 0..3 {
+        let mut transaction = pool.begin().await.unwrap();
+        sqlx::query("SELECT 1")
+            .execute(&mut transaction)
+            .await
+            .unwrap();
+        sqlx::query("SELECT 2")
+            .execute(&mut transaction)
+            .await
+            .unwrap();
+        assert_eq!(
+            histogram_count(&tel, "db.client.connection.wait_time"),
+            finish + 1
+        );
+        assert_eq!(
+            histogram_count(&tel, "db.client.connection.use_time"),
+            finish
+        );
+        match finish {
+            0 => transaction.commit().await.unwrap(),
+            1 => transaction.rollback().await.unwrap(),
+            _ => drop(transaction),
+        }
+        assert_eq!(
+            histogram_count(&tel, "db.client.connection.use_time"),
+            finish + 1
+        );
+    }
+    assert_eq!(pending_count(&tel), 0);
+}
+
+async fn waiting_operation(
+    pool: &sqlx_otel::Pool<sqlx::Sqlite>,
+    path: u8,
+) -> Result<(), sqlx::Error> {
+    use futures::TryStreamExt;
+    match path {
+        0 => {
+            drop(pool.acquire().await?);
+        }
+        1 => {
+            pool.fetch_optional("SELECT 1").await?;
+        }
+        2 => {
+            drop(pool.begin().await?);
+        }
+        3 => {
+            pool.fetch("SELECT 1").try_next().await?;
+        }
+        _ => {
+            pool.with_operation("SELECT", "test")
+                .fetch_optional("SELECT 1")
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn all_acquisition_paths_clear_pending_on_cancel_and_report_real_timeouts() {
+    let tel = common::TestTelemetry::install();
+    let raw = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_millis(100))
+        .connect(":memory:")
+        .await
+        .unwrap();
+    let pool = PoolBuilder::from(raw).build();
+    let held = pool.acquire().await.unwrap();
+    for path in 0..5 {
+        let mut cancelled = Box::pin(waiting_operation(&pool, path));
+        assert!(futures::poll!(&mut cancelled).is_pending());
+        assert_eq!(pending_count(&tel), 1);
+        drop(cancelled);
+        assert_eq!(
+            pending_count(&tel),
+            0,
+            "cancelled acquisition leaked pending"
+        );
+        assert_eq!(
+            timeout_count(&tel),
+            u64::from(path),
+            "caller cancellation is not a pool timeout"
+        );
+        assert!(matches!(
+            waiting_operation(&pool, path).await,
+            Err(sqlx::Error::PoolTimedOut)
+        ));
+        assert_eq!(pending_count(&tel), 0);
+        assert_eq!(timeout_count(&tel), u64::from(path) + 1);
+        assert_eq!(
+            histogram_count(&tel, "db.client.connection.wait_time"),
+            u64::from(path) + 2
+        );
+    }
+    drop(held);
+}
+
+#[tokio::test]
+#[serial]
+async fn dropping_a_partially_consumed_stream_releases_its_only_connection() {
+    use futures::TryStreamExt;
+    let tel = common::TestTelemetry::install();
+    let raw = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(":memory:")
+        .await
+        .unwrap();
+    let pool = PoolBuilder::from(raw).build();
+    let mut rows = pool.fetch("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3");
+    rows.try_next().await.unwrap().unwrap();
+    assert_eq!(histogram_count(&tel, "db.client.connection.use_time"), 0);
+    drop(rows);
+    assert_eq!(histogram_count(&tel, "db.client.connection.use_time"), 1);
+    tokio::time::timeout(Duration::from_secs(1), pool.acquire())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending_count(&tel), 0);
+}
+
 /// Helper to find a named metric in the collected resource metrics.
 fn find_metric<'a>(
     resource_metrics: &'a [opentelemetry_sdk::metrics::data::ResourceMetrics],

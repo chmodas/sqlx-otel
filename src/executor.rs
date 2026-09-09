@@ -687,14 +687,14 @@ macro_rules! impl_executor {
 // Executor impls for each wrapper type
 // ---------------------------------------------------------------------------
 
-impl_executor!(&'_ crate::Pool<DB>, self => &self.inner);
+impl_executor!(&'_ crate::Pool<DB>, self => crate::pool_executor::PoolExecutor(self.clone()));
 impl_executor!(&'c mut crate::PoolConnection<DB>, self => self.inner.as_mut());
 impl_executor!(&'c mut crate::Transaction<'_, DB>, self => &mut *self.inner);
 
 // Annotated wrappers – same instrumentation with per-query annotations threaded through.
 impl_executor!(
     crate::annotations::Annotated<'c, crate::Pool<DB>>,
-    self => &self.inner.inner,
+    self => crate::pool_executor::PoolExecutor(self.inner.clone()),
     annotations: Some(&self.annotations)
 );
 impl_executor!(

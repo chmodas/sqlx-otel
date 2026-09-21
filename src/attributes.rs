@@ -50,6 +50,31 @@ pub enum QueryTextMode {
     Off,
 }
 
+/// Controls whether `sqlx-otel` generates a low-cardinality `db.query.summary`.
+///
+/// Automatic summaries contain only the outer SQL operation and its primary target, such
+/// as `SELECT users` or `INSERT orders`. For a query whose outer target is a common table
+/// expression, the summarizer resolves the CTE to its primary physical target when
+/// possible. Literal values, predicates, selected columns, and bind parameters are never
+/// included.
+///
+/// This is a best-effort extractor, not a complete SQL parser. Dynamic object names still
+/// contribute to metric cardinality. Keep this mode off or supply explicit annotations if
+/// object names are sensitive or unbounded.
+///
+/// Configured via
+/// [`PoolBuilder::with_query_summary_mode`](crate::PoolBuilder::with_query_summary_mode).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum QuerySummaryMode {
+    /// Do not generate `db.query.summary`. Explicit [`QueryAnnotations`](crate::QueryAnnotations)
+    /// are unaffected.
+    #[default]
+    Off,
+    /// Generate a best-effort low-cardinality summary when no explicit query annotations
+    /// were supplied.
+    Auto,
+}
+
 /// Immutable, connection-level OpenTelemetry attributes shared by every span and metric
 /// recording from a single pool.
 ///
@@ -84,6 +109,8 @@ pub(crate) struct ConnectionAttributes {
     pub pool_name: Option<String>,
     /// Controls `db.query.text` capture.
     pub query_text_mode: QueryTextMode,
+    /// Controls automatic `db.query.summary` generation.
+    pub query_summary_mode: QuerySummaryMode,
 }
 
 impl ConnectionAttributes {
@@ -257,6 +284,7 @@ mod tests {
             network_transport: Some("tcp".into()),
             pool_name: Some("primary".into()),
             query_text_mode: QueryTextMode::Full,
+            query_summary_mode: QuerySummaryMode::Off,
         };
         let kvs = attrs.base_key_values();
         assert_eq!(kvs.len(), 9);
@@ -284,6 +312,7 @@ mod tests {
             network_transport: None,
             pool_name: None,
             query_text_mode: QueryTextMode::Off,
+            query_summary_mode: QuerySummaryMode::Off,
         };
         let kvs = attrs.base_key_values();
         assert_eq!(kvs.len(), 1);
@@ -395,6 +424,7 @@ mod tests {
                 network_transport: network_transport.clone(),
                 pool_name: pool_name.clone(),
                 query_text_mode: QueryTextMode::Off,
+                query_summary_mode: QuerySummaryMode::Off,
             };
             let kvs = attrs.base_key_values();
             let expected = 1

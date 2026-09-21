@@ -11,6 +11,15 @@ use std::time::Duration;
 
 const POOL_NAME: &str = "test-pool";
 
+/// The boundaries the crate ships on every latency histogram.
+///
+/// Hardcoded on purpose: importing `LATENCY_BUCKETS_SECONDS` would make the assertion
+/// tautological, and it would pass through any edit to the constant.
+const EXPECTED_LATENCY_BUCKETS: &[f64] = &[
+    0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+    30.0, 60.0,
+];
+
 fn histogram_count(tel: &common::TestTelemetry, name: &str) -> u64 {
     tel.reset();
     let metrics = tel.metrics();
@@ -82,6 +91,10 @@ async fn every_pool_executor_path_acquires_once_without_duplicate_query_spans() 
     pool.describe(sqlx::SqlStr::from_static("SELECT id FROM test"))
         .await
         .unwrap();
+    // `prepare` defaults into `prepare_with`, so it is a funnel path of its own.
+    pool.prepare(sqlx::SqlStr::from_static("SELECT id FROM test"))
+        .await
+        .unwrap();
     pool.with_operation("SELECT", "test")
         .fetch_one("SELECT id FROM test")
         .await
@@ -93,11 +106,11 @@ async fn every_pool_executor_path_acquires_once_without_duplicate_query_spans() 
         .unwrap();
     assert_eq!(
         tel.spans().len(),
-        12,
+        13,
         "query instrumentation must not be nested"
     );
-    assert_eq!(histogram_count(&tel, "db.client.connection.wait_time"), 12);
-    assert_eq!(histogram_count(&tel, "db.client.connection.use_time"), 12);
+    assert_eq!(histogram_count(&tel, "db.client.connection.wait_time"), 13);
+    assert_eq!(histogram_count(&tel, "db.client.connection.use_time"), 13);
     assert_eq!(pending_count(&tel), 0);
     assert_eq!(timeout_count(&tel), 0);
 }
@@ -227,6 +240,356 @@ async fn dropping_a_partially_consumed_stream_releases_its_only_connection() {
         .unwrap()
         .unwrap();
     assert_eq!(pending_count(&tel), 0);
+}
+
+/// Resolve a latency histogram's bucket boundaries as the SDK actually configured them.
+fn histogram_bounds(tel: &common::TestTelemetry, name: &str) -> Vec<f64> {
+    tel.reset();
+    let metrics = tel.metrics();
+    let metric = find_metric(&metrics, name).expect("histogram not recorded");
+    let AggregatedMetrics::F64(MetricData::Histogram(hist)) = metric.data() else {
+        panic!("expected histogram")
+    };
+    hist.data_points()
+        .next()
+        .expect("no data point")
+        .bounds()
+        .collect()
+}
+
+/// Every latency histogram must carry the shared seconds-scale boundaries.
+///
+/// The `OTel` SDK default boundaries (`0, 5, 10, 25, ... 10000`) are millisecond-shaped, so on a
+/// seconds-valued histogram every observation below five seconds collapses into one bucket and
+/// quantiles become interpolation artefacts. This pins all three latency histograms to the
+/// shared set; row-count histograms are deliberately left on the defaults.
+#[tokio::test]
+#[serial]
+async fn latency_histograms_use_seconds_scale_buckets() {
+    let tel = common::TestTelemetry::install();
+    let pool = PoolBuilder::from(sqlx::SqlitePool::connect(":memory:").await.unwrap()).build();
+    drop(pool.acquire().await.unwrap());
+    pool.execute("SELECT 1").await.unwrap();
+    pool.fetch_all("SELECT 1").await.unwrap();
+
+    for name in LATENCY_HISTOGRAMS {
+        assert_eq!(
+            histogram_bounds(&tel, name),
+            EXPECTED_LATENCY_BUCKETS,
+            "{name} boundaries"
+        );
+    }
+
+    // The negative half. Row counts are not durations, so the seconds-scale set must not reach
+    // them – and the shared constant now sits two lines from their builders, which is exactly
+    // where an accidental copy-paste would land.
+    for name in [
+        "db.client.response.returned_rows",
+        "db.client.response.affected_rows",
+    ] {
+        assert_ne!(
+            histogram_bounds(&tel, name),
+            EXPECTED_LATENCY_BUCKETS,
+            "{name} must keep the SDK default boundaries"
+        );
+    }
+}
+
+/// Sub-millisecond acquisitions must land in the low buckets, not be swallowed by a coarse one.
+///
+/// This is the behaviour the boundaries exist for: an in-memory `SQLite` pool acquires in tens of
+/// microseconds, which the SDK defaults would record as indistinguishable from a four-second
+/// wait. The assertion is deliberately made against the 5ms boundary rather than the tightest
+/// one measurement allows – still three orders of magnitude finer than the SDK default's first
+/// edge, without making the test hostage to a scheduler hiccup on a loaded CI runner.
+#[tokio::test]
+#[serial]
+async fn submillisecond_acquisition_lands_below_the_first_millisecond_boundary() {
+    let tel = common::TestTelemetry::install();
+    let pool = PoolBuilder::from(sqlx::SqlitePool::connect(":memory:").await.unwrap()).build();
+    for _ in 0..8 {
+        drop(pool.acquire().await.unwrap());
+    }
+
+    tel.reset();
+    let metrics = tel.metrics();
+    let metric = find_metric(&metrics, "db.client.connection.wait_time").unwrap();
+    let AggregatedMetrics::F64(MetricData::Histogram(hist)) = metric.data() else {
+        panic!("expected histogram")
+    };
+    let dp = hist.data_points().next().unwrap();
+    let bounds: Vec<f64> = dp.bounds().collect();
+    let counts: Vec<u64> = dp.bucket_counts().collect();
+    let five_ms = bounds
+        .iter()
+        .position(|b| (b - 0.005).abs() < f64::EPSILON)
+        .expect("0.005 boundary missing from the shipped set");
+    let below_five_ms: u64 = counts[..=five_ms].iter().sum();
+    assert_eq!(
+        below_five_ms,
+        dp.count(),
+        "warm in-memory acquisitions should all record under 5ms; got {counts:?}"
+    );
+}
+
+/// A query that fails after acquisition must still release its connection and clear pending.
+///
+/// The failure arrives from the driver once the connection is already leased, so the guard and
+/// the usage lease both have to unwind on the error path, not just on success.
+#[tokio::test]
+#[serial]
+async fn queries_failing_after_acquisition_release_the_connection() {
+    let tel = common::TestTelemetry::install();
+    let raw = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_millis(200))
+        .connect(":memory:")
+        .await
+        .unwrap();
+    let pool = PoolBuilder::from(raw).build();
+
+    assert!(pool.fetch_optional("SELECT * FROM missing").await.is_err());
+    assert!(pool.execute("NOT VALID SQL").await.is_err());
+    assert!(pool.fetch_all("SELECT * FROM missing").await.is_err());
+
+    // Collect spans before touching any metric helper: they all call `TestTelemetry::reset`,
+    // which drains the span exporter as well as the metric one.
+    //
+    // Query-level instrumentation must survive the error path, not just acquisition accounting:
+    // each failure should still produce a span marked with the error.
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 3, "one span per failed query");
+    assert!(
+        spans.iter().all(|span| span
+            .attributes
+            .iter()
+            .any(|kv| kv.key.as_str() == "error.type")),
+        "every failed query span must carry error.type"
+    );
+
+    assert_eq!(pending_count(&tel), 0);
+    assert_eq!(
+        timeout_count(&tel),
+        0,
+        "a query error is not a pool timeout"
+    );
+    assert_eq!(histogram_count(&tel, "db.client.connection.wait_time"), 3);
+    assert_eq!(histogram_count(&tel, "db.client.connection.use_time"), 3);
+    assert_eq!(
+        histogram_count(&tel, "db.client.operation.duration"),
+        3,
+        "a failed query should still record its duration"
+    );
+    // The inner `expect` carries the diagnostic: these pools set a 200ms acquire timeout, so a
+    // leak surfaces as `Err(PoolTimedOut)` long before the outer 1s timeout could fire.
+    tokio::time::timeout(Duration::from_secs(1), pool.acquire())
+        .await
+        .expect("acquire hung")
+        .expect("failed queries exhausted the pool");
+}
+
+/// A closed pool fails acquisition without leasing a connection or counting a timeout.
+///
+/// `PoolClosed` and `PoolTimedOut` are both acquisition failures but only the latter belongs in
+/// `db.client.connection.timeouts`; conflating them would inflate the timeout rate on shutdown.
+#[tokio::test]
+#[serial]
+async fn closed_pool_records_no_lease_and_no_timeout() {
+    let tel = common::TestTelemetry::install();
+    let pool = PoolBuilder::from(sqlx::SqlitePool::connect(":memory:").await.unwrap()).build();
+    pool.close().await;
+
+    assert!(pool.fetch_optional("SELECT 1").await.is_err());
+    assert!(pool.begin().await.is_err());
+
+    assert_eq!(pending_count(&tel), 0);
+    assert_eq!(timeout_count(&tel), 0, "PoolClosed is not a timeout");
+    assert_eq!(
+        histogram_count(&tel, "db.client.connection.use_time"),
+        0,
+        "no connection was ever leased"
+    );
+}
+
+/// A multi-statement stream holds one connection across every statement, and releases it when
+/// abandoned between them.
+///
+/// Row-only streams are already covered by `dropping_a_partially_consumed_stream_releases_its_
+/// only_connection`. The distinct axis here is `fetch_many` yielding `Either::Left(QueryResult)`
+/// at each statement boundary: the generator resumes across those boundaries on the same lease,
+/// so a single acquisition must cover all three statements no matter where the caller stops.
+#[tokio::test]
+#[serial]
+async fn multi_statement_stream_holds_one_lease_across_statement_boundaries() {
+    use futures::TryStreamExt;
+    let tel = common::TestTelemetry::install();
+    let raw = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_millis(200))
+        .connect(":memory:")
+        .await
+        .unwrap();
+    let pool = PoolBuilder::from(raw).build();
+    pool.execute("CREATE TABLE t (id integer)").await.unwrap();
+
+    // The SDK aggregates histograms cumulatively and `TestTelemetry::reset` only drops exported
+    // batches, so the setup query's observations persist. Compare against a baseline rather than
+    // against zero.
+    let waits_before = histogram_count(&tel, "db.client.connection.wait_time");
+    let uses_before = histogram_count(&tel, "db.client.connection.use_time");
+
+    // Three statements: each completion yields a `Left(QueryResult)` before the next begins.
+    #[allow(deprecated)]
+    let mut items = Box::pin(pool.fetch_many(
+        "INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); INSERT INTO t VALUES (3);",
+    ));
+
+    let first = items.try_next().await.unwrap().expect("no first item");
+    assert!(
+        first.is_left(),
+        "expected a QueryResult at the first statement boundary"
+    );
+    assert_eq!(
+        histogram_count(&tel, "db.client.connection.wait_time"),
+        waits_before + 1,
+        "one acquisition covers the whole multi-statement stream"
+    );
+    assert_eq!(
+        histogram_count(&tel, "db.client.connection.use_time"),
+        uses_before,
+        "the lease is still open while the stream is mid-flight"
+    );
+
+    // Abandon between statements, not between rows.
+    drop(items);
+
+    assert_eq!(
+        histogram_count(&tel, "db.client.connection.use_time"),
+        uses_before + 1,
+        "abandoning the stream must close out exactly one lease"
+    );
+    assert_eq!(
+        histogram_count(&tel, "db.client.connection.wait_time"),
+        waits_before + 1,
+        "no statement boundary may trigger a second acquisition"
+    );
+    assert_eq!(pending_count(&tel), 0);
+    tokio::time::timeout(Duration::from_secs(1), pool.acquire())
+        .await
+        .expect("acquire hung")
+        .expect("stream abandoned between statements leaked its connection");
+}
+
+/// The three latency histogram names the crate ships explicit boundaries for.
+const LATENCY_HISTOGRAMS: [&str; 3] = [
+    "db.client.connection.wait_time",
+    "db.client.connection.use_time",
+    "db.client.operation.duration",
+];
+
+/// Build a pool under a freshly installed meter provider and report each latency histogram's
+/// bucket boundaries.
+///
+/// Takes an optional view so the same pool workload can be observed with and without one. Each
+/// call installs its own provider because `PoolBuilder::build` resolves its instruments from
+/// whatever provider is global at that moment, so the view has to be registered first.
+async fn latency_bounds_under_view(view_boundaries: Option<Vec<f64>>) -> Vec<Vec<f64>> {
+    use opentelemetry_sdk::metrics::{
+        Aggregation, InMemoryMetricExporter, Instrument, PeriodicReader, SdkMeterProvider, Stream,
+    };
+
+    let exporter = InMemoryMetricExporter::default();
+    let mut builder =
+        SdkMeterProvider::builder().with_reader(PeriodicReader::builder(exporter.clone()).build());
+    if let Some(boundaries) = view_boundaries {
+        // Match only the three histograms. A broader predicate would also hit the counters and
+        // gauges, where the SDK rejects a histogram aggregation and silently falls back to the
+        // implicit default view – passing through an error-recovery path instead of this one.
+        builder = builder.with_view(move |i: &Instrument| {
+            LATENCY_HISTOGRAMS.contains(&i.name()).then(|| {
+                Stream::builder()
+                    .with_aggregation(Aggregation::ExplicitBucketHistogram {
+                        boundaries: boundaries.clone(),
+                        record_min_max: true,
+                    })
+                    .build()
+                    .unwrap()
+            })
+        });
+    }
+    let provider = builder.build();
+    opentelemetry::global::set_meter_provider(provider.clone());
+
+    let pool = PoolBuilder::from(sqlx::SqlitePool::connect(":memory:").await.unwrap()).build();
+    drop(pool.acquire().await.unwrap());
+    pool.execute("SELECT 1").await.unwrap();
+    provider.force_flush().unwrap();
+
+    let collected = exporter.get_finished_metrics().unwrap();
+    LATENCY_HISTOGRAMS
+        .iter()
+        .map(|name| {
+            let metric = find_metric(&collected, name).expect("histogram not recorded");
+            let AggregatedMetrics::F64(MetricData::Histogram(hist)) = metric.data() else {
+                panic!("expected histogram for {name}")
+            };
+            hist.data_points()
+                .next()
+                .expect("no data point")
+                .bounds()
+                .collect()
+        })
+        .collect()
+}
+
+/// An application `View` must be able to override the bucket boundaries the crate ships.
+///
+/// The crate sets boundaries as instrument *advice*, and the SDK applies advice only where no
+/// matching view has already set an aggregation. That is what lets callers retune the histograms
+/// without this crate exposing an API for it, and the README documents it.
+///
+/// Both halves are asserted in one test on purpose. Checking only that a view produces the
+/// boundaries it asked for would pass even if the crate shipped no advice at all – it would be
+/// testing the SDK, not this crate.
+///
+/// The baseline does most of the work: it shows the crate's boundaries are applied when no view
+/// is registered, so the second half is genuinely replacing them rather than supplying a value
+/// where there was none. The `assert_ne!` covers the one case the baseline cannot – an override
+/// that happens to match the shipped set, which would leave the two halves indistinguishable.
+///
+/// This test installs its own meter provider rather than using `TestTelemetry`, which has no
+/// hook for registering views. That makes `#[serial]` matter more here than elsewhere: nothing
+/// restores the previous provider afterwards, and the next test's `TestTelemetry` installation
+/// is what reclaims it.
+#[tokio::test]
+#[serial]
+async fn an_application_view_overrides_the_shipped_bucket_boundaries() {
+    const OVERRIDE: &[f64] = &[0.005, 0.05, 0.5, 5.0];
+
+    // Without a view, the pool must come up on the boundaries the crate advises.
+    let baseline = latency_bounds_under_view(None).await;
+    for (name, bounds) in LATENCY_HISTOGRAMS.iter().zip(&baseline) {
+        assert_eq!(
+            bounds, EXPECTED_LATENCY_BUCKETS,
+            "{name}: crate advice must apply when no view matches"
+        );
+    }
+
+    // With one, the view's aggregation must win outright.
+    let overridden = latency_bounds_under_view(Some(OVERRIDE.to_vec())).await;
+    for (name, bounds) in LATENCY_HISTOGRAMS.iter().zip(&overridden) {
+        assert_eq!(
+            bounds, OVERRIDE,
+            "{name}: a view's aggregation must beat the crate's advice"
+        );
+    }
+
+    // The guard that keeps this test honest: if the crate ever stopped shipping advice, the two
+    // observations would coincide and the assertions above would still pass individually.
+    assert_ne!(
+        baseline, overridden,
+        "override must actually change the bucket layout"
+    );
 }
 
 /// Helper to find a named metric in the collected resource metrics.

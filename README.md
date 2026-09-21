@@ -207,19 +207,41 @@ These mirror the bounded portion of the span attribute set: connection-level att
 | `db.client.connection.idle.max`           | Gauge           |      | Maximum idle connections (equals `max` in SQLx)       |
 | `db.client.connection.idle.min`           | Gauge           |      | Configured minimum connections                        |
 
-Explicit `acquire()`, implicit pool queries (including annotated and streaming queries),
-and `begin()` share one instrumented acquisition. Queries within a transaction do not
-acquire again. Wait time covers completed acquisition attempts, including semaphore wait,
-connection creation and validation, but excludes query execution and `BEGIN`. Dropping a
-waiting future decrements pending requests without recording a completed wait or a pool
-timeout. Only `sqlx::Error::PoolTimedOut` increments the timeout counter. Pending and
-timeout series are initialized at zero; wait buckets resolve submillisecond acquisitions.
-Connection-use time follows the lease through transaction commit, rollback, or drop.
+Explicit `acquire()`, implicit pool queries (including annotated and streaming queries), and `begin()` share one instrumented acquisition; queries issued inside a transaction do not acquire again. Wait time covers completed acquisition attempts – semaphore wait, connection creation, and validation – but excludes `BEGIN` and query execution. Dropping a waiting future decrements pending requests without recording a completed wait or a timeout, since the pool never failed to deliver: the caller left. Only `sqlx::Error::PoolTimedOut` increments the timeout counter, so `PoolClosed` on shutdown does not inflate your timeout rate. Pending-request and timeout series are initialised at zero so dashboards start from a known baseline rather than waiting for the first event. Connection use time follows the lease through transaction commit, rollback, or drop.
 
-`db.client.connection.count` is polled by a background task and requires both a runtime
-feature (`runtime-tokio` or `runtime-async-std`) and a pool name set via
-`PoolBuilder::with_pool_name`. Polling and export intervals can miss brief utilization or
-pending-request peaks. The remaining three are static gauges recorded once at construction.
+`db.client.connection.count` is polled by a background task and requires both a runtime feature (`runtime-tokio` or `runtime-async-std`) and a pool name set via `PoolBuilder::with_pool_name`. Polling and export intervals can miss brief utilisation or pending-request peaks. The remaining three are static gauges recorded once at construction.
+
+### Histogram buckets
+
+The three latency histograms – `db.client.operation.duration`, `db.client.connection.wait_time`, and `db.client.connection.use_time` – are recorded in seconds, as the semantic conventions require. The OpenTelemetry SDK's default bucket boundaries (`0, 5, 10, 25, … 10000`) are shaped for milliseconds, so on a seconds-valued histogram every observation below five seconds falls into a single bucket and any quantile derived from it is an interpolation artefact rather than a measurement. The crate therefore ships explicit boundaries spanning the range a database client actually occupies, from sub-millisecond local round trips up to the 30-second acquire timeout SQLx applies by default:
+
+```text
+0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1,
+0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0
+```
+
+These are instrument *advice*, not a fixed configuration. The SDK applies advice only when no matching view has already set an aggregation, so an application that registers a `View` with its own explicit bucket boundaries overrides what the crate ships – no API is needed from this crate to retune them. (A view whose aggregation the SDK rejects as incompatible with the instrument is discarded, and the crate's advice applies after all, so match histogram names only.)
+
+```rust,ignore
+use opentelemetry_sdk::metrics::{Aggregation, Instrument, SdkMeterProvider, Stream};
+
+let provider = SdkMeterProvider::builder()
+    .with_reader(reader)
+    .with_view(|i: &Instrument| {
+        (i.name() == "db.client.operation.duration").then(|| {
+            Stream::builder()
+                .with_aggregation(Aggregation::ExplicitBucketHistogram {
+                    boundaries: vec![0.005, 0.05, 0.5, 5.0],
+                    record_min_max: true,
+                })
+                .build()
+                .unwrap()
+        })
+    })
+    .build();
+```
+
+The two row-count histograms (`db.client.response.returned_rows` and `db.client.response.affected_rows`) are left on the SDK defaults, which are already reasonable for counts.
 
 ## Backend support
 

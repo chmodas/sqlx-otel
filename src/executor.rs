@@ -10,7 +10,7 @@ use opentelemetry::{Context as OtelContext, KeyValue};
 use opentelemetry_semantic_conventions::attribute;
 
 use crate::annotations::QueryAnnotations;
-use crate::attributes::{self, ConnectionAttributes, QueryTextMode};
+use crate::attributes::{self, ConnectionAttributes, QuerySummaryMode, QueryTextMode};
 use crate::database::Database;
 use crate::metrics::Metrics;
 
@@ -97,13 +97,24 @@ fn start_span(name: &str, span_attrs: Vec<KeyValue>) -> (OtelContext, Instant) {
 /// The returned `metric_attrs` mirror the bounded portion of the span attribute set: connection
 /// attributes plus the four annotation-derived attributes when present, plus error-path attributes
 /// (`error.type`, `db.response.status_code`) appended later by `record_error`. The unbounded
-/// `db.query.text` attribute is deliberately excluded; `db.query.summary` is caller-controlled and
-/// can be unbounded – that cardinality cost is inherited from the span side.
+/// `db.query.text` attribute is deliberately excluded. Automatically generated
+/// `db.query.summary` values contain an operation/target pair; dynamically named targets still contribute to
+/// cardinality. Explicit summaries remain caller-controlled.
 fn begin_query_span(
     attrs: &ConnectionAttributes,
     sql: Option<&str>,
     annotations: Option<&QueryAnnotations>,
 ) -> (OtelContext, Instant, Vec<KeyValue>) {
+    let generated_annotations;
+    let annotations = if annotations.is_none() && attrs.query_summary_mode == QuerySummaryMode::Auto
+    {
+        generated_annotations = sql
+            .and_then(crate::summary::summarize)
+            .map(|summary| QueryAnnotations::new().query_summary(summary));
+        generated_annotations.as_ref()
+    } else {
+        annotations
+    };
     let (op, coll, summary) = annotations.map_or((None, None, None), |a| {
         (
             a.operation.as_deref(),
@@ -836,6 +847,7 @@ mod tests {
             network_transport: None,
             pool_name: None,
             query_text_mode: QueryTextMode::Full,
+            query_summary_mode: QuerySummaryMode::Off,
         }
     }
 
@@ -879,6 +891,67 @@ mod tests {
                 "INSERT INTO t (id, name) VALUES (?, ?)".into()
             ))
         );
+    }
+
+    #[test]
+    fn begin_query_span_generates_low_cardinality_summary_in_auto_mode() {
+        let mut attrs = test_attrs();
+        attrs.query_text_mode = QueryTextMode::Obfuscated;
+        attrs.query_summary_mode = QuerySummaryMode::Auto;
+        let (_, _, metric_attrs) = begin_query_span(
+            &attrs,
+            Some(
+                "WITH source_rows AS (SELECT id FROM events WHERE token = 'secret') \
+                 SELECT COUNT(*) FROM source_rows",
+            ),
+            None,
+        );
+        let summary = metric_attrs
+            .iter()
+            .find(|kv| kv.key.as_str() == "db.query.summary")
+            .map(|kv| kv.value.clone());
+        assert_eq!(
+            summary,
+            Some(opentelemetry::Value::String("SELECT events".into()))
+        );
+    }
+
+    #[test]
+    fn begin_query_span_does_not_generate_summary_when_disabled() {
+        let attrs = test_attrs();
+        let (_, _, metric_attrs) = begin_query_span(&attrs, Some("SELECT * FROM users"), None);
+        assert!(
+            !metric_attrs
+                .iter()
+                .any(|kv| kv.key.as_str() == "db.query.summary")
+        );
+    }
+
+    #[test]
+    fn begin_query_span_prefers_explicit_annotations_over_auto_summary() {
+        let mut attrs = test_attrs();
+        attrs.query_summary_mode = QuerySummaryMode::Auto;
+        let annotations = QueryAnnotations::new()
+            .operation("LOOKUP")
+            .collection("logical_users");
+        let (_, _, metric_attrs) = begin_query_span(
+            &attrs,
+            Some("SELECT * FROM physical_users"),
+            Some(&annotations),
+        );
+        assert!(
+            !metric_attrs
+                .iter()
+                .any(|kv| kv.key.as_str() == "db.query.summary")
+        );
+        assert!(metric_attrs.iter().any(|kv| {
+            kv.key.as_str() == "db.operation.name"
+                && kv.value == opentelemetry::Value::String("LOOKUP".into())
+        }));
+        assert!(metric_attrs.iter().any(|kv| {
+            kv.key.as_str() == "db.collection.name"
+                && kv.value == opentelemetry::Value::String("logical_users".into())
+        }));
     }
 
     // ===========================================================================
@@ -1051,6 +1124,7 @@ mod tests {
             network_transport: None,
             pool_name: None,
             query_text_mode,
+            query_summary_mode: QuerySummaryMode::Off,
         }
     }
 

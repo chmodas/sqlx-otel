@@ -28,7 +28,7 @@ The wrapper talks to the [`opentelemetry`](https://docs.rs/opentelemetry) API di
 
 ```toml
 [dependencies]
-sqlx-otel = { version = "0.5.0", features = ["postgres", "runtime-tokio"] }
+sqlx-otel = { version = "0.6.0", features = ["postgres", "runtime-tokio"] }
 ```
 
 ```rust
@@ -257,6 +257,7 @@ The two row-count histograms (`db.client.response.returned_rows` and `db.client.
 
 | sqlx-otel | sqlx    | opentelemetry | MSRV     |
 | --------- | ------- | ------------- | -------- |
+| `0.6.x`   | `0.9.x` | `0.33.x`      | `1.94.0` |
 | `0.5.x`   | `0.9.x` | `0.32.x`      | `1.94.0` |
 | `0.4.x`   | `0.8.x` | `0.32.x`      | `1.85.0` |
 | `0.3.x`   | `0.8.x` | `0.31.x`      | `1.85.0` |
@@ -267,7 +268,7 @@ Pick the row matching the `sqlx` and `opentelemetry` versions your application a
 
 ## Versioning policy
 
-`sqlx` and `opentelemetry` are both pre-1.0, so Cargo compares their *minor* version for compatibility: `0.31` and `0.32` are separate ranges that never unify, whether or not the release actually changed anything. If your application's versions drift from the ones sqlx-otel was built against, Cargo resolves both copies into the build graph, and the two libraries fail differently.
+`sqlx` and `opentelemetry` are both pre-1.0, so Cargo compares their *minor* version for compatibility: `0.32` and `0.33` are separate ranges that never unify, whether or not the release actually changed anything. If your application's versions drift from the ones sqlx-otel was built against, Cargo resolves both copies into the build graph, and the two libraries fail differently.
 
 **`sqlx` fails at compile time.** Its types are part of this crate's public API, and types from semver-incompatible releases are distinct types. A `Pool` from `sqlx` `0.9` will not go into a wrapper built against `sqlx` `0.8`.
 

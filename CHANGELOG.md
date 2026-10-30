@@ -6,16 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.6.0] – 2026-10-30
+
 ### Fixed
 
 - Implicit pool queries and `Pool::begin()` now route through the instrumented `Pool::acquire()`, so `db.client.connection.wait_time`, `use_time`, `pending_requests`, and `timeouts` account for every acquisition rather than only explicit `acquire()` calls. A workload written as `query(..).fetch_one(&pool)` previously borrowed its connection straight from `sqlx::Pool` and could saturate the pool without any of its waits or timeouts reaching telemetry. Queries issued inside a transaction still acquire once, and connection use time now follows the lease through transaction commit, rollback, or drop ([#40](https://github.com/chmodas/sqlx-otel/pull/40)).
 - Dropping an in-flight `acquire()` – a caller timeout or an aborted task – no longer leaves `db.client.connection.pending_requests` permanently incremented. The decrement moved to a `Drop` guard covering success, error, and cancellation alike. Cancellation records neither a completed wait nor a pool timeout, because the pool did not fail to deliver; only `sqlx::Error::PoolTimedOut` increments the timeout counter, so `PoolClosed` during shutdown no longer inflates the timeout rate ([#40](https://github.com/chmodas/sqlx-otel/pull/40)).
+- `Pool::begin()` returns `Transaction<'static, DB>` rather than a transaction borrowing the pool, matching the owned lifetime `sqlx::Pool::begin()` provides, so it can be moved into spawned tasks or returned from functions.
 
 ### Changed
 
+- **Action required:** Upgraded to `opentelemetry` and `opentelemetry-semantic-conventions` `0.33`. Applications must move their own `opentelemetry` and `opentelemetry_sdk` to `0.33` as well, or spans and metrics stop being emitted.
 - `db.client.connection.wait_time` declares explicit bucket boundaries instead of inheriting the OpenTelemetry SDK defaults ([#40](https://github.com/chmodas/sqlx-otel/pull/40)), and `db.client.operation.duration` and `db.client.connection.use_time` now use the same set ([#42](https://github.com/chmodas/sqlx-otel/pull/42)). The SDK defaults (`0, 5, 10, 25, … 10000`) are shaped for milliseconds, but semconv requires these histograms be recorded in seconds, so every observation below five seconds landed in a single bucket and any quantile computed from it was an interpolation artefact rather than a measurement. The boundaries run from `0.0001` to `60.0` seconds, covering sub-millisecond local round trips through the 30-second acquire timeout SQLx applies by default. **Dashboards and recording rules reading these histograms will see their bucket layout change.** The row-count histograms `db.client.response.returned_rows` and `db.client.response.affected_rows` keep the SDK defaults, which already suit counts. The boundaries are instrument advice, so an application that registers a `View` with a compatible explicit aggregation overrides them and the crate exposes no API of its own for retuning; the README carries a worked example ([#42](https://github.com/chmodas/sqlx-otel/pull/42)).
 - `db.client.connection.pending_requests` and `db.client.connection.timeouts` are initialised at zero when the pool is built, so both series exist from startup instead of appearing only after the first waiting caller or first timeout ([#40](https://github.com/chmodas/sqlx-otel/pull/40)).
-- Bumped `opentelemetry`, `opentelemetry_sdk`, and `opentelemetry-semantic-conventions` to `0.33`.
 
 ## [0.5.0] – 2026-08-09
 
@@ -80,3 +83,4 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 [0.3.0]: https://github.com/chmodas/sqlx-otel/releases/tag/v0.3.0
 [0.4.0]: https://github.com/chmodas/sqlx-otel/releases/tag/v0.4.0
 [0.5.0]: https://github.com/chmodas/sqlx-otel/releases/tag/v0.5.0
+[0.6.0]: https://github.com/chmodas/sqlx-otel/releases/tag/v0.6.0

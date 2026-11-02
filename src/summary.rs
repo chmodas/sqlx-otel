@@ -723,9 +723,186 @@ mod tests {
         assert_eq!(summarize(sql).as_deref(), Some("SELECT loop"));
     }
 
+    #[test]
+    fn cte_resolution_stops_at_the_depth_limit() {
+        // An acyclic chain distinguishes the depth guard from cycle detection.
+        let ctes = (0..18)
+            .map(|index| {
+                let target = if index == 17 {
+                    "physical_rows".to_owned()
+                } else {
+                    format!("cte_{}", index + 1)
+                };
+                format!("cte_{index} AS (SELECT * FROM {target})")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert_eq!(
+            summarize(&format!("WITH {ctes} SELECT * FROM cte_0")).as_deref(),
+            Some("SELECT cte_16")
+        );
+        assert_eq!(
+            summarize(&format!("WITH {ctes} SELECT * FROM cte_2")).as_deref(),
+            Some("SELECT physical_rows")
+        );
+    }
+
+    #[test]
+    fn cte_columns_and_materialization_preserve_the_source() {
+        for hint in ["", "MATERIALIZED", "NOT MATERIALIZED"] {
+            let sql = format!(
+                "WITH selected(id, label) AS {hint} \
+                 (SELECT id, COALESCE(label, 'anonymous') FROM users) \
+                 SELECT * FROM selected"
+            );
+            assert_eq!(summarize(&sql).as_deref(), Some("SELECT users"));
+        }
+    }
+
+    #[test]
+    fn nested_ctes_use_the_nearest_scope() {
+        let sql = "WITH source AS (SELECT * FROM outer_rows), \
+                   selected AS (WITH source AS (SELECT * FROM inner_rows) \
+                                SELECT * FROM source) \
+                   SELECT * FROM selected";
+        assert_eq!(summarize(sql).as_deref(), Some("SELECT inner_rows"));
+    }
+
+    #[test]
+    fn incomplete_cte_prefixes_have_no_summary() {
+        for sql in [
+            "WITH",
+            "WITH , SELECT * FROM users",
+            "WITH selected(id",
+            "WITH selected(id)",
+            "WITH selected AS",
+            "WITH selected AS MATERIALIZED",
+            "WITH selected AS (SELECT * FROM users",
+        ] {
+            assert_eq!(summarize(sql), None, "sql: {sql}");
+        }
+    }
+
+    #[test]
+    fn ddl_and_target_modifiers_preserve_object_names() {
+        for (sql, expected) in [
+            (
+                "ALTER TABLE ONLY users ADD COLUMN active boolean",
+                "ALTER users",
+            ),
+            ("DROP TABLE IF EXISTS users", "DROP users"),
+            (
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS users_idx ON users(id)",
+                "CREATE users_idx",
+            ),
+            ("TRUNCATE users", "TRUNCATE users"),
+            ("SELECT * FROM ONLY users", "SELECT users"),
+            ("UPDATE ONLY users SET active = true", "UPDATE users"),
+            ("COPY users TO STDOUT", "COPY users"),
+            ("EXECUTE refresh_users", "EXECUTE refresh_users"),
+        ] {
+            assert_eq!(summarize(sql).as_deref(), Some(expected), "sql: {sql}");
+        }
+    }
+
+    #[test]
+    fn commands_without_recognized_targets_use_only_the_operation() {
+        for (sql, expected) in [
+            ("CREATE EXTENSION example_extension", "CREATE"),
+            ("BEGIN", "BEGIN"),
+            ("COMMIT", "COMMIT"),
+            ("ROLLBACK", "ROLLBACK"),
+            ("EXPLAIN SELECT * FROM users", "EXPLAIN"),
+            ("SELECT * FROM WHERE secret = 'value'", "SELECT"),
+            ("SELECT * FROM users.", "SELECT"),
+        ] {
+            assert_eq!(summarize(sql).as_deref(), Some(expected), "sql: {sql}");
+        }
+        // Malformed qualification keeps the recognized prefix, not the clause/value.
+        assert_eq!(
+            summarize("SELECT * FROM users.WHERE secret = 'value'").as_deref(),
+            Some("SELECT users")
+        );
+    }
+
+    #[test]
+    fn comments_cannot_supply_a_target_or_a_second_statement() {
+        for sql in [
+            "-- SELECT * FROM secrets\nSELECT * FROM users",
+            "SELECT -- FROM secrets\n * FROM users",
+            "SELECT * FROM users -- FROM secrets",
+            "/* outer /* FROM secrets */ still a comment */ SELECT * FROM users",
+        ] {
+            assert_eq!(
+                summarize(sql).as_deref(),
+                Some("SELECT users"),
+                "sql: {sql}"
+            );
+        }
+        assert_eq!(
+            summarize("SELECT 1; SELECT * FROM secrets").as_deref(),
+            Some("SELECT")
+        );
+    }
+
+    #[test]
+    fn sqlite_bracket_identifiers_keep_delimiters() {
+        for (sql, expected) in [
+            ("SELECT * FROM [daily orders]", "SELECT [daily orders]"),
+            (
+                "SELECT * FROM [reporting].[daily orders]",
+                "SELECT [reporting].[daily orders]",
+            ),
+        ] {
+            assert_eq!(
+                super::summarize(sql, "sqlite").as_deref(),
+                Some(expected),
+                "sql: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn bracket_scanner_does_not_end_at_a_doubled_close() {
+        // Scanner characterization only: SQLite itself ends [...] at the first ].
+        assert_eq!(super::scan_bracket_identifier(b"[a]]b] tail", 0), 6);
+    }
+
+    #[test]
+    fn summary_limit_counts_utf8_bytes_and_preserves_complete_names() {
+        for target in ["x".repeat(248), format!("{}xx", "界".repeat(82))] {
+            let expected = format!("SELECT {target}");
+            assert_eq!(expected.len(), 255);
+            assert_eq!(
+                summarize(&format!("SELECT * FROM {target}")),
+                Some(expected)
+            );
+            assert_eq!(
+                summarize(&format!("SELECT * FROM {target}x")).as_deref(),
+                Some("SELECT")
+            );
+        }
+    }
+
     proptest! {
         #[test]
-        fn arbitrary_unicode_never_panics_or_exceeds_summary_cap(sql in any::<String>()) {
+        fn generated_quoted_selects_summarize_to_operation_and_target(
+            target in "[a-z]{1,40}",
+            value in any::<i64>(),
+        ) {
+            for (system, quote) in [("postgresql", '"'), ("mysql", '`'), ("sqlite", '"')] {
+                let sql = format!("SELECT * FROM {quote}{target}{quote} WHERE id = {value}");
+                let expected = format!("SELECT {quote}{target}{quote}");
+                let summary = super::summarize(&sql, system);
+                prop_assert_eq!(summary.as_deref(), Some(expected.as_str()));
+            }
+        }
+
+        #[test]
+        fn arbitrary_and_structured_inputs_never_panic_or_exceed_summary_cap(sql in prop_oneof![
+                any::<String>(),
+                "[a-z_][a-z_0-9]{0,300}".prop_map(|target| format!("SELECT * FROM {target}")),
+            ]) {
             for system in ["postgresql", "mysql", "sqlite"] {
                 let summary = super::summarize(&sql, system);
                 prop_assert!(summary.as_ref().is_none_or(|value| value.len() <= super::MAX_SUMMARY_BYTES));

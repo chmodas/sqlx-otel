@@ -76,7 +76,7 @@
 //! | `db.query.text`             | The SQL query string with inter-token whitespace collapsed | Unless [`QueryTextMode::Off`] |
 //! | `db.operation.name`         | Database operation (e.g. `SELECT`)                       | When [annotated]            |
 //! | `db.collection.name`        | Target table or collection                               | When [annotated]            |
-//! | `db.query.summary`          | Low-cardinality query summary                            | When [annotated]            |
+//! | `db.query.summary`          | Generated or caller-supplied query summary               | When generated or [annotated] |
 //! | `db.stored_procedure.name`  | Stored procedure name                                    | When [annotated]            |
 //! | `db.response.returned_rows` | Row count                                                | On `fetch*` methods         |
 //! | `db.response.affected_rows` | Rows affected (`QueryResult::rows_affected()`)           | On `execute` ([note](#a-note-on-dbresponseaffected_rows)) |
@@ -153,10 +153,19 @@
 //!
 //! # Per-query annotations
 //!
-//! `sqlx-otel` does **not** parse SQL. The four per-query semantic-convention attributes –
-//! `db.operation.name`, `db.collection.name`, `db.query.summary`, and
-//! `db.stored_procedure.name` – are the caller's responsibility, supplied through the
-//! annotation API. There are two equivalent surfaces depending on whether you prefer the
+//! Automatic summaries are off by default. Enable [`QuerySummaryMode::Auto`] to generate
+//! a best-effort `db.query.summary` containing the operation and primary target (for
+//! example `SELECT users`), resolving common table expressions when possible. This works
+//! regardless of [`QueryTextMode`], including [`QueryTextMode::Off`], and supplies both the
+//! span name and an operation metric attribute. Summaries are capped at 255 bytes;
+//! dynamically named objects still contribute to cardinality. This extractor is not a
+//! general SQL redaction boundary; unsupported forms may be inaccurate. Leave automatic
+//! summaries off for sensitive SQL. The other per-query
+//! semantic-convention attributes – `db.operation.name`,
+//! `db.collection.name`, and `db.stored_procedure.name` – remain caller-supplied through
+//! the annotation API. Any explicit annotations disable automatic summaries for that
+//! query, even when they do not supply a summary.
+//! There are two equivalent annotation surfaces depending on whether you prefer the
 //! annotation to live next to the executor or next to the query:
 //!
 //! **Executor-side** ([`Pool::with_annotations`], [`PoolConnection::with_annotations`],
@@ -263,10 +272,11 @@ mod pool_metrics;
 mod query_ext;
 mod rebuilt_query;
 mod runtime;
+mod summary;
 mod transaction;
 
 pub use annotations::{Annotated, AnnotatedMut, QueryAnnotations};
-pub use attributes::QueryTextMode;
+pub use attributes::{QuerySummaryMode, QueryTextMode};
 pub use connection::PoolConnection;
 pub use database::Database;
 pub use pool::{Pool, PoolBuilder};

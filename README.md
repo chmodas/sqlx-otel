@@ -15,7 +15,7 @@ The wrapper talks to the [`opentelemetry`](https://docs.rs/opentelemetry) API di
 
 - **Spans on every operation.** Every `sqlx::Executor` method emits a `SpanKind::Client` span carrying the OTel database-spans recommended set: `db.system.name`, `db.namespace`, `server.address`/`port`, `network.peer.address`/`port`, `network.protocol.name`, `network.transport`, `db.client.connection.pool.name`, `db.query.text`, returned/affected row counts, and SQLSTATE / `error.type` on failure.
 - **Span/metric attribute parity.** The `db.client.operation.duration` histogram carries the same bounded attribute set as spans – every annotation, every error-path attribute, every connection-level attribute – so dashboards can slice query latency by operation verb, target collection, error class, or pool name. `db.query.text` is the only span attribute deliberately excluded from metrics for cardinality.
-- **Caller-supplied annotations.** The library does not parse SQL. Per-query attributes (`db.operation.name`, `db.collection.name`, `db.query.summary`, `db.stored_procedure.name`) come from a small annotation API.
+- **Caller-supplied annotations.** Per-query attributes (`db.operation.name`, `db.collection.name`, `db.query.summary`, `db.stored_procedure.name`) come from a small annotation API. Optional automatic query summaries provide a best-effort operation/target label when annotations are absent; SQL extraction is off by default.
 - **Three backends, one API.** Postgres, SQLite, and MySQL behind feature flags; the wrapper API is identical across all three.
 - **Drop-in.** `&Pool<DB>` implements `sqlx::Executor`, so existing call sites keep working unchanged.
 
@@ -87,9 +87,44 @@ let pool = PoolBuilder::from(raw_pool)
 
 `network.protocol.name` defaults to the backend's wire protocol (`"postgresql"` for Postgres, `"mysql"` for MySQL, absent for SQLite); override only when the connection is tunnelled through a different application-layer protocol. `network.transport` is not inferred from the connect string – callers who want this attribute on spans / metrics must declare it explicitly so the value reflects the deployment configuration rather than a guess.
 
+## Automatic query summaries
+
+Automatic summaries are **off by default**. Enable best-effort `db.query.summary`
+generation when a short operation name is useful for grouping:
+
+```rust
+use sqlx_otel::{PoolBuilder, QuerySummaryMode};
+
+let pool = PoolBuilder::from(raw_pool)
+    .with_query_summary_mode(QuerySummaryMode::Auto)
+    .build();
+```
+
+The summary contains only the outer operation and primary target, such as `SELECT users` or
+`INSERT orders`. Common table expressions are resolved to their primary physical target
+when possible. Recognized literals are scrubbed before extraction; supported forms omit
+predicates, selected columns, and bind parameters. The generated summary names the span and
+is attached to operation metrics, independently of `QueryTextMode` (including `Off`). It does not infer
+`db.operation.name` or `db.collection.name`.
+
+Any explicit per-query annotations take precedence and disable inference for that query,
+even if they do not set a summary. This is a lightweight extractor, not a complete SQL
+parser: unsupported forms may yield operation-only or inaccurate summaries, or keep the
+generic span name. This is not a general SQL redaction boundary; leave it off for sensitive
+SQL. Summaries are capped at 255 bytes, falling back to the operation rather than
+truncating an identifier. Table/schema names still contribute to metric cardinality;
+use explicit summaries or keep this mode off for dynamically named or sensitive objects.
+
+The shared scrubber treats backslashes as escapes in single-quoted literals and always
+treats `"` as an identifier quote. It does not model PostgreSQL `standard_conforming_strings`,
+SQLite literal backslashes, or MySQL `NO_BACKSLASH_ESCAPES`/default double-quoted strings;
+in those forms literal text can surface as the summary target. Use explicit annotations
+or keep automatic summaries off for queries that depend on those semantics.
+
 ## Per-query annotations
 
-Because the library does not parse SQL, per-query attributes are the caller's responsibility:
+Operation, collection, stored-procedure, and custom summary annotations can be supplied by
+the caller:
 
 ```rust
 use sqlx_otel::{QueryAnnotateExt, QueryAnnotations};
@@ -133,6 +168,9 @@ See [`QueryAnnotations`](https://docs.rs/sqlx-otel/latest/sqlx_otel/struct.Query
 | `Obfuscated`     | Replace literal values (string, numeric, hex, boolean, dollar-quoted) with `?` in `db.query.text`. |
 | `Off`            | Do not capture `db.query.text`.                                                                    |
 
+`QueryTextMode::Off` does not disable automatic summaries. Keep `QuerySummaryMode::Off`
+as well when table or schema names are sensitive.
+
 `Obfuscated` is useful when SQL is constructed via string interpolation rather than bind parameters – the structure of the query is preserved while sensitive literal values are redacted. Comments, identifiers (quoted or otherwise), operators, and `NULL` are kept verbatim.
 
 Both `Full` and `Obfuscated` collapse inter-token whitespace runs to a single space and trim leading/trailing whitespace before emitting `db.query.text`, so multi-line SQL written for source-level readability renders cleanly in OTel exports. Whitespace **inside** string literals, quoted identifiers, dollar-quoted bodies, and comments is preserved verbatim. For example, an UPSERT split across multiple lines for readability:
@@ -171,7 +209,7 @@ Set on every `Executor` method (`execute`, `fetch`, `fetch_all`, `fetch_one`, `f
 | `db.query.text`                  | The SQL query string with inter-token whitespace collapsed  | Unless `QueryTextMode::Off` |
 | `db.operation.name`              | Database operation (e.g. `SELECT`)                          | When annotated              |
 | `db.collection.name`             | Target table or collection                                  | When annotated              |
-| `db.query.summary`               | Low-cardinality query summary                               | When annotated              |
+| `db.query.summary`               | Generated operation/target or caller-supplied summary         | When generated or annotated |
 | `db.stored_procedure.name`       | Stored procedure name                                       | When annotated              |
 | `db.response.returned_rows`      | Row count                                                   | On `fetch*` methods         |
 | `db.response.affected_rows`      | Rows affected (`rows_affected()`)                           | On `execute`                |
@@ -190,7 +228,7 @@ On error, the span status is set to `Error` and an `exception` event is added wi
 | `db.client.response.returned_rows` | Histogram |      | Number of rows returned per `fetch*` call     |
 | `db.client.response.affected_rows` | Histogram |      | Rows affected per `execute` call (custom)     |
 
-These mirror the bounded portion of the span attribute set: connection-level attributes (`db.system.name`, `db.namespace`, `server.address`/`port`, `network.peer.address`/`port`, `network.protocol.name`, `network.transport`, `db.client.connection.pool.name` – wherever set), plus annotation-derived attributes (`db.operation.name`, `db.collection.name`, `db.query.summary`, `db.stored_procedure.name`) when present, plus error-path attributes (`error.type`, plus `db.response.status_code` for `sqlx::Error::Database`) on the error path. `db.query.text` is deliberately excluded for cardinality; `db.query.summary` is caller-controlled and inherits its cardinality cost from the span side.
+These mirror the bounded portion of the span attribute set: connection-level attributes (`db.system.name`, `db.namespace`, `server.address`/`port`, `network.peer.address`/`port`, `network.protocol.name`, `network.transport`, `db.client.connection.pool.name` – wherever set), plus annotation-derived attributes (`db.operation.name`, `db.collection.name`, `db.query.summary`, `db.stored_procedure.name`) when present, plus error-path attributes (`error.type`, plus `db.response.status_code` for `sqlx::Error::Database`) on the error path. `db.query.text` is deliberately excluded for cardinality; `db.query.summary` may be generated or caller-supplied, and dynamically named targets or explicit summaries contribute to metric cardinality.
 
 `db.client.response.affected_rows` is not part of the OpenTelemetry semantic conventions – we ship it for the same reason as the matching span attribute: backends report a useful database-confirmed count that's worth slicing alongside duration. It is recorded only on `execute()` calls (where `QueryResult::rows_affected()` is meaningful) and is not recorded for `execute_many` (deprecated upstream).
 

@@ -102,17 +102,24 @@ let pool = PoolBuilder::from(raw_pool)
 
 The summary contains only the outer operation and primary target, such as `SELECT users` or
 `INSERT orders`. Common table expressions are resolved to their primary physical target
-when possible. Predicates, selected columns, literal values, and bind parameters are never
-included for supported SQL forms. The generated summary names the span and is attached to
-operation metrics, independently of `QueryTextMode` (including `Off`). It does not infer
+when possible. Recognized literals are scrubbed before extraction; supported forms omit
+predicates, selected columns, and bind parameters. The generated summary names the span and
+is attached to operation metrics, independently of `QueryTextMode` (including `Off`). It does not infer
 `db.operation.name` or `db.collection.name`.
 
 Any explicit per-query annotations take precedence and disable inference for that query,
 even if they do not set a summary. This is a lightweight extractor, not a complete SQL
-parser: unsupported forms may produce an operation-only summary or keep the existing
-generic span name. Summaries are capped at 255 bytes, falling back to the operation rather
-than truncating an identifier. Table/schema names still contribute to metric cardinality;
+parser: unsupported forms may yield operation-only or inaccurate summaries, or keep the
+generic span name. This is not a general SQL redaction boundary; leave it off for sensitive
+SQL. Summaries are capped at 255 bytes, falling back to the operation rather than
+truncating an identifier. Table/schema names still contribute to metric cardinality;
 use explicit summaries or keep this mode off for dynamically named or sensitive objects.
+
+The shared scrubber treats backslashes as escapes in single-quoted literals and always
+treats `"` as an identifier quote. It does not model PostgreSQL `standard_conforming_strings`,
+SQLite literal backslashes, or MySQL `NO_BACKSLASH_ESCAPES`/default double-quoted strings;
+in those forms literal text can surface as the summary target. Use explicit annotations
+or keep automatic summaries off for queries that depend on those semantics.
 
 ## Per-query annotations
 
@@ -161,6 +168,9 @@ See [`QueryAnnotations`](https://docs.rs/sqlx-otel/latest/sqlx_otel/struct.Query
 | `Obfuscated`     | Replace literal values (string, numeric, hex, boolean, dollar-quoted) with `?` in `db.query.text`. |
 | `Off`            | Do not capture `db.query.text`.                                                                    |
 
+`QueryTextMode::Off` does not disable automatic summaries. Keep `QuerySummaryMode::Off`
+as well when table or schema names are sensitive.
+
 `Obfuscated` is useful when SQL is constructed via string interpolation rather than bind parameters – the structure of the query is preserved while sensitive literal values are redacted. Comments, identifiers (quoted or otherwise), operators, and `NULL` are kept verbatim.
 
 Both `Full` and `Obfuscated` collapse inter-token whitespace runs to a single space and trim leading/trailing whitespace before emitting `db.query.text`, so multi-line SQL written for source-level readability renders cleanly in OTel exports. Whitespace **inside** string literals, quoted identifiers, dollar-quoted bodies, and comments is preserved verbatim. For example, an UPSERT split across multiple lines for readability:
@@ -199,7 +209,7 @@ Set on every `Executor` method (`execute`, `fetch`, `fetch_all`, `fetch_one`, `f
 | `db.query.text`                  | The SQL query string with inter-token whitespace collapsed  | Unless `QueryTextMode::Off` |
 | `db.operation.name`              | Database operation (e.g. `SELECT`)                          | When annotated              |
 | `db.collection.name`             | Target table or collection                                  | When annotated              |
-| `db.query.summary`               | Low-cardinality query summary                               | When annotated              |
+| `db.query.summary`               | Generated operation/target or caller-supplied summary         | When generated or annotated |
 | `db.stored_procedure.name`       | Stored procedure name                                       | When annotated              |
 | `db.response.returned_rows`      | Row count                                                   | On `fetch*` methods         |
 | `db.response.affected_rows`      | Rows affected (`rows_affected()`)                           | On `execute`                |
@@ -218,7 +228,7 @@ On error, the span status is set to `Error` and an `exception` event is added wi
 | `db.client.response.returned_rows` | Histogram |      | Number of rows returned per `fetch*` call     |
 | `db.client.response.affected_rows` | Histogram |      | Rows affected per `execute` call (custom)     |
 
-These mirror the bounded portion of the span attribute set: connection-level attributes (`db.system.name`, `db.namespace`, `server.address`/`port`, `network.peer.address`/`port`, `network.protocol.name`, `network.transport`, `db.client.connection.pool.name` – wherever set), plus annotation-derived attributes (`db.operation.name`, `db.collection.name`, `db.query.summary`, `db.stored_procedure.name`) when present, plus error-path attributes (`error.type`, plus `db.response.status_code` for `sqlx::Error::Database`) on the error path. `db.query.text` is deliberately excluded for cardinality; `db.query.summary` is caller-controlled and inherits its cardinality cost from the span side.
+These mirror the bounded portion of the span attribute set: connection-level attributes (`db.system.name`, `db.namespace`, `server.address`/`port`, `network.peer.address`/`port`, `network.protocol.name`, `network.transport`, `db.client.connection.pool.name` – wherever set), plus annotation-derived attributes (`db.operation.name`, `db.collection.name`, `db.query.summary`, `db.stored_procedure.name`) when present, plus error-path attributes (`error.type`, plus `db.response.status_code` for `sqlx::Error::Database`) on the error path. `db.query.text` is deliberately excluded for cardinality; `db.query.summary` may be generated or caller-supplied, and dynamically named targets or explicit summaries contribute to metric cardinality.
 
 `db.client.response.affected_rows` is not part of the OpenTelemetry semantic conventions – we ship it for the same reason as the matching span attribute: backends report a useful database-confirmed count that's worth slicing alongside duration. It is recorded only on `execute()` calls (where `QueryResult::rows_affected()` is meaningful) and is not recorded for `execute_many` (deprecated upstream).
 
@@ -235,7 +245,41 @@ These mirror the bounded portion of the span attribute set: connection-level att
 | `db.client.connection.idle.max`           | Gauge           |      | Maximum idle connections (equals `max` in SQLx)       |
 | `db.client.connection.idle.min`           | Gauge           |      | Configured minimum connections                        |
 
-The first four are recorded inline on every `acquire()` / connection drop – no sampling gaps. `db.client.connection.count` is polled by a background task and requires both a runtime feature (`runtime-tokio` or `runtime-async-std`) and a pool name set via `PoolBuilder::with_pool_name`. The remaining three are static gauges recorded once at pool construction.
+Explicit `acquire()`, implicit pool queries (including annotated and streaming queries), and `begin()` share one instrumented acquisition; queries issued inside a transaction do not acquire again. Wait time covers completed acquisition attempts – semaphore wait, connection creation, and validation – but excludes `BEGIN` and query execution. Dropping a waiting future decrements pending requests without recording a completed wait or a timeout, since the pool never failed to deliver: the caller left. Only `sqlx::Error::PoolTimedOut` increments the timeout counter, so `PoolClosed` on shutdown does not inflate your timeout rate. Pending-request and timeout series are initialised at zero so dashboards start from a known baseline rather than waiting for the first event. Connection use time follows the lease through transaction commit, rollback, or drop.
+
+`db.client.connection.count` is polled by a background task and requires both a runtime feature (`runtime-tokio` or `runtime-async-std`) and a pool name set via `PoolBuilder::with_pool_name`. Polling and export intervals can miss brief utilisation or pending-request peaks. The remaining three are static gauges recorded once at construction.
+
+### Histogram buckets
+
+The three latency histograms – `db.client.operation.duration`, `db.client.connection.wait_time`, and `db.client.connection.use_time` – are recorded in seconds, as the semantic conventions require. The OpenTelemetry SDK's default bucket boundaries (`0, 5, 10, 25, … 10000`) are shaped for milliseconds, so on a seconds-valued histogram every observation below five seconds falls into a single bucket and any quantile derived from it is an interpolation artefact rather than a measurement. The crate therefore ships explicit boundaries spanning the range a database client actually occupies, from sub-millisecond local round trips up to the 30-second acquire timeout SQLx applies by default:
+
+```text
+0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1,
+0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0
+```
+
+These are instrument *advice*, not a fixed configuration. The SDK applies advice only when no matching view has already set an aggregation, so an application that registers a `View` with its own explicit bucket boundaries overrides what the crate ships – no API is needed from this crate to retune them. (A view whose aggregation the SDK rejects as incompatible with the instrument is discarded, and the crate's advice applies after all, so match histogram names only.)
+
+```rust,ignore
+use opentelemetry_sdk::metrics::{Aggregation, Instrument, SdkMeterProvider, Stream};
+
+let provider = SdkMeterProvider::builder()
+    .with_reader(reader)
+    .with_view(|i: &Instrument| {
+        (i.name() == "db.client.operation.duration").then(|| {
+            Stream::builder()
+                .with_aggregation(Aggregation::ExplicitBucketHistogram {
+                    boundaries: vec![0.005, 0.05, 0.5, 5.0],
+                    record_min_max: true,
+                })
+                .build()
+                .unwrap()
+        })
+    })
+    .build();
+```
+
+The two row-count histograms (`db.client.response.returned_rows` and `db.client.response.affected_rows`) are left on the SDK defaults, which are already reasonable for counts.
 
 ## Backend support
 

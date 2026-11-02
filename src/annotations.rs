@@ -46,7 +46,8 @@ macro_rules! impl_with_annotations_mut {
 }
 
 /// Per-query annotation values that enrich OpenTelemetry spans with semantic-convention
-/// attributes the library cannot derive automatically (because it does not parse SQL).
+/// attributes supplied by the caller. Explicit annotations suppress automatic query
+/// summaries, including when no custom summary is supplied.
 ///
 /// Use the builder methods to set whichever attributes apply to a given query, then pass
 /// the result through one of the equivalent annotation surfaces:

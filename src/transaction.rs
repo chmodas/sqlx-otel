@@ -33,6 +33,7 @@ use crate::pool::SharedState;
 pub struct Transaction<'c, DB: sqlx::Database> {
     pub(crate) inner: sqlx::Transaction<'c, DB>,
     pub(crate) state: SharedState,
+    pub(crate) usage: crate::connection::ConnectionUsage,
 }
 
 impl<DB> Transaction<'_, DB>
@@ -45,7 +46,9 @@ where
     ///
     /// Returns `sqlx::Error` if the commit fails.
     pub async fn commit(self) -> Result<(), sqlx::Error> {
-        self.inner.commit().await
+        let result = self.inner.commit().await;
+        drop(self.usage);
+        result
     }
 
     /// Roll back the transaction.
@@ -54,7 +57,9 @@ where
     ///
     /// Returns `sqlx::Error` if the rollback fails.
     pub async fn rollback(self) -> Result<(), sqlx::Error> {
-        self.inner.rollback().await
+        let result = self.inner.rollback().await;
+        drop(self.usage);
+        result
     }
 
     impl_with_annotations_mut!();

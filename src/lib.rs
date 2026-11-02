@@ -76,7 +76,7 @@
 //! | `db.query.text`             | The SQL query string with inter-token whitespace collapsed | Unless [`QueryTextMode::Off`] |
 //! | `db.operation.name`         | Database operation (e.g. `SELECT`)                       | When [annotated]            |
 //! | `db.collection.name`        | Target table or collection                               | When [annotated]            |
-//! | `db.query.summary`          | Low-cardinality operation/target summary                 | When generated or [annotated] |
+//! | `db.query.summary`          | Generated or caller-supplied query summary               | When generated or [annotated] |
 //! | `db.stored_procedure.name`  | Stored procedure name                                    | When [annotated]            |
 //! | `db.response.returned_rows` | Row count                                                | On `fetch*` methods         |
 //! | `db.response.affected_rows` | Rows affected (`QueryResult::rows_affected()`)           | On `execute` ([note](#a-note-on-dbresponseaffected_rows)) |
@@ -111,11 +111,35 @@
 //! | `db.client.connection.idle.max`         | Gauge           |      | Maximum idle connections (equals `max` in `SQLx`)    |
 //! | `db.client.connection.idle.min`         | Gauge           |      | Configured minimum connections                       |
 //!
-//! The first four are recorded inline on every `acquire()` and connection drop – no sampling
-//! gaps. `connection.count` is polled by a background task and requires both
+//! Explicit acquisition, implicit pool queries (including annotated and streaming queries), and
+//! `begin()` share one instrumented acquisition; queries inside a transaction do not acquire
+//! again. Wait time covers completed acquisition attempts and excludes `BEGIN` and query
+//! execution. Caller cancellation clears pending without recording a completed wait or a pool
+//! timeout, since the pool never failed to deliver – the caller left. Only
+//! `sqlx::Error::PoolTimedOut` increments the timeout counter, so `PoolClosed` on shutdown does
+//! not inflate the timeout rate. Connection use time follows the lease through transaction
+//! completion. Pending and timeout series start at zero. Polling/export can miss brief gauge
+//! peaks. `connection.count` is polled by a background task and requires both
 //! [`PoolBuilder::with_pool_name`] and a runtime feature (`runtime-tokio` or
 //! `runtime-async-std`); without either, the gauge is silent. The remaining three are static
 //! gauges recorded once at [`PoolBuilder::build`].
+//!
+//! ## Histogram buckets
+//!
+//! `db.client.operation.duration`, `db.client.connection.wait_time`, and
+//! `db.client.connection.use_time` are recorded in seconds, as semconv requires. The `OTel` SDK's
+//! default bucket boundaries (`0, 5, 10, 25, ... 10000`) are shaped for milliseconds, so on a
+//! seconds-valued histogram every observation below five seconds collapses into one bucket and
+//! quantiles derived from it are interpolation artefacts rather than measurements. All three
+//! therefore ship explicit boundaries spanning sub-millisecond round trips up to the 30-second
+//! acquire timeout `SQLx` applies by default. The two row-count histograms are left on the SDK
+//! defaults, which suit counts already.
+//!
+//! These boundaries are instrument *advice*. The SDK applies advice only where no matching view
+//! has already set an aggregation, so an application that registers a `View` with a compatible
+//! explicit aggregation overrides them – this crate deliberately exposes no API of its own for
+//! retuning them. A view whose aggregation the SDK rejects as incompatible falls back to the
+//! implicit default view, which applies this advice after all. See the README for an example.
 //!
 //! ## A note on `db.response.affected_rows`
 //!
@@ -129,12 +153,18 @@
 //!
 //! # Per-query annotations
 //!
-//! `sqlx-otel` can generate a conservative `db.query.summary` with
-//! [`QuerySummaryMode::Auto`]. It extracts only the operation and primary target (for
-//! example `SELECT users`) and resolves common table expressions when possible. The other
-//! per-query semantic-convention attributes – `db.operation.name`,
+//! Automatic summaries are off by default. Enable [`QuerySummaryMode::Auto`] to generate
+//! a best-effort `db.query.summary` containing the operation and primary target (for
+//! example `SELECT users`), resolving common table expressions when possible. This works
+//! regardless of [`QueryTextMode`], including [`QueryTextMode::Off`], and supplies both the
+//! span name and an operation metric attribute. Summaries are capped at 255 bytes;
+//! dynamically named objects still contribute to cardinality. This extractor is not a
+//! general SQL redaction boundary; unsupported forms may be inaccurate. Leave automatic
+//! summaries off for sensitive SQL. The other per-query
+//! semantic-convention attributes – `db.operation.name`,
 //! `db.collection.name`, and `db.stored_procedure.name` – remain caller-supplied through
-//! the annotation API. Explicit annotations take precedence over automatic summaries.
+//! the annotation API. Any explicit annotations disable automatic summaries for that
+//! query, even when they do not supply a summary.
 //! There are two equivalent annotation surfaces depending on whether you prefer the
 //! annotation to live next to the executor or next to the query:
 //!
@@ -237,6 +267,7 @@ mod executor;
 mod metrics;
 mod obfuscate;
 mod pool;
+mod pool_executor;
 mod pool_metrics;
 mod query_ext;
 mod rebuilt_query;

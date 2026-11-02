@@ -3,8 +3,9 @@
 //! The OpenTelemetry database semantic conventions recommend using
 //! `db.query.summary` as the span name when query-level instrumentation can derive one.
 //! This module intentionally extracts only the outer operation and its primary target.
-//! Predicates, selected columns, literal values, and bind parameters never participate in
-//! the summary.
+//! Recognized literals are scrubbed before extraction; supported forms omit predicates,
+//! selected columns, and bind parameters. This is not a complete SQL parser or a general
+//! redaction boundary for arbitrary dialect extensions.
 
 const MAX_SUMMARY_BYTES: usize = 255;
 const MAX_CTE_RESOLUTION_DEPTH: usize = 16;
@@ -33,12 +34,11 @@ struct Target {
 }
 
 /// Return a short summary such as `SELECT users` or `INSERT orders`.
-pub(crate) fn summarize(sql: &str) -> Option<String> {
-    // Run the same literal scrubber used by QueryTextMode::Obfuscated before parsing.
-    // Query summaries therefore cannot accidentally incorporate a literal even if the
-    // lightweight tokenizer below encounters malformed SQL.
+pub(crate) fn summarize(sql: &str, system: &str) -> Option<String> {
+    // Reuse QueryTextMode::Obfuscated's literal handling before extraction. Both passes
+    // are best effort; callers with sensitive SQL should leave automatic summaries off.
     let sanitized = crate::obfuscate::obfuscate(sql);
-    let tokens = tokenize(&sanitized);
+    let tokens = tokenize(&sanitized, system == "mysql");
     let (operation, target) = summarize_tokens(&tokens, &[], &mut Vec::new(), 0)?;
     let Some(target) = target else {
         return Some(operation);
@@ -107,7 +107,13 @@ fn resolve_cte_target(
     scopes.push(local_ctes);
     scopes.extend_from_slice(inherited_cte_scopes);
     let resolved = summarize_tokens(&cte.body, &scopes, visited_ctes, resolution_depth + 1)
-        .and_then(|(_, nested_target)| nested_target)
+        .and_then(|(operation, nested_target)| {
+            if operation.eq_ignore_ascii_case("SELECT") {
+                nested_target
+            } else {
+                None
+            }
+        })
         .unwrap_or(target);
     visited_ctes.pop();
     resolved
@@ -180,19 +186,10 @@ fn matching_right_paren(tokens: &[Token], open: usize) -> Option<usize> {
 }
 
 fn find_operation(tokens: &[Token], start: usize) -> Option<(String, usize)> {
-    let mut depth = 0_u32;
-    for (index, token) in tokens.iter().enumerate().skip(start) {
-        match token {
-            Token::LeftParen => depth = depth.saturating_add(1),
-            Token::RightParen => depth = depth.saturating_sub(1),
-            Token::Semicolon if depth == 0 => return None,
-            Token::Word(word) if depth == 0 && is_operation(word) => {
-                return Some((word.clone(), index));
-            }
-            _ => {}
-        }
-    }
-    None
+    let Token::Word(word) = tokens.get(start)? else {
+        return None;
+    };
+    is_operation(word).then(|| (word.clone(), start))
 }
 
 fn find_target(tokens: &[Token], operation_index: usize, operation: &str) -> Option<Target> {
@@ -377,7 +374,7 @@ fn is_clause_keyword(word: &str) -> bool {
     .any(|keyword| word.eq_ignore_ascii_case(keyword))
 }
 
-fn tokenize(sql: &str) -> Vec<Token> {
+fn tokenize(sql: &str, mysql_comments: bool) -> Vec<Token> {
     let bytes = sql.as_bytes();
     let mut tokens = Vec::new();
     let mut index = 0;
@@ -391,8 +388,19 @@ fn tokenize(sql: &str) -> Vec<Token> {
                     index += 1;
                 }
             }
+            b'#' if mysql_comments => {
+                // PostgreSQL also permits '#' in operators; this is MySQL-only.
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
             b'/' if bytes.get(index + 1) == Some(&b'*') => {
                 index = skip_block_comment(bytes, index);
+            }
+            b'\'' => {
+                // A dialect-specific comment may have desynchronized the shared scrubber.
+                // Skip any literal that survives rather than treating its contents as SQL.
+                index = scan_doubled_quote(bytes, index, b'\'');
             }
             b'"' | b'`' => {
                 let quote = bytes[index];
@@ -462,6 +470,10 @@ fn skip_block_comment(bytes: &[u8], mut index: usize) -> usize {
 fn scan_doubled_quote(bytes: &[u8], start: usize, quote: u8) -> usize {
     let mut index = start + 1;
     while index < bytes.len() {
+        if quote == b'\'' && bytes[index] == b'\\' {
+            index += if index + 1 < bytes.len() { 2 } else { 1 };
+            continue;
+        }
         if bytes[index] == quote {
             if bytes.get(index + 1) == Some(&quote) {
                 index += 2;
@@ -499,7 +511,11 @@ fn is_word_continue(byte: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::summarize;
+    use proptest::prelude::*;
+
+    fn summarize(sql: &str) -> Option<String> {
+        super::summarize(sql, "postgresql")
+    }
 
     #[test]
     fn summarizes_simple_statements() {
@@ -575,6 +591,80 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_outer_operations_do_not_expose_nested_operations() {
+        for sql in [
+            "REVOKE SELECT ON accounts FROM app_role",
+            "GRANT SELECT ON accounts TO app_role",
+            "SHOW CREATE TABLE accounts",
+            "REPLACE INTO reports SELECT * FROM source",
+            "DECLARE cursor_name CURSOR FOR SELECT * FROM accounts",
+            "PREPARE query_name AS SELECT * FROM accounts",
+        ] {
+            assert_eq!(summarize(sql), None, "sql: {sql}");
+        }
+    }
+
+    #[test]
+    fn read_cte_does_not_resolve_to_a_nested_write_target() {
+        let sql = "WITH deleted AS (DELETE FROM jobs RETURNING *) SELECT * FROM deleted";
+        assert_eq!(summarize(sql).as_deref(), Some("SELECT deleted"));
+    }
+
+    #[test]
+    fn mysql_hash_comments_cannot_supply_targets() {
+        for (sql, expected) in [
+            ("SELECT NOW() # FROM tenant_acme", "SELECT"),
+            (
+                "SELECT NOW() # FROM tenant_acme\n FROM users",
+                "SELECT users",
+            ),
+            (
+                "# SELECT * FROM tenant_acme\n SELECT * FROM users",
+                "SELECT users",
+            ),
+            ("SELECT * FROM `tenant#users`", "SELECT `tenant#users`"),
+            ("SELECT '# FROM tenant_acme' FROM users", "SELECT users"),
+        ] {
+            assert_eq!(super::summarize(sql, "mysql").as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn mysql_hash_comment_quotes_cannot_expose_following_literals() {
+        for sql in [
+            "SELECT id, # 3\" pipe\n  'moved from tenant_acme' AS note FROM jobs",
+            "SELECT id, # 3` pipe\n  'moved from tenant_acme' AS note FROM jobs",
+            "SELECT id, # 3\" pipe\n  'it''s moved from tenant_acme' AS note FROM jobs",
+            r"SELECT id, # 3` pipe
+  'it\'s moved from tenant_acme' AS note FROM jobs",
+        ] {
+            assert_eq!(
+                super::summarize(sql, "mysql").as_deref(),
+                Some("SELECT jobs")
+            );
+        }
+    }
+
+    #[test]
+    fn postgres_hash_operator_does_not_hide_the_target() {
+        assert_eq!(
+            summarize("SELECT flags # 1 FROM users").as_deref(),
+            Some("SELECT users")
+        );
+    }
+
+    #[test]
+    fn backslash_escaped_literals_cannot_supply_targets() {
+        let sql = r"SELECT 'it\'s' AS a, 'x FROM hidden' AS b FROM users";
+        assert_eq!(
+            super::summarize(sql, "mysql").as_deref(),
+            Some("SELECT users")
+        );
+        let sql = r"SELECT E'it\'s FROM hidden' FROM users";
+        assert_eq!(summarize(sql).as_deref(), Some("SELECT users"));
+    }
+
+    #[test]
     fn preserves_qualified_and_quoted_targets() {
         assert_eq!(
             summarize(r#"SELECT * FROM "reporting"."daily orders" WHERE id = 42"#).as_deref(),
@@ -631,5 +721,15 @@ mod tests {
     fn recursive_cte_does_not_recurse_forever() {
         let sql = "WITH RECURSIVE loop AS (SELECT * FROM loop) SELECT * FROM loop";
         assert_eq!(summarize(sql).as_deref(), Some("SELECT loop"));
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_unicode_never_panics_or_exceeds_summary_cap(sql in any::<String>()) {
+            for system in ["postgresql", "mysql", "sqlite"] {
+                let summary = super::summarize(&sql, system);
+                prop_assert!(summary.as_ref().is_none_or(|value| value.len() <= super::MAX_SUMMARY_BYTES));
+            }
+        }
     }
 }

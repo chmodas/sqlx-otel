@@ -156,7 +156,9 @@ impl<DB: Database> PoolBuilder<DB> {
     /// [`QuerySummaryMode::Off`].
     ///
     /// [`QuerySummaryMode::Auto`] extracts only the outer SQL operation and primary
-    /// target. Explicit per-query [`QueryAnnotations`] take precedence.
+    /// target, independently of [`QueryTextMode`]. Any explicit per-query
+    /// [`QueryAnnotations`] disable inference, even without a custom summary. See
+    /// [`QuerySummaryMode`] for limits and cardinality considerations.
     #[must_use]
     pub fn with_query_summary_mode(mut self, mode: QuerySummaryMode) -> Self {
         self.query_summary_mode = mode;
@@ -239,7 +241,7 @@ impl<DB: Database> PoolBuilder<DB> {
             .build()
             .record(min_conns, &base_attrs);
 
-        Pool {
+        let pool = Pool {
             inner: self.pool,
             state: SharedState { attrs, metrics },
             metrics_shutdown,
@@ -250,6 +252,7 @@ impl<DB: Database> PoolBuilder<DB> {
                     .with_description(
                         "The time it took to obtain an open connection from the pool.",
                     )
+                    .with_boundaries(crate::metrics::LATENCY_BUCKETS_SECONDS.to_vec())
                     .build(),
             ),
             use_time: Arc::new(
@@ -259,6 +262,7 @@ impl<DB: Database> PoolBuilder<DB> {
                     .with_description(
                         "The time between borrowing a connection and returning it to the pool.",
                     )
+                    .with_boundaries(crate::metrics::LATENCY_BUCKETS_SECONDS.to_vec())
                     .build(),
             ),
             timeouts: Arc::new(
@@ -275,7 +279,10 @@ impl<DB: Database> PoolBuilder<DB> {
                     .with_description("The number of pending requests for an open connection.")
                     .build(),
             ),
-        }
+        };
+        pool.pending_requests.add(0, &base_attrs);
+        pool.timeouts.add(0, &base_attrs);
+        pool
     }
 
     /// Spawn the pool metrics background task if a pool name is set and a runtime is
@@ -397,9 +404,13 @@ impl<DB: Database> Pool<DB> {
     pub async fn acquire(&self) -> Result<PoolConnection<DB>, sqlx::Error> {
         let attrs = self.state.attrs.base_key_values();
         self.pending_requests.add(1, &attrs);
+        let pending = PendingAcquisition {
+            counter: &self.pending_requests,
+            attrs: &attrs,
+        };
         let start = std::time::Instant::now();
         let result = self.inner.acquire().await;
-        self.pending_requests.add(-1, &attrs);
+        drop(pending);
         self.wait_time.record(start.elapsed().as_secs_f64(), &attrs);
 
         if let Err(sqlx::Error::PoolTimedOut) = &result {
@@ -409,9 +420,11 @@ impl<DB: Database> Pool<DB> {
         result.map(|inner| PoolConnection {
             inner,
             state: self.state.clone(),
-            use_time: self.use_time.clone(),
-            acquired_at: std::time::Instant::now(),
-            base_attrs: attrs,
+            usage: crate::connection::ConnectionUsage {
+                use_time: self.use_time.clone(),
+                acquired_at: std::time::Instant::now(),
+                base_attrs: attrs,
+            },
         })
     }
 
@@ -427,10 +440,17 @@ impl<DB: Database> Pool<DB> {
     ///
     /// Returns `sqlx::Error` if `BEGIN` fails – typically due to a connection problem or
     /// because the underlying connection cannot start a new transaction.
-    pub async fn begin(&self) -> Result<Transaction<'_, DB>, sqlx::Error> {
-        self.inner.begin().await.map(|inner| Transaction {
+    pub async fn begin(&self) -> Result<Transaction<'static, DB>, sqlx::Error> {
+        let PoolConnection {
             inner,
-            state: self.state.clone(),
+            state,
+            usage,
+        } = self.acquire().await?;
+        let inner = sqlx::Transaction::begin(inner, None).await?;
+        Ok(Transaction {
+            inner,
+            state,
+            usage,
         })
     }
 
@@ -497,5 +517,24 @@ impl<DB: Database> Pool<DB> {
                 .operation(operation)
                 .collection(collection),
         )
+    }
+}
+
+/// Decrements `db.client.connection.pending_requests` on every exit path from
+/// [`Pool::acquire`].
+///
+/// A caller timeout or task abort can drop the `acquire()` future while it is still awaiting
+/// `SQLx`, which would otherwise leave the counter permanently incremented. Tying the decrement
+/// to a `Drop` guard covers success, error, and cancellation alike. Cancellation deliberately
+/// stops there: it records no completed wait and is not classified as `PoolTimedOut`, because
+/// the pool never failed to deliver – the caller left.
+struct PendingAcquisition<'a> {
+    counter: &'a opentelemetry::metrics::UpDownCounter<i64>,
+    attrs: &'a [opentelemetry::KeyValue],
+}
+
+impl Drop for PendingAcquisition<'_> {
+    fn drop(&mut self) {
+        self.counter.add(-1, self.attrs);
     }
 }

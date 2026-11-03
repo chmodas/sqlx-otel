@@ -55,7 +55,7 @@ proptest = "1"
 serial_test = "3"
 sqlx = { version = "0.9", features = ["macros", "sqlite", "postgres", "mysql", "mysql-rsa", "runtime-tokio"] }
 testcontainers = "0.28"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "net", "sync", "time"] }
 
 [[example]]
 name = "sqlite"

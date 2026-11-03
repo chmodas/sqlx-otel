@@ -147,8 +147,17 @@ async fn transactions_keep_one_acquisition_and_measure_the_complete_lease() {
             histogram_count(&tel, "db.client.connection.use_time"),
             finish + 1
         );
+        assert_eq!(
+            histogram_count(&tel, "sqlx_otel.transaction.duration"),
+            finish + 1,
+            "transaction time is distinct from the lease, and recorded once"
+        );
     }
     assert_eq!(pending_count(&tel), 0);
+    assert_eq!(
+        histogram_count(&tel, "sqlx_otel.transaction.begin.duration"),
+        3
+    );
 }
 
 async fn waiting_operation(
@@ -205,6 +214,16 @@ async fn all_acquisition_paths_clear_pending_on_cancel_and_report_real_timeouts(
             u64::from(path),
             "caller cancellation is not a pool timeout"
         );
+        assert_eq!(
+            histogram_count(&tel, "sqlx_otel.connection.abandoned_wait.duration"),
+            u64::from(path) + 1,
+            "each abandoned wait is measured exactly once"
+        );
+        assert_eq!(
+            histogram_count(&tel, "db.client.connection.wait_time"),
+            u64::from(path) + 1,
+            "an abandoned wait is not a completed wait"
+        );
         assert!(matches!(
             waiting_operation(&pool, path).await,
             Err(sqlx::Error::PoolTimedOut)
@@ -214,6 +233,11 @@ async fn all_acquisition_paths_clear_pending_on_cancel_and_report_real_timeouts(
         assert_eq!(
             histogram_count(&tel, "db.client.connection.wait_time"),
             u64::from(path) + 2
+        );
+        assert_eq!(
+            histogram_count(&tel, "sqlx_otel.connection.abandoned_wait.duration"),
+            u64::from(path) + 1,
+            "a timed-out wait got an answer, so it was not abandoned"
         );
     }
     drop(held);

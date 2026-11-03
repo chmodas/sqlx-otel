@@ -98,6 +98,11 @@
 //! These carry the connection-level attributes (`db.system.name`, `db.namespace`, `server.address`,
 //! `server.port`).
 //!
+//! `db.client.operation.duration` and the query span both start when the executor method is called
+//! and end when the client observes the result. On `&Pool` that interval includes acquiring the
+//! connection, plus client and network time. It is not server SQL execution time and does not
+//! prove a lock wait; compare it with `db.client.connection.wait_time` before reading it that way.
+//!
 //! ## Connection-pool metrics
 //!
 //! | Instrument                              | Type            | Unit | Description                                          |
@@ -110,19 +115,46 @@
 //! | `db.client.connection.max`              | Gauge           |      | Maximum number of connections allowed                |
 //! | `db.client.connection.idle.max`         | Gauge           |      | Maximum idle connections (equals `max` in `SQLx`)    |
 //! | `db.client.connection.idle.min`         | Gauge           |      | Configured minimum connections                       |
+//! | `sqlx_otel.connection.abandoned_wait.duration` | Histogram | `s` | Time waited by a caller that dropped its `acquire()` |
 //!
 //! Explicit acquisition, implicit pool queries (including annotated and streaming queries), and
 //! `begin()` share one instrumented acquisition; queries inside a transaction do not acquire
 //! again. Wait time covers completed acquisition attempts and excludes `BEGIN` and query
 //! execution. Caller cancellation clears pending without recording a completed wait or a pool
-//! timeout, since the pool never failed to deliver – the caller left. Only
-//! `sqlx::Error::PoolTimedOut` increments the timeout counter, so `PoolClosed` on shutdown does
+//! timeout, since the pool never failed to deliver – the caller left; instead it records the time
+//! already waited once on `sqlx_otel.connection.abandoned_wait.duration`, which has no semantic
+//! convention equivalent. A future dropped before its first poll never waited and records nothing.
+//! Only `sqlx::Error::PoolTimedOut` increments the timeout counter, so `PoolClosed` on shutdown does
 //! not inflate the timeout rate. Connection use time follows the lease through transaction
-//! completion. Pending and timeout series start at zero. Polling/export can miss brief gauge
-//! peaks. `connection.count` is polled by a background task and requires both
+//! completion and ends when the lease owner is dropped; `SQLx` returns the connection to the pool
+//! in the background after that, so a sample does not prove that cleanup finished. Pending and
+//! timeout series start at zero. Polling/export can miss brief gauge peaks. `connection.count` is
+//! polled by a background task and requires both
 //! [`PoolBuilder::with_pool_name`] and a runtime feature (`runtime-tokio` or
 //! `runtime-async-std`); without either, the gauge is silent. The remaining three are static
 //! gauges recorded once at [`PoolBuilder::build`].
+//!
+//! ## Workload attribution
+//!
+//! [`PoolAttribution::scope`] splits the connection-lease instruments by one bounded `&'static str`
+//! attribute for connections acquired inside the scope, captured once at acquisition. It splits
+//! series without adding samples; `pending_requests`, the pool gauges and the operation metrics
+//! stay untouched. Scopes follow polling, so spawned tasks need
+//! [`PoolAttribution::inherit`]. See [`PoolAttribution`] for the exact coverage.
+//!
+//! ## Transaction metrics
+//!
+//! | Instrument                             | Type      | Unit | Bounded attribute                     |
+//! |----------------------------------------|-----------|------|---------------------------------------|
+//! | `sqlx_otel.transaction.begin.duration` | Histogram | `s`  | `sqlx_otel.transaction.begin.outcome` |
+//! | `sqlx_otel.transaction.duration`       | Histogram | `s`  | `sqlx_otel.transaction.outcome`       |
+//!
+//! Semantic conventions define no transaction metrics, so both live in this crate's namespace and
+//! carry the lease attributes. The first covers `BEGIN` once a connection is held (`ok`, `error`,
+//! `abandoned`); only `ok` starts the second, whose interval ends at the terminal client
+//! observation and so excludes acquisition and `BEGIN`. See [`Transaction`] for its outcomes, none
+//! of which claims a server result: a dropped transaction only queued a rollback, and an abandoned
+//! `COMMIT` has an unknown outcome.
 //!
 //! ## Histogram buckets
 //!
@@ -140,6 +172,10 @@
 //! explicit aggregation overrides them – this crate deliberately exposes no API of its own for
 //! retuning them. A view whose aggregation the SDK rejects as incompatible falls back to the
 //! implicit default view, which applies this advice after all. See the README for an example.
+//!
+//! `sqlx_otel.connection.abandoned_wait.duration` and `sqlx_otel.transaction.begin.duration` use
+//! the same boundaries. `sqlx_otel.transaction.duration` extends them to one hour, because no
+//! client timeout caps a transaction.
 //!
 //! ## A note on `db.response.affected_rows`
 //!
@@ -251,6 +287,7 @@
 #[macro_use]
 mod annotations;
 pub(crate) mod attributes;
+mod attribution;
 mod compact;
 mod connection;
 mod database;
@@ -264,9 +301,11 @@ mod query_ext;
 mod rebuilt_query;
 mod runtime;
 mod transaction;
+mod transaction_metrics;
 
 pub use annotations::{Annotated, AnnotatedMut, QueryAnnotations};
 pub use attributes::QueryTextMode;
+pub use attribution::PoolAttribution;
 pub use connection::PoolConnection;
 pub use database::Database;
 pub use pool::{Pool, PoolBuilder};

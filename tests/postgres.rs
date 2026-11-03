@@ -1191,3 +1191,397 @@ async fn query_scalar_macro_fetch_all_with_annotations_via_pool() {
 async fn executor_side_query_side_parity_via_pool() {
     test_executor_side_query_side_parity_via_pool!(test_pool().await, common::POSTGRES_DIALECT);
 }
+
+// ===========================================================================
+// Connection lifecycle against a real server
+// ===========================================================================
+
+mod connection_lifecycle {
+    use std::collections::BTreeMap;
+
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+    use sqlx::Executor as _;
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+    use sqlx_otel::PoolAttribution;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::watch;
+    use tokio::task::JoinHandle;
+    use tokio::time::{sleep, timeout};
+
+    use super::{Duration, PoolBuilder, common, serial, shared_container};
+
+    const KEY: &str = "test.workload.kind";
+    const REFRESH: PoolAttribution = PoolAttribution::new(KEY, "refresh");
+    const EVALUATE: PoolAttribution = PoolAttribution::new(KEY, "evaluate");
+    const OUTCOME: &str = "sqlx_otel.transaction.outcome";
+    const BEGIN_OUTCOME: &str = "sqlx_otel.transaction.begin.outcome";
+    const WAIT: &str = "db.client.connection.wait_time";
+    const USE: &str = "db.client.connection.use_time";
+    const ABANDONED: &str = "sqlx_otel.connection.abandoned_wait.duration";
+    const BEGIN: &str = "sqlx_otel.transaction.begin.duration";
+    const TRANSACTION: &str = "sqlx_otel.transaction.duration";
+    /// Long enough for a statement to reach the server through the gate, with its answer withheld.
+    const HELD_STATEMENT: Duration = Duration::from_millis(200);
+
+    fn counts<const N: usize>(entries: [(&str, u64); N]) -> BTreeMap<String, u64> {
+        entries
+            .into_iter()
+            .map(|(value, count)| (value.to_owned(), count))
+            .collect()
+    }
+
+    /// Sample count of a histogram per value of `key`, with `<none>` for series without it.
+    fn series(tel: &common::TestTelemetry, name: &str, key: &str) -> BTreeMap<String, u64> {
+        tel.reset();
+        let metrics = tel.metrics();
+        let mut series = BTreeMap::new();
+        let Some(metric) = metrics
+            .iter()
+            .flat_map(opentelemetry_sdk::metrics::data::ResourceMetrics::scope_metrics)
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+            .find(|metric| metric.name() == name)
+        else {
+            return series;
+        };
+        let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = metric.data() else {
+            panic!("{name} must be an f64 histogram");
+        };
+        for point in histogram.data_points() {
+            let value = point
+                .attributes()
+                .find(|attribute| attribute.key.as_str() == key)
+                .map_or_else(
+                    || "<none>".to_owned(),
+                    |attribute| attribute.value.to_string(),
+                );
+            *series.entry(value).or_insert(0) += point.count();
+        }
+        series
+    }
+
+    /// Forwards `PostgreSQL` traffic and can withhold the server's answers. A statement then sits
+    /// at a known point, sent to the server with its result unseen by the client, independent of
+    /// timing.
+    struct ResponseGate {
+        port: u16,
+        held: watch::Sender<bool>,
+        accept: JoinHandle<()>,
+    }
+
+    impl ResponseGate {
+        async fn start(options: &PgConnectOptions) -> Self {
+            let upstream = (options.get_host().to_owned(), options.get_port());
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (held, gate) = watch::channel(false);
+            let accept = tokio::spawn(async move {
+                while let Ok((client, _)) = listener.accept().await {
+                    tokio::spawn(forward(client, upstream.clone(), gate.clone()));
+                }
+            });
+            Self { port, held, accept }
+        }
+
+        fn hold(&self) {
+            self.held.send_replace(true);
+        }
+
+        fn release(&self) {
+            self.held.send_replace(false);
+        }
+    }
+
+    impl Drop for ResponseGate {
+        fn drop(&mut self) {
+            self.accept.abort();
+        }
+    }
+
+    async fn forward(client: TcpStream, upstream: (String, u16), mut held: watch::Receiver<bool>) {
+        let Ok(server) = TcpStream::connect(upstream).await else {
+            return;
+        };
+        let (mut client_read, mut client_write) = client.into_split();
+        let (mut server_read, mut server_write) = server.into_split();
+        let requests = tokio::io::copy(&mut client_read, &mut server_write);
+        let responses = async {
+            let mut chunk = [0_u8; 8192];
+            loop {
+                let length = server_read.read(&mut chunk).await?;
+                if length == 0 || held.wait_for(|held| !*held).await.is_err() {
+                    return Ok::<_, std::io::Error>(());
+                }
+                client_write.write_all(&chunk[..length]).await?;
+            }
+        };
+        tokio::select! {
+            _ = requests => {}
+            _ = responses => {}
+        }
+    }
+
+    async fn wait_until_idle(pool: &sqlx::PgPool) {
+        timeout(Duration::from_secs(5), async {
+            while pool.num_idle() != 1 {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the connection must return to the pool");
+    }
+
+    async fn terminate_backend(admin: &sqlx::PgPool, backend: i32) {
+        let terminated: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
+            .bind(backend)
+            .fetch_one(admin)
+            .await
+            .unwrap();
+        assert!(terminated);
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let alive: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)",
+                )
+                .bind(backend)
+                .fetch_one(admin)
+                .await
+                .unwrap();
+                if !alive {
+                    return;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the backend must exit");
+    }
+
+    /// Two workloads share one connection on one task: the second waits while the first holds a
+    /// transaction, across awaits, and the first ends inside the second's scope.
+    #[tokio::test]
+    #[serial]
+    async fn attribution_stays_with_each_lease() {
+        let tel = common::TestTelemetry::install();
+        let raw = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(5))
+            .connect(&shared_container().await.url)
+            .await
+            .unwrap();
+        let pool = PoolBuilder::from(raw).build();
+
+        let mut transaction = REFRESH.scope(pool.begin()).await.unwrap();
+        let mut waiting = Box::pin(EVALUATE.scope(pool.fetch_one("SELECT 1")));
+        assert!(futures::poll!(&mut waiting).is_pending());
+        let mut abandoned = Box::pin(EVALUATE.scope(pool.acquire()));
+        assert!(futures::poll!(&mut abandoned).is_pending());
+        REFRESH.scope(async { drop(abandoned) }).await;
+        assert_eq!(series(&tel, ABANDONED, KEY), counts([("evaluate", 1)]));
+
+        sqlx::query("SELECT 2")
+            .execute(&mut transaction)
+            .await
+            .unwrap();
+        EVALUATE.scope(transaction.commit()).await.unwrap();
+        waiting.await.unwrap();
+
+        let leases = counts([("evaluate", 1), ("refresh", 1)]);
+        assert_eq!(series(&tel, WAIT, KEY), leases);
+        assert_eq!(series(&tel, USE, KEY), leases);
+        assert_eq!(series(&tel, BEGIN, KEY), counts([("refresh", 1)]));
+        assert_eq!(series(&tel, TRANSACTION, KEY), counts([("refresh", 1)]));
+        assert_eq!(
+            series(&tel, TRANSACTION, OUTCOME),
+            counts([("commit_ok", 1)])
+        );
+        pool.close().await;
+    }
+
+    /// Each terminal path against a real server, including the ones where the client cannot know
+    /// the server's result. The row checks show the labels must not be read as server facts.
+    #[tokio::test]
+    #[serial]
+    #[allow(clippy::too_many_lines)]
+    async fn transaction_outcomes_report_only_what_the_client_saw() {
+        let tel = common::TestTelemetry::install();
+        let url = &shared_container().await.url;
+        let options: PgConnectOptions = url.parse().unwrap();
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(options.clone())
+            .await
+            .unwrap();
+        admin
+            .execute(
+                "DROP TABLE IF EXISTS lifecycle_row, lifecycle_child, lifecycle_parent;
+                 CREATE TABLE lifecycle_row (id integer PRIMARY KEY);
+                 CREATE TABLE lifecycle_parent (id integer PRIMARY KEY);
+                 CREATE TABLE lifecycle_child (
+                     parent_id integer REFERENCES lifecycle_parent (id)
+                         DEFERRABLE INITIALLY DEFERRED
+                 );",
+            )
+            .await
+            .unwrap();
+        let row_exists = async |id: i32| -> bool {
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM lifecycle_row WHERE id = $1)")
+                .bind(id)
+                .fetch_one(&admin)
+                .await
+                .unwrap()
+        };
+
+        let gate = ResponseGate::start(&options).await;
+        // No ping on acquire: the next statement on an idle connection is the one under test.
+        let raw = PgPoolOptions::new()
+            .max_connections(1)
+            .test_before_acquire(false)
+            .acquire_timeout(Duration::from_secs(5))
+            .connect_with(options.clone().host("127.0.0.1").port(gate.port))
+            .await
+            .unwrap();
+        let pool = PoolBuilder::from(raw.clone()).build();
+        let insert = |id: i32| sqlx::query("INSERT INTO lifecycle_row VALUES ($1)").bind(id);
+
+        // Acknowledged commit, with several queries on one acquisition.
+        let mut transaction = pool.begin().await.unwrap();
+        insert(1).execute(&mut transaction).await.unwrap();
+        sqlx::query("SELECT 1")
+            .execute(&mut transaction)
+            .await
+            .unwrap();
+        assert_eq!(series(&tel, WAIT, KEY), counts([("<none>", 1)]));
+        transaction.commit().await.unwrap();
+        assert!(row_exists(1).await);
+        assert_eq!(
+            series(&tel, TRANSACTION, OUTCOME),
+            counts([("commit_ok", 1)])
+        );
+
+        // COMMIT of an already failed transaction: PostgreSQL answers with a ROLLBACK tag and no
+        // error, so the client saw success and nothing committed.
+        let mut transaction = pool.begin().await.unwrap();
+        insert(2).execute(&mut transaction).await.unwrap();
+        assert!(
+            sqlx::query("SELECT 1 / 0")
+                .execute(&mut transaction)
+                .await
+                .is_err()
+        );
+        transaction.commit().await.unwrap();
+        assert!(!row_exists(2).await);
+        assert_eq!(
+            series(&tel, TRANSACTION, OUTCOME),
+            counts([("commit_ok", 2)])
+        );
+
+        // A deferred constraint rejects the COMMIT statement itself.
+        let mut transaction = pool.begin().await.unwrap();
+        sqlx::query("INSERT INTO lifecycle_child VALUES (1)")
+            .execute(&mut transaction)
+            .await
+            .unwrap();
+        assert!(transaction.commit().await.is_err());
+        assert_eq!(
+            series(&tel, TRANSACTION, OUTCOME),
+            counts([("commit_error", 1), ("commit_ok", 2)])
+        );
+
+        // Acknowledged rollback.
+        let mut transaction = pool.begin().await.unwrap();
+        insert(3).execute(&mut transaction).await.unwrap();
+        transaction.rollback().await.unwrap();
+        assert!(!row_exists(3).await);
+
+        // Plain drop: recorded at once, while the rollback is only queued for the return.
+        let mut transaction = pool.begin().await.unwrap();
+        insert(4).execute(&mut transaction).await.unwrap();
+        gate.hold();
+        drop(transaction);
+        assert_eq!(
+            series(&tel, TRANSACTION, OUTCOME),
+            counts([
+                ("commit_error", 1),
+                ("commit_ok", 2),
+                ("dropped", 1),
+                ("rollback_ok", 1),
+            ])
+        );
+        gate.release();
+        wait_until_idle(&raw).await;
+        assert!(!row_exists(4).await);
+
+        // COMMIT reaches the server and its answer is withheld until the caller gives up. The
+        // client recorded an abandonment, and the row committed anyway.
+        let mut transaction = pool.begin().await.unwrap();
+        insert(5).execute(&mut transaction).await.unwrap();
+        gate.hold();
+        assert!(timeout(HELD_STATEMENT, transaction.commit()).await.is_err());
+        assert_eq!(series(&tel, TRANSACTION, OUTCOME)["commit_abandoned"], 1);
+        gate.release();
+        wait_until_idle(&raw).await;
+        assert!(row_exists(5).await);
+
+        // The same for ROLLBACK.
+        let mut transaction = pool.begin().await.unwrap();
+        insert(6).execute(&mut transaction).await.unwrap();
+        gate.hold();
+        assert!(
+            timeout(HELD_STATEMENT, transaction.rollback())
+                .await
+                .is_err()
+        );
+        assert_eq!(series(&tel, TRANSACTION, OUTCOME)["rollback_abandoned"], 1);
+        gate.release();
+        wait_until_idle(&raw).await;
+        assert!(!row_exists(6).await);
+
+        // BEGIN abandoned on a held connection: a completed acquisition and no transaction.
+        let transactions_before = series(&tel, TRANSACTION, OUTCOME);
+        gate.hold();
+        assert!(timeout(HELD_STATEMENT, pool.begin()).await.is_err());
+        assert_eq!(series(&tel, BEGIN, BEGIN_OUTCOME)["abandoned"], 1);
+        gate.release();
+        wait_until_idle(&raw).await;
+        assert_eq!(series(&tel, TRANSACTION, OUTCOME), transactions_before);
+
+        // BEGIN failed: the backend is gone, and with no ping the pool hands out its dead connection.
+        let backend: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        wait_until_idle(&raw).await;
+        terminate_backend(&admin, backend).await;
+        assert!(pool.begin().await.is_err());
+        assert_eq!(series(&tel, BEGIN, BEGIN_OUTCOME)["error"], 1);
+        assert_eq!(series(&tel, TRANSACTION, OUTCOME), transactions_before);
+
+        // Exactly once across everything above, on exactly one acquisition each.
+        assert_eq!(
+            series(&tel, BEGIN, BEGIN_OUTCOME),
+            counts([("abandoned", 1), ("error", 1), ("ok", 7)])
+        );
+        assert_eq!(
+            series(&tel, TRANSACTION, OUTCOME),
+            counts([
+                ("commit_abandoned", 1),
+                ("commit_error", 1),
+                ("commit_ok", 2),
+                ("dropped", 1),
+                ("rollback_abandoned", 1),
+                ("rollback_ok", 1),
+            ])
+        );
+        // Seven transactions, the failed and abandoned BEGINs, and the backend-id query.
+        assert_eq!(series(&tel, WAIT, KEY), counts([("<none>", 10)]));
+        assert_eq!(series(&tel, USE, KEY), counts([("<none>", 10)]));
+
+        pool.close().await;
+        admin
+            .execute("DROP TABLE lifecycle_row, lifecycle_child, lifecycle_parent")
+            .await
+            .unwrap();
+        admin.close().await;
+    }
+}

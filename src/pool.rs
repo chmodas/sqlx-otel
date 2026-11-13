@@ -1,11 +1,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::future::BoxFuture;
+
 use opentelemetry_semantic_conventions::metric as semconv_metric;
 
 use crate::annotations::{Annotated, QueryAnnotations};
 use crate::attributes::{ConnectionAttributes, QueryTextMode};
-use crate::connection::PoolConnection;
+use crate::connection::{AcquiredConnection, PoolConnection};
 use crate::database::Database;
 use crate::metrics::Metrics;
 use crate::transaction::Transaction;
@@ -404,7 +406,7 @@ impl<DB: Database> Pool<DB> {
             inner,
             state: self.state.clone(),
             usage: crate::connection::ConnectionUsage {
-                use_time: self.use_time.clone(),
+                use_time: Some(self.use_time.clone()),
                 acquired_at: std::time::Instant::now(),
                 base_attrs: attrs,
             },
@@ -435,6 +437,31 @@ impl<DB: Database> Pool<DB> {
             state,
             usage,
         })
+    }
+
+    /// The wrapped `sqlx::Pool`, for `SQLx` APIs that accept nothing else, such as
+    /// `sqlx::postgres::PgListener::connect_with`.
+    ///
+    /// Work done through the returned pool is **not** instrumented: no spans, no
+    /// `db.client.operation.duration`, no `db.client.connection.wait_time` / `use_time` /
+    /// `pending_requests` / `timeouts`. Its connections are the ones this pool shares, so they
+    /// still count towards `db.client.connection.count`.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # #[cfg(feature = "sqlite")]
+    /// # async fn _doc() -> Result<(), sqlx::Error> {
+    /// # use sqlx_otel::PoolBuilder;
+    /// let pool = PoolBuilder::from(sqlx::SqlitePool::connect(":memory:").await?).build();
+    /// let raw: &sqlx::SqlitePool = pool.inner();
+    /// assert!(!raw.is_closed());
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn inner(&self) -> &sqlx::Pool<DB> {
+        &self.inner
     }
 
     /// Shut down the pool, waiting for all connections to be released.
@@ -500,6 +527,54 @@ impl<DB: Database> Pool<DB> {
                 .operation(operation)
                 .collection(collection),
         )
+    }
+}
+
+/// Lets `SQLx` APIs generic over [`sqlx::Acquire`] – `sqlx::migrate::Migrator::run` among them –
+/// take an instrumented pool.
+///
+/// Both methods acquire through [`Pool::acquire`], so `db.client.connection.wait_time`,
+/// `pending_requests` and `timeouts` are recorded. `acquire` returns an [`AcquiredConnection`],
+/// which records `db.client.connection.use_time` when dropped. `begin` returns a plain
+/// `sqlx::Transaction`, which does not report when it releases its connection, so that lease
+/// records no `use_time`; prefer the inherent [`Pool::begin`] where the concrete type is known.
+/// Queries run through either are not instrumented.
+///
+/// # Example
+///
+/// ```no_run
+/// # #[cfg(feature = "sqlite")]
+/// # async fn _doc() -> Result<(), sqlx::Error> {
+/// # use sqlx_otel::PoolBuilder;
+/// // A function generic over `Acquire`, as `Migrator::run` is.
+/// async fn ping<'a>(
+///     db: impl sqlx::Acquire<'a, Database = sqlx::Sqlite>,
+/// ) -> Result<(), sqlx::Error> {
+///     let mut conn = db.acquire().await?;
+///     sqlx::query("SELECT 1").execute(&mut *conn).await?;
+///     Ok(())
+/// }
+///
+/// let pool = PoolBuilder::from(sqlx::SqlitePool::connect(":memory:").await?).build();
+/// ping(&pool).await?;
+/// # Ok(())
+/// # }
+/// ```
+impl<'a, DB: Database> sqlx::Acquire<'a> for &'a Pool<DB> {
+    type Database = DB;
+
+    type Connection = AcquiredConnection<DB>;
+
+    fn acquire(self) -> BoxFuture<'a, Result<Self::Connection, sqlx::Error>> {
+        Box::pin(async move { Pool::acquire(self).await.map(AcquiredConnection::new) })
+    }
+
+    fn begin(self) -> BoxFuture<'a, Result<sqlx::Transaction<'a, DB>, sqlx::Error>> {
+        Box::pin(async move {
+            let PoolConnection { inner, usage, .. } = Pool::acquire(self).await?;
+            usage.discard();
+            sqlx::Transaction::begin(inner, None).await
+        })
     }
 }
 

@@ -1,3 +1,4 @@
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -40,15 +41,25 @@ pub struct PoolConnection<DB: sqlx::Database> {
 /// Moves with an owned connection into a transaction, preserving the complete lease duration.
 #[derive(Debug)]
 pub(crate) struct ConnectionUsage {
-    pub(crate) use_time: Arc<Histogram<f64>>,
+    /// `None` once [`discard`](Self::discard)ed: the lease end is not observable.
+    pub(crate) use_time: Option<Arc<Histogram<f64>>>,
     pub(crate) acquired_at: Instant,
     pub(crate) base_attrs: Vec<KeyValue>,
 }
 
+impl ConnectionUsage {
+    /// Give up on recording this lease, for a connection handed to a type that does not report
+    /// when it releases the connection.
+    pub(crate) fn discard(mut self) {
+        self.use_time = None;
+    }
+}
+
 impl Drop for ConnectionUsage {
     fn drop(&mut self) {
-        self.use_time
-            .record(self.acquired_at.elapsed().as_secs_f64(), &self.base_attrs);
+        if let Some(use_time) = &self.use_time {
+            use_time.record(self.acquired_at.elapsed().as_secs_f64(), &self.base_attrs);
+        }
     }
 }
 
@@ -60,4 +71,51 @@ impl<DB: sqlx::Database> std::fmt::Debug for PoolConnection<DB> {
 
 impl<DB: Database> PoolConnection<DB> {
     impl_with_annotations_mut!();
+}
+
+/// A pooled connection acquired through the [`sqlx::Acquire`] implementation on `&Pool`.
+///
+/// It exists so that `SQLx` APIs generic over [`sqlx::Acquire`] – such as
+/// `sqlx::migrate::Migrator::run` – accept an instrumented [`Pool`](crate::Pool). It dereferences
+/// to the backend connection, the type those APIs expect.
+///
+/// The acquisition is instrumented exactly like [`Pool::acquire`](crate::Pool::acquire)
+/// (`db.client.connection.wait_time`, `pending_requests`, `timeouts`), and
+/// `db.client.connection.use_time` is recorded when the value is dropped. Queries run on the
+/// dereferenced connection are **not** instrumented: no spans, no
+/// `db.client.operation.duration`. Use [`Pool::acquire`](crate::Pool::acquire) to run
+/// instrumented queries on a dedicated connection.
+pub struct AcquiredConnection<DB: sqlx::Database> {
+    inner: sqlx::pool::PoolConnection<DB>,
+    _usage: ConnectionUsage,
+}
+
+impl<DB: sqlx::Database> AcquiredConnection<DB> {
+    pub(crate) fn new(connection: PoolConnection<DB>) -> Self {
+        let PoolConnection { inner, usage, .. } = connection;
+        Self {
+            inner,
+            _usage: usage,
+        }
+    }
+}
+
+impl<DB: sqlx::Database> std::fmt::Debug for AcquiredConnection<DB> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcquiredConnection").finish_non_exhaustive()
+    }
+}
+
+impl<DB: sqlx::Database> Deref for AcquiredConnection<DB> {
+    type Target = DB::Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<DB: sqlx::Database> DerefMut for AcquiredConnection<DB> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
 }

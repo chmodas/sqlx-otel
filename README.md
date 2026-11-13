@@ -87,6 +87,22 @@ let pool = PoolBuilder::from(raw_pool)
 
 `network.protocol.name` defaults to the backend's wire protocol (`"postgresql"` for Postgres, `"mysql"` for MySQL, absent for SQLite); override only when the connection is tunnelled through a different application-layer protocol. `network.transport` is not inferred from the connect string – callers who want this attribute on spans / metrics must declare it explicitly so the value reflects the deployment configuration rather than a guess.
 
+## APIs that need a plain `SQLx` pool
+
+`&Pool` implements `sqlx::Acquire`, so APIs generic over it accept the instrumented pool directly:
+
+```rust
+migrator.run(&pool).await?;
+```
+
+The acquisition is measured (`wait_time`, `pending_requests`, `timeouts`, and `use_time` for `acquire`), but queries run on the acquired connection are not instrumented. `Acquire::begin` hands back a plain `sqlx::Transaction`, which records no `use_time`.
+
+For APIs that take nothing but a `sqlx::Pool`, `Pool::inner` returns the wrapped pool. Nothing done through it is instrumented:
+
+```rust
+let listener = sqlx::postgres::PgListener::connect_with(pool.inner()).await?;
+```
+
 ## Per-query annotations
 
 Because the library does not parse SQL, per-query attributes are the caller's responsibility:

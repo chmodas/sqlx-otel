@@ -1191,3 +1191,28 @@ async fn query_scalar_macro_fetch_all_with_annotations_via_pool() {
 async fn executor_side_query_side_parity_via_pool() {
     test_executor_side_query_side_parity_via_pool!(test_pool().await, common::POSTGRES_DIALECT);
 }
+
+// ===========================================================================
+// APIs that take a plain sqlx pool
+// ===========================================================================
+
+/// `PgListener::connect_with` accepts only a `sqlx::PgPool`: `Pool::inner` provides it.
+#[tokio::test]
+#[serial]
+async fn listener_connects_through_inner_pool() {
+    let pool = test_pool().await;
+    let mut listener = sqlx::postgres::PgListener::connect_with(pool.inner())
+        .await
+        .unwrap();
+    listener.listen("sqlx_otel_inner").await.unwrap();
+
+    pool.execute("NOTIFY sqlx_otel_inner, 'ping'")
+        .await
+        .unwrap();
+
+    let notification = tokio::time::timeout(Duration::from_secs(5), listener.recv())
+        .await
+        .expect("no notification")
+        .unwrap();
+    assert_eq!(notification.payload(), "ping");
+}

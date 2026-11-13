@@ -53,7 +53,7 @@ dtor = "1"
 opentelemetry_sdk = { version = "0.33", features = ["testing", "rt-tokio"] }
 proptest = "1"
 serial_test = "3"
-sqlx = { version = "0.9", features = ["macros", "sqlite", "postgres", "mysql", "mysql-rsa", "runtime-tokio"] }
+sqlx = { version = "0.9", features = ["macros", "migrate", "sqlite", "postgres", "mysql", "mysql-rsa", "runtime-tokio"] }
 testcontainers = "0.28"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 

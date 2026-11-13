@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `impl sqlx::Acquire for &Pool<DB>`, so `SQLx` APIs generic over `Acquire` – `sqlx::migrate::Migrator::run` among them – accept an instrumented pool. Acquisition goes through `Pool::acquire` and records `db.client.connection.wait_time`, `pending_requests` and `timeouts`; `acquire` returns the new `AcquiredConnection`, which dereferences to the backend connection and records `use_time` when dropped. `begin` returns a plain `sqlx::Transaction` and records no `use_time`. Queries run through either are not instrumented ([#47](https://github.com/chmodas/sqlx-otel/pull/47)).
+- `Pool::inner()`, the wrapped `sqlx::Pool`, for APIs that accept nothing else, such as `sqlx::postgres::PgListener::connect_with`. Work done through it is not instrumented ([#47](https://github.com/chmodas/sqlx-otel/pull/47)).
+
 ### Fixed
 
 - Implicit pool queries and `Pool::begin()` now route through the instrumented `Pool::acquire()`, so `db.client.connection.wait_time`, `use_time`, `pending_requests`, and `timeouts` account for every acquisition rather than only explicit `acquire()` calls. A workload written as `query(..).fetch_one(&pool)` previously borrowed its connection straight from `sqlx::Pool` and could saturate the pool without any of its waits or timeouts reaching telemetry. Queries issued inside a transaction still acquire once, and connection use time now follows the lease through transaction commit, rollback, or drop ([#40](https://github.com/chmodas/sqlx-otel/pull/40)).

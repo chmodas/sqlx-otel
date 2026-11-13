@@ -1083,3 +1083,121 @@ mod async_std_runtime {
         drop(conn);
     }
 }
+
+/// `&Pool` implements `sqlx::Acquire`: the acquisition is measured like `Pool::acquire`, the lease
+/// ends when the connection is dropped, and queries on the raw connection are not instrumented.
+#[tokio::test]
+#[serial]
+async fn acquire_trait_measures_the_lease() {
+    let tel = common::TestTelemetry::install();
+    let pool = PoolBuilder::from(sqlx::SqlitePool::connect(":memory:").await.unwrap()).build();
+    let waits_before = histogram_count(&tel, "db.client.connection.wait_time");
+    let uses_before = histogram_count(&tel, "db.client.connection.use_time");
+
+    let mut conn = sqlx::Acquire::acquire(&pool).await.unwrap();
+    sqlx::query("SELECT 1").execute(&mut *conn).await.unwrap();
+    // `histogram_count` drains the exporters, so the spans are read first.
+    assert!(
+        tel.spans().is_empty(),
+        "queries on the raw connection are not instrumented"
+    );
+    assert_eq!(
+        histogram_count(&tel, "db.client.connection.wait_time"),
+        waits_before + 1
+    );
+    assert_eq!(
+        histogram_count(&tel, "db.client.connection.use_time"),
+        uses_before,
+        "the lease is still open"
+    );
+    assert_eq!(pending_count(&tel), 0);
+
+    drop(conn);
+    assert_eq!(
+        histogram_count(&tel, "db.client.connection.use_time"),
+        uses_before + 1
+    );
+}
+
+/// `Acquire::begin` measures the acquisition but records no `use_time`: a plain
+/// `sqlx::Transaction` does not report when it releases the connection.
+#[tokio::test]
+#[serial]
+async fn acquire_trait_begin_measures_the_wait_only() {
+    let tel = common::TestTelemetry::install();
+    let pool = PoolBuilder::from(sqlx::SqlitePool::connect(":memory:").await.unwrap()).build();
+    let waits_before = histogram_count(&tel, "db.client.connection.wait_time");
+    let uses_before = histogram_count(&tel, "db.client.connection.use_time");
+
+    let mut tx = sqlx::Acquire::begin(&pool).await.unwrap();
+    sqlx::query("SELECT 1").execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+
+    assert_eq!(
+        histogram_count(&tel, "db.client.connection.wait_time"),
+        waits_before + 1
+    );
+    assert_eq!(
+        histogram_count(&tel, "db.client.connection.use_time"),
+        uses_before
+    );
+    assert_eq!(pending_count(&tel), 0);
+}
+
+/// The use case `Acquire` exists for: a `Migrator` runs on the instrumented pool.
+#[tokio::test]
+#[serial]
+async fn migrator_runs_on_the_instrumented_pool() {
+    use sqlx::migrate::{Migration, MigrationType, Migrator};
+    let tel = common::TestTelemetry::install();
+    let pool = PoolBuilder::from(sqlx::SqlitePool::connect(":memory:").await.unwrap()).build();
+    let waits_before = histogram_count(&tel, "db.client.connection.wait_time");
+
+    let migrator = Migrator::with_migrations(vec![Migration::new(
+        1,
+        "create t".into(),
+        MigrationType::Simple,
+        sqlx::SqlStr::from_static("CREATE TABLE t (id integer)"),
+        false,
+    )]);
+    migrator.run(&pool).await.unwrap();
+
+    let row: (i64,) = sqlx::query_as("SELECT count(*) FROM t")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.0, 0);
+    assert!(
+        histogram_count(&tel, "db.client.connection.wait_time") > waits_before,
+        "the migrator acquired through the instrumented pool"
+    );
+    assert_eq!(pending_count(&tel), 0);
+}
+
+/// `Pool::inner` is the wrapped pool: it shares the connections and is not instrumented.
+#[tokio::test]
+#[serial]
+async fn inner_pool_is_not_instrumented() {
+    let tel = common::TestTelemetry::install();
+    let raw = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(":memory:")
+        .await
+        .unwrap();
+    let pool = PoolBuilder::from(raw).build();
+    pool.execute("CREATE TABLE t (id integer)").await.unwrap();
+    let waits_before = histogram_count(&tel, "db.client.connection.wait_time");
+
+    // One connection, one in-memory database: the table created through the wrapper is visible.
+    let row: (i64,) = sqlx::query_as("SELECT count(*) FROM t")
+        .fetch_one(pool.inner())
+        .await
+        .unwrap();
+    assert_eq!(row.0, 0);
+    // `histogram_count` drained the exporters: any span now came from the query above.
+    assert!(tel.spans().is_empty());
+    assert_eq!(
+        histogram_count(&tel, "db.client.connection.wait_time"),
+        waits_before
+    );
+}

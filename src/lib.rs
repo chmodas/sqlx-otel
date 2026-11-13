@@ -267,7 +267,7 @@ mod transaction;
 
 pub use annotations::{Annotated, AnnotatedMut, QueryAnnotations};
 pub use attributes::QueryTextMode;
-pub use connection::PoolConnection;
+pub use connection::{AcquiredConnection, PoolConnection};
 pub use database::Database;
 pub use pool::{Pool, PoolBuilder};
 pub use query_ext::{AnnotatedQuery, QueryAnnotateExt};

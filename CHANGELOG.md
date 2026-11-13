@@ -8,8 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- `impl sqlx::Acquire for &Pool<DB>`, so `SQLx` APIs generic over `Acquire` – `sqlx::migrate::Migrator::run` among them – accept an instrumented pool. Acquisition goes through `Pool::acquire` and records `db.client.connection.wait_time`, `pending_requests` and `timeouts`; `acquire` returns the new `AcquiredConnection`, which dereferences to the backend connection and records `use_time` when dropped. `begin` returns a plain `sqlx::Transaction` and records no `use_time`. Queries run through either are not instrumented.
-- `Pool::inner()`, the wrapped `sqlx::Pool`, for APIs that accept nothing else, such as `sqlx::postgres::PgListener::connect_with`. Work done through it is not instrumented.
+- `impl sqlx::Acquire for &Pool<DB>`, so `SQLx` APIs generic over `Acquire` – `sqlx::migrate::Migrator::run` among them – accept an instrumented pool. Acquisition goes through `Pool::acquire` and records `db.client.connection.wait_time`, `pending_requests` and `timeouts`; `acquire` returns the new `AcquiredConnection`, which dereferences to the backend connection and records `use_time` when dropped. `begin` returns a plain `sqlx::Transaction` and records no `use_time`. Queries run through either are not instrumented ([#47](https://github.com/chmodas/sqlx-otel/pull/47)).
+- `Pool::inner()`, the wrapped `sqlx::Pool`, for APIs that accept nothing else, such as `sqlx::postgres::PgListener::connect_with`. Work done through it is not instrumented ([#47](https://github.com/chmodas/sqlx-otel/pull/47)).
 
 ### Fixed
 

@@ -206,19 +206,70 @@ These mirror the bounded portion of the span attribute set: connection-level att
 | `db.client.connection.max`                | Gauge           |      | Maximum number of connections allowed                 |
 | `db.client.connection.idle.max`           | Gauge           |      | Maximum idle connections (equals `max` in SQLx)       |
 | `db.client.connection.idle.min`           | Gauge           |      | Configured minimum connections                        |
+| `sqlx_otel.connection.abandoned_wait.duration` | Histogram  | `s`  | Time waited by a caller that dropped its `acquire()`  |
 
-Explicit `acquire()`, implicit pool queries (including annotated and streaming queries), and `begin()` share one instrumented acquisition; queries issued inside a transaction do not acquire again. Wait time covers completed acquisition attempts – semaphore wait, connection creation, and validation – but excludes `BEGIN` and query execution. Dropping a waiting future decrements pending requests without recording a completed wait or a timeout, since the pool never failed to deliver: the caller left. Only `sqlx::Error::PoolTimedOut` increments the timeout counter, so `PoolClosed` on shutdown does not inflate your timeout rate. Pending-request and timeout series are initialised at zero so dashboards start from a known baseline rather than waiting for the first event. Connection use time follows the lease through transaction commit, rollback, or drop.
+Explicit `acquire()`, implicit pool queries (including annotated and streaming queries), and `begin()` share one instrumented acquisition; queries issued inside a transaction do not acquire again. Wait time covers completed acquisition attempts – semaphore wait, connection creation, and validation – but excludes `BEGIN` and query execution. Dropping a waiting future decrements pending requests without recording a completed wait or a timeout, since the pool never failed to deliver: the caller left. It records the time already waited once on `sqlx_otel.connection.abandoned_wait.duration` instead, a custom instrument because semantic conventions have no equivalent; a future dropped before its first poll never waited and records nothing. Only `sqlx::Error::PoolTimedOut` increments the timeout counter, so `PoolClosed` on shutdown does not inflate your timeout rate. Pending-request and timeout series are initialised at zero so dashboards start from a known baseline rather than waiting for the first event. Connection use time follows the lease through transaction commit, rollback, or drop, and ends when the lease owner is dropped. SQLx returns the connection to the pool in the background after that, so a sample does not prove that cleanup finished.
+
+`db.client.operation.duration` and the query span start when the executor method is called and end when the client observes the result. On `&Pool` that interval includes acquiring the connection, plus client and network time. It is not database execution time and does not prove a lock wait; compare it with `db.client.connection.wait_time` before reading it that way.
 
 `db.client.connection.count` is polled by a background task and requires both a runtime feature (`runtime-tokio` or `runtime-async-std`) and a pool name set via `PoolBuilder::with_pool_name`. Polling and export intervals can miss brief utilisation or pending-request peaks. The remaining three are static gauges recorded once at construction.
 
+### Workload attribution
+
+Wrap a workload in `PoolAttribution::scope` to split the connection-lease instruments by one bounded attribute:
+
+```rust,ignore
+use sqlx_otel::PoolAttribution;
+
+PoolAttribution::new("myapp.job.kind", "nightly_rollup")
+    .scope(run_job(&pool))
+    .await;
+```
+
+- **Carries it:** `db.client.connection.wait_time`, `use_time` and `timeouts`, plus `sqlx_otel.connection.abandoned_wait.duration` and the two transaction histograms. It splits series without adding samples, so summing across it reproduces the pool-wide totals. A workload's timeout series is initialized at zero at its first acquisition; on backends that compute rates from cumulative samples, the first timeout is visible only if that zero was exported first.
+- **Never carries it:** `pending_requests` and the pool gauges, which stay pool-wide, and `db.client.operation.duration` and the row-count histograms, whose `db.query.summary` dimension would multiply with it.
+- **Reserved keys:** attribution using a connection attribute or either transaction-outcome key is ignored, even when that optional pool attribute is absent. This preserves pool identity and outcomes.
+- **Bounded:** key and value are `&'static str`, so runtime identifiers cannot reach a label by accident. The added series are at most `pools × (values + 1)`, times the outcome count on the transaction histograms.
+- **Immutable per lease:** it is captured when an acquisition first runs and stored with the attempt and its lease, so dropping a connection or transaction elsewhere cannot move the sample to another workload.
+- **Poll-scoped, not task-scoped:** futures polled inside the scope inherit it, including `join!`, `select!` and `FuturesUnordered` children, and concurrent scopes on one task stay separate. `tokio::spawn`, `spawn_blocking` and other threads do **not** inherit it; use `PoolAttribution::inherit(future)` to pass it to a spawned task. A stream acquires when first polled, so the scope at that poll wins. It has no runtime dependency.
+
+Absence of the attribute means "acquired without valid attribution".
+
+### Transaction metrics
+
+| Instrument                             | Type      | Unit | Bounded attribute                                            |
+|----------------------------------------|-----------|------|--------------------------------------------------------------|
+| `sqlx_otel.transaction.begin.duration` | Histogram | `s`  | `sqlx_otel.transaction.begin.outcome`: `ok`, `error`, `abandoned` |
+| `sqlx_otel.transaction.duration`       | Histogram | `s`  | `sqlx_otel.transaction.outcome`, below                       |
+
+Semantic conventions define no transaction metrics, so both are custom instruments. Each carries the lease's connection attributes and attribution. `begin.duration` runs from holding a connection to observing the result of `BEGIN`, so it excludes acquisition. Only `ok` starts `transaction.duration`, which runs from there to the terminal client observation. That makes it distinct from `use_time`, which also spans `BEGIN` and the connection's handover, and which also ends for a failed `BEGIN`.
+
+Outcomes report what the client observed, never what the server did:
+
+| Outcome              | The client observed                                     | What it does not prove                                                   |
+|----------------------|---------------------------------------------------------|--------------------------------------------------------------------------|
+| `commit_ok`          | `commit()` returned `Ok`                                | That data committed: PostgreSQL answers `COMMIT` on a failed transaction with a `ROLLBACK` tag and no error |
+| `commit_error`       | `commit()` returned `Err`                               | A rejected commit: after a transport error the server outcome is unknown |
+| `commit_abandoned`   | The `commit()` future was dropped mid-flight            | Anything: `COMMIT` may have reached the server, so this is neither a rollback nor a failed commit |
+| `rollback_ok`        | `rollback()` returned `Ok`                              |                                                                          |
+| `rollback_error`     | `rollback()` returned `Err`                             | That the transaction is still open                                       |
+| `rollback_abandoned` | The `rollback()` future was dropped mid-flight          | A completed rollback: SQLx queued another for the connection's next use  |
+| `dropped`            | Dropped with no terminal call started, or a `commit()` / `rollback()` future dropped before its first poll | A server rollback: SQLx only queued one for the connection's next use |
+
+`dropped` is a client lifecycle observation, not an error. It can be expected when a guard releases a transaction or an early return drops one; SQLx has only queued rollback, so it does not confirm server cleanup.
+
+Telemetry adds no await, round trip, or `Drop` behaviour to the transaction itself. `begin.duration` uses the boundaries below; `transaction.duration` extends them with `120, 300, 600, 1800, 3600`, because no client timeout caps a transaction and long batch transactions must not all collapse into the overflow bucket.
+
 ### Histogram buckets
 
-The three latency histograms – `db.client.operation.duration`, `db.client.connection.wait_time`, and `db.client.connection.use_time` – are recorded in seconds, as the semantic conventions require. The OpenTelemetry SDK's default bucket boundaries (`0, 5, 10, 25, … 10000`) are shaped for milliseconds, so on a seconds-valued histogram every observation below five seconds falls into a single bucket and any quantile derived from it is an interpolation artefact rather than a measurement. The crate therefore ships explicit boundaries spanning the range a database client actually occupies, from sub-millisecond local round trips up to the 30-second acquire timeout SQLx applies by default:
+The three semantic-convention latency histograms – `db.client.operation.duration`, `db.client.connection.wait_time`, and `db.client.connection.use_time` – are recorded in seconds, as the semantic conventions require. The OpenTelemetry SDK's default bucket boundaries (`0, 5, 10, 25, … 10000`) are shaped for milliseconds, so on a seconds-valued histogram every observation below five seconds falls into a single bucket and any quantile derived from it is an interpolation artefact rather than a measurement. The crate therefore ships explicit boundaries spanning the range a database client actually occupies, from sub-millisecond local round trips up to the 30-second acquire timeout SQLx applies by default:
 
 ```text
 0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1,
 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0
 ```
+
+`sqlx_otel.connection.abandoned_wait.duration` and `sqlx_otel.transaction.begin.duration` use the same boundaries. `sqlx_otel.transaction.duration` extends them as described above.
 
 These are instrument *advice*, not a fixed configuration. The SDK applies advice only when no matching view has already set an aggregation, so an application that registers a `View` with its own explicit bucket boundaries overrides what the crate ships – no API is needed from this crate to retune them. (A view whose aggregation the SDK rejects as incompatible with the instrument is discarded, and the crate's advice applies after all, so match histogram names only.)
 

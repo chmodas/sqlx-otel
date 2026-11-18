@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use opentelemetry_semantic_conventions::metric as semconv_metric;
 
@@ -9,6 +9,7 @@ use crate::connection::PoolConnection;
 use crate::database::Database;
 use crate::metrics::Metrics;
 use crate::transaction::Transaction;
+use crate::transaction_metrics::TransactionMetrics;
 
 /// Shared state propagated to every wrapper type derived from a pool.
 #[derive(Debug, Clone)]
@@ -183,7 +184,8 @@ impl<DB: Database> PoolBuilder<DB> {
     /// `db.client.connection.idle.max`, `db.client.connection.idle.min`) are recorded
     /// once with the connection-level attributes – they do not change over the pool's
     /// lifetime. The wait-time / use-time / timeout / pending-request instruments are
-    /// created here and updated inline on every `acquire()` and connection drop.
+    /// created here and updated inline on every `acquire()` and connection drop. So are the
+    /// abandoned-wait and transaction instruments, which have no series until first used.
     #[must_use]
     pub fn build(self) -> Pool<DB> {
         let metrics_shutdown = self.spawn_pool_metrics_task();
@@ -262,6 +264,17 @@ impl<DB: Database> PoolBuilder<DB> {
                     .with_description("The number of pending requests for an open connection.")
                     .build(),
             ),
+            abandoned_wait: Arc::new(
+                meter
+                    .f64_histogram("sqlx_otel.connection.abandoned_wait.duration")
+                    .with_unit("s")
+                    .with_description(
+                        "The time a caller waited for a connection before dropping the attempt.",
+                    )
+                    .with_boundaries(crate::metrics::LATENCY_BUCKETS_SECONDS.to_vec())
+                    .build(),
+            ),
+            transactions: Arc::new(TransactionMetrics::new(&meter)),
         };
         pool.pending_requests.add(0, &base_attrs);
         pool.timeouts.add(0, &base_attrs);
@@ -354,6 +367,11 @@ pub struct Pool<DB: sqlx::Database> {
     /// Up/down counter for `db.client.connection.pending_requests`, tracks callers
     /// currently waiting in `acquire()`.
     pending_requests: Arc<opentelemetry::metrics::UpDownCounter<i64>>,
+    /// Histogram for `sqlx_otel.connection.abandoned_wait.duration`, recorded when an `acquire()`
+    /// already waiting is dropped.
+    abandoned_wait: Arc<opentelemetry::metrics::Histogram<f64>>,
+    /// Instruments for the `sqlx_otel.transaction.*` family.
+    transactions: Arc<TransactionMetrics>,
 }
 
 impl<DB: sqlx::Database> Clone for Pool<DB> {
@@ -366,6 +384,8 @@ impl<DB: sqlx::Database> Clone for Pool<DB> {
             use_time: self.use_time.clone(),
             timeouts: self.timeouts.clone(),
             pending_requests: self.pending_requests.clone(),
+            abandoned_wait: self.abandoned_wait.clone(),
+            transactions: self.transactions.clone(),
         }
     }
 }
@@ -379,22 +399,35 @@ impl<DB: Database> Pool<DB> {
     /// returned [`PoolConnection`] records `db.client.connection.use_time` when dropped
     /// and is itself an [`sqlx::Executor`] via `&mut conn`.
     ///
+    /// Dropping this future while it waits records the time already waited once on
+    /// `sqlx_otel.connection.abandoned_wait.duration`, not as a completed wait or a timeout. A
+    /// future that was never polled never waited and records nothing. The active
+    /// [`PoolAttribution`](crate::PoolAttribution) is captured on first poll and used for every
+    /// measurement of this attempt and its lease.
+    ///
     /// # Errors
     ///
     /// Returns `sqlx::Error` if a connection cannot be obtained from the pool – typically
     /// `PoolTimedOut` when the configured acquire timeout elapses, or `PoolClosed` after
     /// [`close`](Self::close).
     pub async fn acquire(&self) -> Result<PoolConnection<DB>, sqlx::Error> {
-        let attrs = self.state.attrs.base_key_values();
-        self.pending_requests.add(1, &attrs);
+        let pool_attrs = self.state.attrs.base_key_values();
+        let attrs = crate::attribution::lease_attributes(&pool_attrs);
+        // Initialize the workload series like the pool-wide series. A rate can include the
+        // first timeout in a cumulative-sample rate only if the zero was exported first.
+        self.timeouts.add(0, &attrs);
+        self.pending_requests.add(1, &pool_attrs);
         let pending = PendingAcquisition {
             counter: &self.pending_requests,
-            attrs: &attrs,
+            pool_attrs: &pool_attrs,
+            abandoned_wait: &self.abandoned_wait,
+            lease_attrs: &attrs,
+            started_at: Instant::now(),
+            completed: false,
         };
-        let start = std::time::Instant::now();
         let result = self.inner.acquire().await;
-        drop(pending);
-        self.wait_time.record(start.elapsed().as_secs_f64(), &attrs);
+        let waited = pending.complete();
+        self.wait_time.record(waited.as_secs_f64(), &attrs);
 
         if let Err(sqlx::Error::PoolTimedOut) = &result {
             self.timeouts.add(1, &attrs);
@@ -405,8 +438,8 @@ impl<DB: Database> Pool<DB> {
             state: self.state.clone(),
             usage: crate::connection::ConnectionUsage {
                 use_time: self.use_time.clone(),
-                acquired_at: std::time::Instant::now(),
-                base_attrs: attrs,
+                acquired_at: Instant::now(),
+                lease_attrs: attrs,
             },
         })
     }
@@ -419,6 +452,10 @@ impl<DB: Database> Pool<DB> {
     /// it; dropping the value without doing either rolls back implicitly (per `SQLx`'s
     /// usual behaviour).
     ///
+    /// Records one `sqlx_otel.transaction.begin.duration` sample once a connection is held,
+    /// including when `BEGIN` fails or this future is dropped during it. Only a successful `BEGIN`
+    /// starts `sqlx_otel.transaction.duration`; see [`Transaction`] for its outcomes.
+    ///
     /// # Errors
     ///
     /// Returns `sqlx::Error` if `BEGIN` fails – typically due to a connection problem or
@@ -429,11 +466,15 @@ impl<DB: Database> Pool<DB> {
             state,
             usage,
         } = self.acquire().await?;
-        let inner = sqlx::Transaction::begin(inner, None).await?;
+        let (inner, lifecycle) = self
+            .transactions
+            .observe_begin(&usage.lease_attrs, sqlx::Transaction::begin(inner, None))
+            .await?;
         Ok(Transaction {
             inner,
             state,
             usage,
+            lifecycle,
         })
     }
 
@@ -504,20 +545,37 @@ impl<DB: Database> Pool<DB> {
 }
 
 /// Decrements `db.client.connection.pending_requests` on every exit path from
-/// [`Pool::acquire`].
+/// [`Pool::acquire`], and measures the attempts that never got an answer.
 ///
 /// A caller timeout or task abort can drop the `acquire()` future while it is still awaiting
 /// `SQLx`, which would otherwise leave the counter permanently incremented. Tying the decrement
-/// to a `Drop` guard covers success, error, and cancellation alike. Cancellation deliberately
-/// stops there: it records no completed wait and is not classified as `PoolTimedOut`, because
-/// the pool never failed to deliver – the caller left.
+/// to a `Drop` guard covers success, error, and cancellation alike. Cancellation records no
+/// completed wait and is not classified as `PoolTimedOut`, because the pool never failed to
+/// deliver – the caller left. It records the elapsed wait on its own instrument instead, exactly
+/// once, because the guard exists only after a first poll and is dropped only once.
 struct PendingAcquisition<'a> {
     counter: &'a opentelemetry::metrics::UpDownCounter<i64>,
-    attrs: &'a [opentelemetry::KeyValue],
+    pool_attrs: &'a [opentelemetry::KeyValue],
+    abandoned_wait: &'a opentelemetry::metrics::Histogram<f64>,
+    lease_attrs: &'a [opentelemetry::KeyValue],
+    started_at: Instant,
+    completed: bool,
+}
+
+impl PendingAcquisition<'_> {
+    /// `SQLx` answered, so this attempt was not abandoned. Returns how long it took.
+    fn complete(mut self) -> Duration {
+        self.completed = true;
+        self.started_at.elapsed()
+    }
 }
 
 impl Drop for PendingAcquisition<'_> {
     fn drop(&mut self) {
-        self.counter.add(-1, self.attrs);
+        self.counter.add(-1, self.pool_attrs);
+        if !self.completed {
+            self.abandoned_wait
+                .record(self.started_at.elapsed().as_secs_f64(), self.lease_attrs);
+        }
     }
 }

@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `sqlx_otel.connection.abandoned_wait.duration` records the time already waited, once, when a polled `acquire()` is dropped before SQLx answers. `db.client.connection.wait_time` and `db.client.connection.timeouts` keep their meaning, and a never-polled future records nothing.
+- `PoolAttribution` splits `db.client.connection.wait_time`, `use_time` and `timeouts`, plus the new instruments, by one bounded `&'static str` attribute captured at acquisition. It uses a poll-scoped thread-local with no new dependency. **Queries that read those series without aggregating over attributes will see them split once a scope is used**; totals are unchanged. `pending_requests`, the pool gauges and the operation metrics are unaffected. Spawned tasks are not covered unless passed `PoolAttribution::inherit`.
+- `sqlx_otel.transaction.begin.duration` (`ok`, `error`, `abandoned`) and `sqlx_otel.transaction.duration` (`commit_ok`, `commit_error`, `commit_abandoned`, `rollback_ok`, `rollback_error`, `rollback_abandoned`, `dropped`) report transaction boundaries and terminal client observations, distinct from `use_time`. They add no await, round trip or change to SQLx's ownership and drop behaviour.
+
 ## [0.6.0] – 2026-10-30
 
 ### Fixed

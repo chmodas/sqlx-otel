@@ -23,11 +23,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Install Rust stable
+      # Pinned because Rust 1.100.0 moved test binaries out of target/<profile>/deps/,
+      # where cargo-llvm-cov 0.8.4 still looks for them. Restore `stable` once that is fixed.
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
         with:
-          toolchain: stable
-          components: clippy
+          toolchain: 1.99.1
+          components: clippy, rustfmt
 
       - name: Cargo cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1

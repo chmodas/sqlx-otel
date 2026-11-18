@@ -145,7 +145,7 @@ impl<DB: Database> PoolBuilder<DB> {
     }
 
     /// Configure how `db.query.text` is captured on spans. Defaults to
-    /// [`QueryTextMode::Full`].
+    /// [`QueryTextMode::Full`]. [`QueryTextMode::Off`] also disables automatic summaries.
     #[must_use]
     pub fn with_query_text_mode(mut self, mode: QueryTextMode) -> Self {
         self.query_text_mode = mode;
@@ -156,7 +156,7 @@ impl<DB: Database> PoolBuilder<DB> {
     /// [`QuerySummaryMode::Off`].
     ///
     /// [`QuerySummaryMode::Auto`] extracts only the outer SQL operation and primary
-    /// target, independently of [`QueryTextMode`]. Any explicit per-query
+    /// target when query text is enabled. Any explicit per-query
     /// [`QueryAnnotations`] disable inference, even without a custom summary. See
     /// [`QuerySummaryMode`] for limits and cardinality considerations.
     #[must_use]

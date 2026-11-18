@@ -155,10 +155,10 @@
 //!
 //! Automatic summaries are off by default. Enable [`QuerySummaryMode::Auto`] to generate
 //! a best-effort `db.query.summary` containing the operation and primary target (for
-//! example `SELECT users`), resolving common table expressions when possible. This works
-//! regardless of [`QueryTextMode`], including [`QueryTextMode::Off`], and supplies both the
-//! span name and an operation metric attribute. Summaries are capped at 255 bytes;
-//! dynamically named objects still contribute to cardinality. This extractor is not a
+//! example `SELECT users`), resolving common table expressions when possible. The summary
+//! supplies both the span name and an operation metric attribute. [`QueryTextMode::Off`]
+//! disables automatic summaries and still emits explicit annotations. Summaries are capped at
+//! 255 bytes. Dynamically named objects still contribute to cardinality. This extractor is not a
 //! general SQL redaction boundary; unsupported forms may be inaccurate. Leave automatic
 //! summaries off for sensitive SQL. The other per-query
 //! semantic-convention attributes – `db.operation.name`,

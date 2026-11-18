@@ -525,12 +525,10 @@ async fn query_summary_drives_span_name() {
 #[tokio::test]
 #[serial]
 async fn automatic_summaries_are_opt_in_and_group_without_literal_values() {
-    use sqlx_otel::{QueryAnnotations, QuerySummaryMode, QueryTextMode};
+    use sqlx_otel::{QuerySummaryMode, QueryTextMode};
 
     let tel = common::TestTelemetry::install();
-    let default_pool = PoolBuilder::from(raw_pool().await)
-        .with_query_text_mode(QueryTextMode::Off)
-        .build();
+    let default_pool = test_pool().await;
     default_pool
         .fetch_all("SELECT name FROM sqlite_master")
         .await
@@ -541,7 +539,7 @@ async fn automatic_summaries_are_opt_in_and_group_without_literal_values() {
     tel.reset();
 
     let pool = PoolBuilder::from(raw_pool().await)
-        .with_query_text_mode(QueryTextMode::Off)
+        .with_query_text_mode(QueryTextMode::Obfuscated)
         .with_query_summary_mode(QuerySummaryMode::Auto)
         .build();
     for sql in [
@@ -558,7 +556,10 @@ async fn automatic_summaries_are_opt_in_and_group_without_literal_values() {
             common::attr(span, "db.query.summary"),
             Some("SELECT sqlite_master".into())
         );
-        assert_eq!(common::attr(span, "db.query.text"), None);
+        assert_eq!(
+            common::attr(span, "db.query.text"),
+            Some("SELECT name FROM sqlite_master WHERE name = ?".into())
+        );
         assert_eq!(common::attr(span, "db.operation.name"), None);
         assert_eq!(common::attr(span, "db.collection.name"), None);
     }
@@ -570,29 +571,11 @@ async fn automatic_summaries_are_opt_in_and_group_without_literal_values() {
     )
     .unwrap();
     assert_eq!(point.count(), 2);
-    tel.reset();
-
-    sqlx::query("SELECT name FROM sqlite_master")
-        .with_annotations(QueryAnnotations::new().query_summary("schema lookup"))
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-    let spans = tel.spans();
-    assert_eq!(spans.len(), 1);
-    assert_eq!(spans[0].name, "schema lookup");
-    assert!(
-        common::find_histogram_data_point_with(
-            &tel.metrics(),
-            "db.client.operation.duration",
-            &[("db.query.summary", "schema lookup")],
-        )
-        .is_some()
-    );
 }
 
 #[tokio::test]
 #[serial]
-async fn explicit_annotations_without_summary_suppress_auto_inference() {
+async fn query_text_off_suppresses_auto_summary_but_keeps_explicit_annotations() {
     use sqlx_otel::{QueryAnnotations, QuerySummaryMode, QueryTextMode};
 
     let tel = common::TestTelemetry::install();
@@ -600,19 +583,92 @@ async fn explicit_annotations_without_summary_suppress_auto_inference() {
         .with_query_text_mode(QueryTextMode::Off)
         .with_query_summary_mode(QuerySummaryMode::Auto)
         .build();
+    let sql = "SELECT name FROM main.sqlite_master";
+
+    sqlx::query(sql).fetch_all(&pool).await.unwrap();
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].name, SYSTEM);
+    let point = common::find_histogram_data_point_with(
+        &tel.metrics(),
+        "db.client.operation.duration",
+        &[("db.system.name", SYSTEM)],
+    )
+    .unwrap();
+    assert_eq!(point.count(), 1);
+    for key in [
+        "db.query.text",
+        "db.query.summary",
+        "db.operation.name",
+        "db.collection.name",
+        "db.stored_procedure.name",
+    ] {
+        assert_eq!(common::attr(&spans[0], key), None, "span attribute {key}");
+        assert_eq!(
+            common::metric_attr(&point, key),
+            None,
+            "metric attribute {key}"
+        );
+    }
+    tel.reset();
+
+    sqlx::query(sql)
+        .with_annotations(
+            QueryAnnotations::new()
+                .operation("LOOKUP")
+                .collection("catalog")
+                .stored_procedure("lookup_catalog")
+                .query_summary("schema lookup"),
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    let spans = tel.spans();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].name, "schema lookup");
+    let annotations = [
+        ("db.operation.name", "LOOKUP"),
+        ("db.collection.name", "catalog"),
+        ("db.stored_procedure.name", "lookup_catalog"),
+        ("db.query.summary", "schema lookup"),
+    ];
+    for (key, value) in annotations {
+        assert_eq!(common::attr(&spans[0], key), Some(value.into()));
+    }
+    assert_eq!(common::attr(&spans[0], "db.query.text"), None);
+    let point = common::find_histogram_data_point_with(
+        &tel.metrics(),
+        "db.client.operation.duration",
+        &annotations,
+    )
+    .unwrap();
+    assert_eq!(point.count(), 1);
+    assert_eq!(common::metric_attr(&point, "db.query.text"), None);
+}
+
+#[tokio::test]
+#[serial]
+async fn explicit_annotations_without_summary_suppress_auto_inference() {
+    use sqlx_otel::{QueryAnnotations, QuerySummaryMode};
+
+    let tel = common::TestTelemetry::install();
+    let pool = PoolBuilder::from(raw_pool().await)
+        .with_query_summary_mode(QuerySummaryMode::Auto)
+        .build();
+    let sql = "SELECT name FROM sqlite_master";
 
     pool.with_operation("LOOKUP", "logical_users")
-        .fetch_all("SELECT name FROM sqlite_master")
+        .fetch_all(sql)
         .await
         .unwrap();
     let spans = tel.spans();
     assert_eq!(spans.len(), 1);
     assert_eq!(spans[0].name, "LOOKUP logical_users");
     assert_eq!(common::attr(&spans[0], "db.query.summary"), None);
-    assert_eq!(common::attr(&spans[0], "db.query.text"), None);
+    assert_eq!(common::attr(&spans[0], "db.query.text"), Some(sql.into()));
     tel.reset();
 
-    sqlx::query("SELECT name FROM sqlite_master")
+    sqlx::query(sql)
         .with_annotations(QueryAnnotations::new())
         .fetch_all(&pool)
         .await
@@ -623,7 +679,7 @@ async fn explicit_annotations_without_summary_suppress_auto_inference() {
     assert_eq!(common::attr(&spans[0], "db.query.summary"), None);
     assert_eq!(common::attr(&spans[0], "db.operation.name"), None);
     assert_eq!(common::attr(&spans[0], "db.collection.name"), None);
-    assert_eq!(common::attr(&spans[0], "db.query.text"), None);
+    assert_eq!(common::attr(&spans[0], "db.query.text"), Some(sql.into()));
 }
 
 // ===========================================================================

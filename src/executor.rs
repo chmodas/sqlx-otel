@@ -106,7 +106,9 @@ fn begin_query_span(
     annotations: Option<&QueryAnnotations>,
 ) -> (OtelContext, Instant, Vec<KeyValue>) {
     let generated_annotations;
-    let annotations = if annotations.is_none() && attrs.query_summary_mode == QuerySummaryMode::Auto
+    let annotations = if annotations.is_none()
+        && attrs.query_summary_mode == QuerySummaryMode::Auto
+        && attrs.query_text_mode != QueryTextMode::Off
     {
         generated_annotations = sql
             .and_then(|sql| crate::summary::summarize(sql, attrs.system))
@@ -896,7 +898,6 @@ mod tests {
     #[test]
     fn begin_query_span_generates_low_cardinality_summary_in_auto_mode() {
         let mut attrs = test_attrs();
-        attrs.query_text_mode = QueryTextMode::Obfuscated;
         attrs.query_summary_mode = QuerySummaryMode::Auto;
         let (_, _, metric_attrs) = begin_query_span(
             &attrs,

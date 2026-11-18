@@ -104,8 +104,8 @@ The summary contains only the outer operation and primary target, such as `SELEC
 `INSERT orders`. Common table expressions are resolved to their primary physical target
 when possible. Recognized literals are scrubbed before extraction; supported forms omit
 predicates, selected columns, and bind parameters. The generated summary names the span and
-is attached to operation metrics, independently of `QueryTextMode` (including `Off`). It does not infer
-`db.operation.name` or `db.collection.name`.
+is attached to operation metrics. `QueryTextMode::Off` disables generation. The summarizer
+does not infer `db.operation.name` or `db.collection.name`.
 
 Any explicit per-query annotations take precedence and disable inference for that query,
 even if they do not set a summary. This is a lightweight extractor, not a complete SQL
@@ -166,10 +166,9 @@ See [`QueryAnnotations`](https://docs.rs/sqlx-otel/latest/sqlx_otel/struct.Query
 |------------------|----------------------------------------------------------------------------------------------------|
 | `Full` (default) | Capture the parameterised query. Safe because SQLx uses bind parameters.                           |
 | `Obfuscated`     | Replace literal values (string, numeric, hex, boolean, dollar-quoted) with `?` in `db.query.text`. |
-| `Off`            | Do not capture `db.query.text`.                                                                    |
+| `Off`            | Disable `db.query.text` capture and automatic summaries.                                          |
 
-`QueryTextMode::Off` does not disable automatic summaries. Keep `QuerySummaryMode::Off`
-as well when table or schema names are sensitive.
+Explicit per-query annotations still appear on spans and operation metrics when query text is `Off`.
 
 `Obfuscated` is useful when SQL is constructed via string interpolation rather than bind parameters – the structure of the query is preserved while sensitive literal values are redacted. Comments, identifiers (quoted or otherwise), operators, and `NULL` are kept verbatim.
 

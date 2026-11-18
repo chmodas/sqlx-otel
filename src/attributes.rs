@@ -1,7 +1,7 @@
 use opentelemetry::KeyValue;
 use opentelemetry_semantic_conventions::attribute;
 
-/// Controls whether and how `db.query.text` is captured on spans.
+/// Controls `db.query.text` capture on spans and whether automatic summaries are allowed.
 ///
 /// Configured via [`PoolBuilder::with_query_text_mode`](crate::PoolBuilder::with_query_text_mode).
 ///
@@ -27,8 +27,8 @@ use opentelemetry_semantic_conventions::attribute;
 ///   otherwise), operators, and `NULL` are kept verbatim.
 /// - **[`Off`](Self::Off)** – appropriate when the query text is itself sensitive
 ///   (proprietary schemas, query shapes that reveal business logic) or when query-text
-///   cardinality must be eliminated entirely. Keep [`QuerySummaryMode::Off`] as well
-///   when object names are sensitive: automatic summaries can still emit those names.
+///   cardinality must be eliminated entirely. This also disables automatic summaries.
+///   Explicit [`QueryAnnotations`](crate::QueryAnnotations) are still emitted.
 ///
 /// `db.query.parameter.<key>` capture is **not supported** – `SQLx`'s `Execute` trait does
 /// not expose bind values, and reverse-engineering them from the encoded buffer would tie
@@ -47,7 +47,8 @@ pub enum QueryTextMode {
     /// via string interpolation rather than bind parameters. The same whitespace
     /// normalisation as [`Full`](Self::Full) is applied after redaction.
     Obfuscated,
-    /// Do not capture `db.query.text` at all.
+    /// Disable `db.query.text` capture and automatic summaries. Explicit query annotations
+    /// are still emitted.
     Off,
 }
 
@@ -58,8 +59,7 @@ pub enum QueryTextMode {
 /// expression, the summarizer resolves the CTE to its primary physical target when
 /// possible. Recognized literals are scrubbed before extraction; supported forms omit
 /// predicates, selected columns, and bind parameters. Generated summaries name the span
-/// and appear on operation metrics, independently of [`QueryTextMode`] (including
-/// [`QueryTextMode::Off`]).
+/// and appear on operation metrics. [`QueryTextMode::Off`] disables summary generation.
 /// They do not infer `db.operation.name` or `db.collection.name`.
 ///
 /// This mode is off by default. Any explicit [`QueryAnnotations`](crate::QueryAnnotations)
@@ -86,8 +86,8 @@ pub enum QuerySummaryMode {
     /// are unaffected.
     #[default]
     Off,
-    /// Generate a best-effort low-cardinality summary when no explicit query annotations
-    /// were supplied.
+    /// Generate a best-effort low-cardinality summary when query text is enabled and
+    /// no explicit query annotations were supplied.
     Auto,
 }
 

@@ -46,7 +46,8 @@ macro_rules! impl_with_annotations_mut {
 }
 
 /// Per-query annotation values that enrich OpenTelemetry spans with semantic-convention
-/// attributes the library cannot derive automatically (because it does not parse SQL).
+/// attributes supplied by the caller. Explicit annotations suppress automatic query
+/// summaries, including when no custom summary is supplied.
 ///
 /// Use the builder methods to set whichever attributes apply to a given query, then pass
 /// the result through one of the equivalent annotation surfaces:
@@ -265,7 +266,7 @@ mod tests {
     fn test_state() -> SharedState {
         use std::sync::Arc;
 
-        use crate::attributes::{ConnectionAttributes, QueryTextMode};
+        use crate::attributes::{ConnectionAttributes, QuerySummaryMode, QueryTextMode};
         use crate::metrics::Metrics;
 
         SharedState {
@@ -280,6 +281,7 @@ mod tests {
                 network_transport: None,
                 pool_name: None,
                 query_text_mode: QueryTextMode::Off,
+                query_summary_mode: QuerySummaryMode::Off,
             }),
             metrics: Arc::new(Metrics::new()),
         }

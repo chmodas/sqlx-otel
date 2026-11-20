@@ -135,6 +135,10 @@ See [`QueryAnnotations`](https://docs.rs/sqlx-otel/latest/sqlx_otel/struct.Query
 
 `Obfuscated` is useful when SQL is constructed via string interpolation rather than bind parameters – the structure of the query is preserved while sensitive literal values are redacted. Comments, identifiers (quoted or otherwise), operators, and `NULL` are kept verbatim.
 
+Obfuscation follows the lexical rules of the backend in use, because the same bytes mean different things on each: `\` escapes inside `'…'` only on MySQL (and in PostgreSQL `E'…'` strings), `"…"` is a string literal on MySQL but an identifier elsewhere, `#` starts a comment only on MySQL, `[…]` is an identifier only on SQLite, and block comments nest only on PostgreSQL. A quoted identifier or comment left unterminated is redacted to the end of the statement rather than emitted verbatim.
+
+The obfuscator assumes each backend's default settings, which it cannot observe. PostgreSQL with `standard_conforming_strings = off`, or MySQL with `NO_BACKSLASH_ESCAPES` or `ANSI_QUOTES`, changes what a quote or backslash means and can let literal content through. SQLite treats a double-quoted `"…"` that names no column as a string literal; the obfuscator keeps `"…"` as an identifier, so write string literals with single quotes. MySQL optimizer hints (`/*+ … */`) are comments and are kept verbatim, values included. A MySQL `/*!NNNNN … */` comment versioned newer than the server, or a MariaDB-only `/*M! … */` sent to MySQL, is a plain comment to the server but SQL to the obfuscator, so quotes inside it can shift where later literals are found.
+
 Both `Full` and `Obfuscated` collapse inter-token whitespace runs to a single space and trim leading/trailing whitespace before emitting `db.query.text`, so multi-line SQL written for source-level readability renders cleanly in OTel exports. Whitespace **inside** string literals, quoted identifiers, dollar-quoted bodies, and comments is preserved verbatim. For example, an UPSERT split across multiple lines for readability:
 
 ```sql

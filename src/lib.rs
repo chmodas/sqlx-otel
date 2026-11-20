@@ -255,6 +255,7 @@ mod compact;
 mod connection;
 mod database;
 mod executor;
+mod lexer;
 mod metrics;
 mod obfuscate;
 mod pool;

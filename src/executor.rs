@@ -12,6 +12,7 @@ use opentelemetry_semantic_conventions::attribute;
 use crate::annotations::QueryAnnotations;
 use crate::attributes::{self, ConnectionAttributes, QueryTextMode};
 use crate::database::Database;
+use crate::lexer::Dialect;
 use crate::metrics::Metrics;
 
 // ---------------------------------------------------------------------------
@@ -55,18 +56,19 @@ fn build_attributes(
     let mut kv = attrs.base_key_values();
     append_annotation_attrs(&mut kv, annotations);
     if let Some(sql) = sql {
+        let dialect = Dialect::from_system(attrs.system);
         match attrs.query_text_mode {
             QueryTextMode::Full => {
                 kv.push(KeyValue::new(
                     attribute::DB_QUERY_TEXT,
-                    crate::compact::compact_whitespace(sql),
+                    crate::compact::compact_whitespace(sql, dialect),
                 ));
             }
             QueryTextMode::Obfuscated => {
-                let obfuscated = crate::obfuscate::obfuscate(sql);
+                let obfuscated = crate::obfuscate::obfuscate(sql, dialect);
                 kv.push(KeyValue::new(
                     attribute::DB_QUERY_TEXT,
-                    crate::compact::compact_whitespace(&obfuscated),
+                    crate::compact::compact_whitespace(&obfuscated, dialect),
                 ));
             }
             QueryTextMode::Off => {}
@@ -1027,6 +1029,8 @@ mod tests {
         }
     }
 
+    use crate::lexer::strategies::{SENTINEL, any_obfuscation_case};
+    use crate::lexer::{TokenKind, tokenize};
     use proptest::prelude::*;
 
     /// Build a `ConnectionAttributes` from explicit option fields. Used by the proptest
@@ -1063,52 +1067,19 @@ mod tests {
         ]
     }
 
-    /// Sentinel embedded inside marked literals for the chain no-leak proptest. Mirrors
-    /// the constant in `obfuscate::tests::proptests` so a single failure mode (a literal
-    /// kind escaping redaction) is detected through both the standalone `obfuscate`
-    /// invariants and the executor-level chain invariants. The chain generators below
-    /// intentionally duplicate the token shapes from `obfuscate::tests::proptests` and
-    /// `compact::tests::proptests`; if a token shape needs adjusting, mirror the change
-    /// in all three modules so the chain invariants stay honest.
-    const CHAIN_SENTINEL: &str = "XSECRETX";
-
-    /// Minimal fragment generator for the chain proptests: covers the token kinds whose
-    /// composition through `obfuscate -> compact_whitespace` exercises every region of
-    /// both state machines. Bodies are alphabetic-and-digit so the sentinel cannot
-    /// accidentally appear in a non-literal token.
-    fn chain_fragment_any() -> impl Strategy<Value = String> {
-        let token = prop_oneof![
-            "[a-z_][a-z0-9_]{0,7}".prop_map(String::from),
-            "[ \t\n]{0,5}".prop_map(String::from),
-            "[a-z0-9 _]{0,8}".prop_map(|inner| format!("'{inner}'")),
-            "[a-z0-9 _]{0,8}".prop_map(|inner| format!("\"{inner}\"")),
-            (
-                "[a-z_]{0,3}".prop_map(String::from),
-                "[a-z0-9 _]{0,8}".prop_map(String::from),
-            )
-                .prop_map(|(tag, body)| format!("${tag}${body}${tag}$")),
-            "[a-z0-9 _]{0,12}".prop_map(|inner| format!("--{inner}\n")),
-            "[a-z0-9 _]{0,12}".prop_map(|inner| format!("/*{inner}*/")),
-            "[0-9]{1,5}".prop_map(String::from),
-            prop::sample::select(vec![",", ";", "=", "(", ")", "+", "*", "?"])
-                .prop_map(String::from),
-        ];
-        prop::collection::vec(token, 0..12).prop_map(|tokens| tokens.concat())
+    /// The `db.system.name` value whose dialect is `d`, so tests drive `build_attributes` through
+    /// the same `Dialect::from_system` mapping production uses.
+    fn system_for(d: Dialect) -> &'static str {
+        match d {
+            Dialect::Postgres => "postgresql",
+            Dialect::MySql => "mysql",
+            Dialect::Sqlite => "sqlite",
+        }
     }
 
-    /// Marked-literal fragment generator: every string and dollar-quoted body embeds the
-    /// sentinel. Surrounding tokens never contain the sentinel because their bodies are
-    /// lowercase-only. If any literal kind is not redacted by `obfuscate`, the sentinel
-    /// leaks through to the chain output.
-    fn chain_fragment_marked() -> impl Strategy<Value = String> {
-        let token = prop_oneof![
-            "[a-z_][a-z0-9_]{0,7}".prop_map(String::from),
-            "[ \t\n]{0,5}".prop_map(String::from),
-            Just(format!("'{CHAIN_SENTINEL}'")),
-            "[a-z_]{0,3}".prop_map(|tag| format!("${tag}${CHAIN_SENTINEL}${tag}$")),
-            prop::sample::select(vec![",", ";", "=", "(", ")"]).prop_map(String::from),
-        ];
-        prop::collection::vec(token, 0..10).prop_map(|tokens| tokens.concat())
+    /// The obfuscate-then-compact chain `build_attributes` applies in `Obfuscated` mode.
+    fn chain(sql: &str, d: Dialect) -> String {
+        crate::compact::compact_whitespace(&crate::obfuscate::obfuscate(sql, d), d)
     }
 
     /// Strategy for an arbitrary `QueryAnnotations` whose four fields are independently
@@ -1237,30 +1208,75 @@ mod tests {
             prop_assert!(!keys.contains(&"db.stored_procedure.name"));
         }
 
-        /// Chain idempotence for the `Obfuscated` arm pipeline:
-        /// `compact_whitespace(obfuscate(s))` is a fixed point. Both passes are
-        /// individually idempotent (proven in their own modules); their composition must
-        /// also be – running the chain twice produces the same string as running it once.
+        /// Chain idempotence for the `Obfuscated` arm pipeline: running
+        /// `compact_whitespace(obfuscate(s))` twice equals running it once, in every dialect. Both
+        /// passes are individually idempotent; their composition must be too.
         #[test]
-        fn chain_compact_obfuscate_idempotent(s in chain_fragment_any()) {
-            let f = |x: &str| crate::compact::compact_whitespace(&crate::obfuscate::obfuscate(x));
-            let once = f(&s);
-            let twice = f(&once);
-            prop_assert_eq!(once, twice);
+        fn chain_compact_obfuscate_idempotent((d, s, _) in any_obfuscation_case()) {
+            let once = chain(&s, d);
+            prop_assert_eq!(chain(&once, d), once);
         }
 
-        /// No-leak through chain: every literal in the input embeds the sentinel
-        /// `XSECRETX`. After `compact_whitespace(obfuscate(s))`, the sentinel must be
-        /// gone – otherwise some literal kind escaped redaction or the compaction step
-        /// introduced a path that re-exposed redacted bytes.
+        /// No-leak through the emitted attribute: every generated literal embeds the sentinel, and
+        /// `build_attributes` – driven by the backend's `db.system.name`, so the dialect mapping is
+        /// part of what is tested – must not emit it in `db.query.text`.
         #[test]
-        fn chain_compact_obfuscate_no_leak(s in chain_fragment_marked()) {
-            let f = |x: &str| crate::compact::compact_whitespace(&crate::obfuscate::obfuscate(x));
-            let out = f(&s);
+        fn obfuscated_query_text_never_contains_a_literal((d, s, _) in any_obfuscation_case()) {
+            let mut attrs =
+                make_connection_attributes(None, None, None, None, None, QueryTextMode::Obfuscated);
+            attrs.system = system_for(d);
+            let kv = build_attributes(&attrs, Some(&s), None);
+            let text = kv
+                .iter()
+                .find(|k| k.key.as_str() == "db.query.text")
+                .map(|k| k.value.as_str().into_owned())
+                .expect("db.query.text must be emitted in Obfuscated mode");
+            prop_assert_eq!(&text, &chain(&s, d));
             prop_assert!(
-                !out.contains("XSECRETX"),
-                "sentinel leaked through chain: input={s:?} output={out:?}"
+                !text.contains(SENTINEL),
+                "sentinel leaked: dialect={:?} input={:?} output={:?}", d, s, text
             );
+        }
+
+        /// Re-lexing obfuscated text cannot drift: apart from the redacted literals and the `?`
+        /// placeholders standing in for them, `obfuscate`'s output has exactly the tokens of its
+        /// input, in order. The compactor re-lexes that output, so a drift here would let
+        /// compaction disagree with obfuscation about region boundaries.
+        #[test]
+        fn obfuscated_output_relexes_to_the_same_structure(
+            (d, s, _) in any_obfuscation_case(),
+        ) {
+            let is_literal = |kind: TokenKind, text: &str| {
+                matches!(
+                    kind,
+                    TokenKind::StringLiteral | TokenKind::Number | TokenKind::Unterminated
+                ) || (kind == TokenKind::Word
+                    && (text.eq_ignore_ascii_case("true") || text.eq_ignore_ascii_case("false")))
+            };
+            let is_placeholder = |kind: TokenKind, text: &str| kind == TokenKind::Other && text == "?";
+            // Returns the non-literal, non-placeholder tokens plus the count of literals and
+            // placeholders, so a spurious `?` added beside a real one is caught by the count.
+            let structure = |sql: &str| -> (Vec<(TokenKind, String)>, usize, usize) {
+                let mut kept = Vec::new();
+                let (mut literals, mut placeholders) = (0, 0);
+                for t in tokenize(sql, d) {
+                    let text = &sql[t.start..t.end];
+                    if is_literal(t.kind, text) {
+                        literals += 1;
+                    } else if is_placeholder(t.kind, text) {
+                        placeholders += 1;
+                    } else {
+                        kept.push((t.kind, text.to_owned()));
+                    }
+                }
+                (kept, literals, placeholders)
+            };
+            let out = crate::obfuscate::obfuscate(&s, d);
+            let (in_kept, in_literals, in_placeholders) = structure(&s);
+            let (out_kept, out_literals, out_placeholders) = structure(&out);
+            prop_assert_eq!(out_kept, in_kept);
+            prop_assert_eq!(out_literals, 0);
+            prop_assert_eq!(out_placeholders, in_placeholders + in_literals);
         }
 
         /// Trim invariant on the emitted `db.query.text`: for both `Full` and

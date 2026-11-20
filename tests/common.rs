@@ -506,6 +506,12 @@ pub struct Dialect {
     /// no concrete binds. Each backend uses its own placeholder syntax (`?` for sqlite
     /// and mysql, `$1` for postgres).
     pub prepare_with_select_sql: &'static str,
+    /// Queries built around this backend's lexical traps – constructs another backend reads
+    /// differently, so an obfuscator applying the wrong dialect loses track of where a literal ends
+    /// – paired with the exact `db.query.text` `QueryTextMode::Obfuscated` must emit. Each returns
+    /// a column `q` holding the sentinel literal `XSECRETX`, which proves the engine itself parsed
+    /// the sentinel as a literal.
+    pub obfuscation_traps: &'static [(&'static str, &'static str)],
 }
 
 pub const SQLITE_DIALECT: Dialect = Dialect {
@@ -517,6 +523,11 @@ pub const SQLITE_DIALECT: Dialect = Dialect {
     string_concat_update_sql: "UPDATE affected_test SET name = name || '_updated' WHERE id IN (2, 3)",
     bind_two_sum_sql: "SELECT ?1 + ?2 AS sum",
     prepare_with_select_sql: "SELECT ?",
+    obfuscation_traps: &[(
+        // `[don't]` is one identifier; `\` does not escape.
+        r"SELECT 1 AS [don't], 'c:\' AS p, 'XSECRETX' AS q",
+        "SELECT ? AS [don't], ? AS p, ? AS q",
+    )],
 };
 
 pub const POSTGRES_DIALECT: Dialect = Dialect {
@@ -529,6 +540,23 @@ pub const POSTGRES_DIALECT: Dialect = Dialect {
     string_concat_update_sql: "UPDATE affected_test SET name = name || '_updated' WHERE id IN (2, 3)",
     bind_two_sum_sql: "SELECT ($1::bigint + $2::bigint) AS sum",
     prepare_with_select_sql: "SELECT $1",
+    obfuscation_traps: &[
+        (
+            // `\` does not escape, block comments nest, and `\r` ends a line comment.
+            "SELECT 'c:\\' AS p /* /* */ don't */, 1 AS a -- don't\r, 'XSECRETX' AS q",
+            "SELECT ? AS p /* /* */ don't */, ? AS a -- don't\r, ? AS q",
+        ),
+        (
+            // `$` continues an identifier, so `x$a$` is not a dollar-quote opener.
+            "SELECT 1 AS x$a$, 'p$a$q' AS p, 'XSECRETX' AS q",
+            "SELECT ? AS x$a$, ? AS p, ? AS q",
+        ),
+        (
+            // An E-string continues across a newline with backslash escapes intact.
+            "SELECT E'a'\n'\\' , ''z'' , ' AS p, 'XSECRETX' AS q",
+            "SELECT E? AS p, ? AS q",
+        ),
+    ],
 };
 
 pub const MYSQL_DIALECT: Dialect = Dialect {
@@ -542,6 +570,19 @@ pub const MYSQL_DIALECT: Dialect = Dialect {
     string_concat_update_sql: "UPDATE affected_test SET name = CONCAT(name, '_updated') WHERE id IN (2, 3)",
     bind_two_sum_sql: "SELECT CAST(? + ? AS SIGNED) AS sum",
     prepare_with_select_sql: "SELECT ?",
+    obfuscation_traps: &[
+        (
+            // `#` starts a comment, `"…"` is a string, and `--` without whitespace is two
+            // minus signs.
+            "SELECT 1 AS a # don't\n, \"XSECRETX\" AS q, 2--'1' AS r",
+            "SELECT ? AS a # don't\n, ? AS q, ?--? AS r",
+        ),
+        (
+            // `\` escapes, and an executable comment's body is SQL.
+            "SELECT 'it\\'s' AS p, /*!50000 'XSECRETX' */ AS q",
+            "SELECT ? AS p, /*!50000 ? */ AS q",
+        ),
+    ],
 };
 
 /// `DROP TABLE IF EXISTS` then `CREATE TABLE` at the supplied pool. Used at the top of
@@ -3865,6 +3906,47 @@ macro_rules! test_query_text_mode_obfuscated_replaces_literals {
             $crate::common::attr(&spans[0], "db.query.text"),
             Some(opentelemetry::Value::String("SELECT ?, ?, ?".into()))
         );
+    }};
+}
+
+/// `QueryTextMode::Obfuscated` follows the backend's lexical rules: for every query in
+/// `Dialect::obfuscation_traps`, the engine returns the sentinel literal in column `q` (so the trap
+/// is real SQL meaning what the test assumes), and the emitted `db.query.text` is exactly the
+/// expected redaction, with the sentinel nowhere in it.
+#[macro_export]
+macro_rules! test_query_text_mode_obfuscated_dialect_traps {
+    ($raw_pool_factory:expr, $dialect:expr) => {{
+        // Span-side assertion only; metrics are bound to the no-op meter for the same
+        // reason as `test_query_text_mode_obfuscated_replaces_literals`.
+        use sqlx::Executor as _;
+        let dialect = $dialect;
+        let raw = $raw_pool_factory;
+        let pool = sqlx_otel::PoolBuilder::from(raw)
+            .with_query_text_mode(sqlx_otel::QueryTextMode::Obfuscated)
+            .build();
+
+        for &(sql, expected) in dialect.obfuscation_traps {
+            let tel = $crate::common::TestTelemetry::install();
+            let row = (&pool).fetch_one(sql).await.unwrap();
+            let q: String = sqlx::Row::get(&row, "q");
+            assert_eq!(
+                q, "XSECRETX",
+                "engine did not read the sentinel as a literal: {sql:?}"
+            );
+
+            let spans = tel.spans();
+            assert_eq!(spans.len(), 1);
+            let Some(opentelemetry::Value::String(text)) =
+                $crate::common::attr(&spans[0], "db.query.text")
+            else {
+                panic!("db.query.text missing for {sql:?}");
+            };
+            assert_eq!(text.as_str(), expected, "query: {sql:?}");
+            assert!(
+                !text.as_str().contains("XSECRETX"),
+                "sentinel leaked: {text:?}"
+            );
+        }
     }};
 }
 

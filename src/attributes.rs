@@ -8,31 +8,36 @@ use opentelemetry_semantic_conventions::attribute;
 /// # Whitespace normalisation
 ///
 /// For both [`Full`](Self::Full) and [`Obfuscated`](Self::Obfuscated) the emitted text has
-/// inter-token whitespace runs collapsed to a single ASCII space and leading/trailing
-/// whitespace trimmed. Whitespace **inside** string literals, quoted identifiers,
-/// dollar-quoted bodies, and comments is preserved verbatim. Multi-line SQL written across
-/// several Rust source lines therefore renders as a single readable line in `OTel` exports
-/// without the embedded `\n` and indentation runs that come from source-level formatting.
-/// [`Off`](Self::Off) is unaffected (no attribute is emitted).
+/// inter-token whitespace runs collapsed to a single ASCII space and leading/trailing whitespace
+/// trimmed. Whitespace **inside** string literals, quoted identifiers, dollar-quoted bodies, and
+/// comments is preserved verbatim. Multi-line SQL written across several Rust source lines
+/// therefore renders as a single readable line in `OTel` exports without the embedded `\n` and
+/// indentation runs that come from source-level formatting. [`Off`](Self::Off) is unaffected (no
+/// attribute is emitted).
 ///
 /// # When to choose what
 ///
-/// - **[`Full`](Self::Full)** (default) – appropriate when all SQL flows through `SQLx`
-///   bind parameters. The captured text contains placeholders (`$1`, `?`), not literal
-///   values, so user data does not leak into the span.
-/// - **[`Obfuscated`](Self::Obfuscated)** – appropriate when SQL is built via string
-///   interpolation (`format!`, query concatenation, dynamic identifiers) and may contain
-///   literal values. Structure is preserved; literals (string, numeric, hex, boolean, and
-///   `PostgreSQL` dollar-quoted) are replaced with `?`. Comments, identifiers (quoted or
-///   otherwise), operators, and `NULL` are kept verbatim.
-/// - **[`Off`](Self::Off)** – appropriate when the query text is itself sensitive
-///   (proprietary schemas, query shapes that reveal business logic) or when query-text
-///   cardinality must be eliminated entirely.
+/// - **[`Full`](Self::Full)** (default) – appropriate when all SQL flows through `SQLx` bind
+///   parameters. The captured text contains placeholders (`$1`, `?`), not literal values, so user
+///   data does not leak into the span.
+/// - **[`Obfuscated`](Self::Obfuscated)** – appropriate when SQL is built via string interpolation
+///   (`format!`, query concatenation, dynamic identifiers) and may contain literal values.
+///   Structure is preserved; literals (string, numeric, hex, boolean, and `PostgreSQL`
+///   dollar-quoted) are replaced with `?`. Comments, identifiers (quoted or otherwise), operators,
+///   and `NULL` are kept verbatim. Literals are found using the lexical rules of the backend in use
+///   (`MySQL` backslash escapes, `"…"` strings and `#` comments, `SQLite` `[…]` identifiers, nested
+///   `PostgreSQL` comments), and an unterminated quoted identifier or comment is redacted to the
+///   end of the statement. The rules assume each backend's default settings: `PostgreSQL` with
+///   `standard_conforming_strings = off`, or `MySQL` with `NO_BACKSLASH_ESCAPES` or `ANSI_QUOTES`,
+///   can let literal content through.
+/// - **[`Off`](Self::Off)** – appropriate when the query text is itself sensitive (proprietary
+///   schemas, query shapes that reveal business logic) or when query-text cardinality must be
+///   eliminated entirely.
 ///
-/// `db.query.parameter.<key>` capture is **not supported** – `SQLx`'s `Execute` trait does
-/// not expose bind values, and reverse-engineering them from the encoded buffer would tie
-/// the wrapper to driver internals. Callers who need per-parameter attributes can add
-/// them manually via the active span using the OpenTelemetry API.
+/// `db.query.parameter.<key>` capture is **not supported** – `SQLx`'s `Execute` trait does not
+/// expose bind values, and reverse-engineering them from the encoded buffer would tie the wrapper
+/// to driver internals. Callers who need per-parameter attributes can add them manually via the
+/// active span using the OpenTelemetry API.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum QueryTextMode {
     /// Capture the parameterised query text. This is the default because `SQLx` queries

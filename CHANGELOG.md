@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- `QueryTextMode::Obfuscated` no longer leaks string-literal content into `db.query.text`. The obfuscator applied one set of lexical rules to all three backends, so wherever those rules differed from the backend's it lost track of where a literal ended and emitted the rest of the statement – literal values included – as structure. `'c:\'` (a complete literal on PostgreSQL and SQLite), an apostrophe in a MySQL `#` comment or a SQLite `[don't]` identifier, MySQL `"…"` strings, MySQL `/*! … */` bodies, `a--'x'` on MySQL, nested PostgreSQL comments, and `$` inside PostgreSQL identifiers all triggered it. Obfuscation and whitespace compaction now share one lexer that follows the rules of the backend in use. Numeric literals with digit separators or binary/octal prefixes (`1_000`, `0b1010`, `0o17`) are redacted whole instead of leaving digits behind ([#49](https://github.com/chmodas/sqlx-otel/pull/49)).
+- An unterminated quoted identifier or block comment is now redacted to the end of the statement instead of emitted verbatim, so malformed SQL cannot carry literal values past the obfuscator ([#49](https://github.com/chmodas/sqlx-otel/pull/49)).
+
+### Changed
+
+- `QueryTextMode::Obfuscated` output differs in places as a result of the fix above: MySQL `"…"` is redacted as the string literal it is, `$tag$…$tag$` is only a dollar quote on PostgreSQL, backticks are punctuation on PostgreSQL, and malformed numerals such as `0xZZ` or `1e` become a single `?`. Dashboards or alerts matching on exact `db.query.text` values may need updating ([#49](https://github.com/chmodas/sqlx-otel/pull/49)).
+
 ## [0.6.0] – 2026-10-30
 
 ### Fixed

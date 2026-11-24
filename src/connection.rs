@@ -11,8 +11,9 @@ use crate::pool::SharedState;
 ///
 /// Acquired via [`Pool::acquire`](crate::Pool::acquire). `&mut PoolConnection<DB>` implements
 /// [`sqlx::Executor`], so the value plugs straight into the standard `SQLx` query builders. When
-/// the value is dropped, the connection is returned to the pool and `db.client.connection.use_time`
-/// is recorded with the elapsed time between `acquire` and `drop`.
+/// the value is dropped, `db.client.connection.use_time` is recorded with the elapsed time between
+/// `acquire` and `drop`, and the connection starts its way back to the pool. `SQLx` finishes that
+/// return in the background, so the sample is not proof that the connection is available again.
 ///
 /// Use [`with_annotations`](Self::with_annotations) / [`with_operation`](Self::with_operation) to
 /// attach per-query semantic-convention attributes – the methods are inherited via the same macro
@@ -42,13 +43,15 @@ pub struct PoolConnection<DB: sqlx::Database> {
 pub(crate) struct ConnectionUsage {
     pub(crate) use_time: Arc<Histogram<f64>>,
     pub(crate) acquired_at: Instant,
-    pub(crate) base_attrs: Vec<KeyValue>,
+    /// Pool attributes plus the [`PoolAttribution`](crate::PoolAttribution) captured when the
+    /// acquisition started. Never re-read, so the lease's end cannot drift to another workload.
+    pub(crate) lease_attrs: Vec<KeyValue>,
 }
 
 impl Drop for ConnectionUsage {
     fn drop(&mut self) {
         self.use_time
-            .record(self.acquired_at.elapsed().as_secs_f64(), &self.base_attrs);
+            .record(self.acquired_at.elapsed().as_secs_f64(), &self.lease_attrs);
     }
 }
 

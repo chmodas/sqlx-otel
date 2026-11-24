@@ -411,15 +411,20 @@ impl<DB: Database> Pool<DB> {
     /// `PoolTimedOut` when the configured acquire timeout elapses, or `PoolClosed` after
     /// [`close`](Self::close).
     pub async fn acquire(&self) -> Result<PoolConnection<DB>, sqlx::Error> {
-        let pool_attrs = self.state.attrs.base_key_values();
-        let attrs = crate::attribution::lease_attributes(&pool_attrs);
-        // Initialize the workload series like the pool-wide series. A rate can include the
-        // first timeout in a cumulative-sample rate only if the zero was exported first.
-        self.timeouts.add(0, &attrs);
-        self.pending_requests.add(1, &pool_attrs);
+        // Both series share one attribute vector. The pool-wide set is its prefix.
+        let (attrs, pool_len) =
+            crate::attribution::lease_attributes(self.state.attrs.base_key_values());
+        // `build()` already seeded the pool-wide series, so only a workload series needs its zero
+        // here. A rate can include the first timeout in a cumulative-sample rate only if the zero
+        // was exported first. Comparing lengths rather than reading the scope skips an ignored
+        // reserved-key attribution, whose lease set is the pool-wide set.
+        if attrs.len() > pool_len {
+            self.timeouts.add(0, &attrs);
+        }
+        self.pending_requests.add(1, &attrs[..pool_len]);
         let pending = PendingAcquisition {
             counter: &self.pending_requests,
-            pool_attrs: &pool_attrs,
+            pool_attrs: &attrs[..pool_len],
             abandoned_wait: &self.abandoned_wait,
             lease_attrs: &attrs,
             started_at: Instant::now(),

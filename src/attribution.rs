@@ -180,24 +180,31 @@ const RESERVED_KEYS: &[&str] = &[
     "sqlx_otel.transaction.outcome",
 ];
 
-/// The pool-wide attribute set plus any valid attribution active right now.
+/// Appends any valid attribution active right now to the pool-wide attribute set.
+///
+/// Takes the pool attributes by value and returns them with the length of the pool-wide prefix,
+/// so both series use the same vector. `&attrs[..pool_len]` is the pool-wide set and `&attrs`
+/// is the lease set.
 ///
 /// Called once per acquisition. The result is owned by the attempt and lease, so nothing recorded
 /// later reads the thread-local again.
-pub(crate) fn lease_attributes(pool_attrs: &[KeyValue]) -> Vec<KeyValue> {
-    let mut attrs = Vec::with_capacity(pool_attrs.len() + 2);
-    attrs.extend_from_slice(pool_attrs);
+pub(crate) fn lease_attributes(mut pool_attrs: Vec<KeyValue>) -> (Vec<KeyValue>, usize) {
+    let pool_len = pool_attrs.len();
     if let Some(attribution) = PoolAttribution::current()
         && !RESERVED_KEYS.contains(&attribution.key)
     {
-        attrs.push(attribution.key_value());
+        pool_attrs.push(attribution.key_value());
     }
-    attrs
+    (pool_attrs, pool_len)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PoolAttribution, lease_attributes};
+    use super::PoolAttribution;
+
+    fn lease_attributes(pool_attrs: &[KeyValue]) -> Vec<KeyValue> {
+        super::lease_attributes(pool_attrs.to_vec()).0
+    }
     use futures::executor::block_on;
     use futures::future::{FutureExt, lazy, poll_fn};
     use opentelemetry::KeyValue;

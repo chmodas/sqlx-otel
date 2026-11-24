@@ -2,9 +2,11 @@
 //! and metrics following the [database client semantic conventions][semconv].
 //!
 //! `sqlx-otel` talks to the [`opentelemetry`] API directly – there is no `tracing` bridge
-//! indirection. The wrapper is **zero-cost when no `TracerProvider` or `MeterProvider` is
-//! installed** because the global `opentelemetry` API resolves to no-op instruments in that
-//! configuration; the only overhead is one `Arc` clone per acquired connection or transaction.
+//! indirection. Without a `TracerProvider` or `MeterProvider`, OpenTelemetry uses no-op
+//! instruments. The wrapper still measures elapsed time and builds metric attributes. Each
+//! acquisition builds one attribute vector and clones the pool's owned attribute strings.
+//! After a successful `BEGIN`, the transaction copies its lease attributes once. Recording a
+//! `BEGIN` or transaction outcome builds a vector containing the lease attributes and the outcome.
 //!
 //! [semconv]: https://opentelemetry.io/docs/specs/semconv/database/
 //!
@@ -48,8 +50,8 @@
 //! `sqlx-otel` produces telemetry but **does not install a provider** – that is the application's
 //! responsibility. Pair this crate with the [`opentelemetry_sdk`] (or any other compliant SDK) and
 //! set up exporters for your traces and metrics. Until a provider is installed via
-//! [`opentelemetry::global::set_tracer_provider`] / [`set_meter_provider`][m], the instrumentation
-//! is a no-op.
+//! [`opentelemetry::global::set_tracer_provider`] / [`set_meter_provider`][m], the corresponding
+//! spans or metrics are discarded.
 //!
 //! [`opentelemetry_sdk`]: https://docs.rs/opentelemetry_sdk
 //! [m]: https://docs.rs/opentelemetry/latest/opentelemetry/global/fn.set_meter_provider.html
@@ -124,6 +126,8 @@
 //! timeout, since the pool never failed to deliver – the caller left; instead it records the time
 //! already waited once on `sqlx_otel.connection.abandoned_wait.duration`, which has no semantic
 //! convention equivalent. A future dropped before its first poll never waited and records nothing.
+//! A panic that unwinds through a waiting acquisition, such as one raised by a `before_acquire`
+//! hook, drops the future the same way and is recorded there too.
 //! Only `sqlx::Error::PoolTimedOut` increments the timeout counter, so `PoolClosed` on shutdown does
 //! not inflate the timeout rate. Connection use time follows the lease through transaction
 //! completion and ends when the lease owner is dropped; `SQLx` returns the connection to the pool

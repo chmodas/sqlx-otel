@@ -368,7 +368,7 @@ pub struct Pool<DB: sqlx::Database> {
     /// currently waiting in `acquire()`.
     pending_requests: Arc<opentelemetry::metrics::UpDownCounter<i64>>,
     /// Histogram for `sqlx_otel.connection.abandoned_wait.duration`, recorded when an `acquire()`
-    /// already waiting is dropped.
+    /// already waiting is dropped, by its caller or by a panic unwinding through it.
     abandoned_wait: Arc<opentelemetry::metrics::Histogram<f64>>,
     /// Instruments for the `sqlx_otel.transaction.*` family.
     transactions: Arc<TransactionMetrics>,
@@ -401,9 +401,10 @@ impl<DB: Database> Pool<DB> {
     ///
     /// Dropping this future while it waits records the time already waited once on
     /// `sqlx_otel.connection.abandoned_wait.duration`, not as a completed wait or a timeout. A
-    /// future that was never polled never waited and records nothing. The active
-    /// [`PoolAttribution`](crate::PoolAttribution) is captured on first poll and used for every
-    /// measurement of this attempt and its lease.
+    /// future that was never polled never waited and records nothing. A panic that unwinds through
+    /// the wait, such as one raised by a `before_acquire` hook, drops the future the same way and
+    /// is recorded there too. The active [`PoolAttribution`](crate::PoolAttribution) is captured
+    /// on first poll and used for every measurement of this attempt and its lease.
     ///
     /// # Errors
     ///
@@ -557,7 +558,10 @@ impl<DB: Database> Pool<DB> {
 /// to a `Drop` guard covers success, error, and cancellation alike. Cancellation records no
 /// completed wait and is not classified as `PoolTimedOut`, because the pool never failed to
 /// deliver – the caller left. It records the elapsed wait on its own instrument instead, exactly
-/// once, because the guard exists only after a first poll and is dropped only once.
+/// once, because the guard exists only after a first poll and is dropped only once. A panic that
+/// unwinds through the await drops the guard uncompleted too, so it is recorded as an abandoned
+/// wait: gating on `std::thread::panicking()` would instead lose real cancellations dropped while
+/// an unrelated panic unwinds.
 struct PendingAcquisition<'a> {
     counter: &'a opentelemetry::metrics::UpDownCounter<i64>,
     pool_attrs: &'a [opentelemetry::KeyValue],
